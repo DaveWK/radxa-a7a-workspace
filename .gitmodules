@@ -1,0 +1,15 @@
+[submodule "firmware/oreboot"]
+	path = firmware/oreboot
+	url = https://github.com/DaveWK/oreboot.git
+	branch = radxa-cubie-a7a
+[submodule "firmware/edk2"]
+	path = firmware/edk2
+	url = https://github.com/tianocore/edk2.git
+[submodule "firmware/edk2-platforms"]
+	path = firmware/edk2-platforms
+	url = https://github.com/DaveWK/edk2-platforms.git
+	branch = radxa-cubie-a7a
+[submodule "fedora"]
+	path = fedora
+	url = https://github.com/DaveWK/radxa-a7a-fedora.git
+	branch = radxa-cubie-a7a

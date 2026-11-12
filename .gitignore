@@ -1,0 +1,11 @@
+# Build outputs, images and tools built from source: never committed.
+/out/
+*.img
+*.img.xz
+*.simg
+# Vendor inputs fetched at build time (scripts/fetch-vendor.sh): never committed.
+/vendor/
+# Serial logs stay local.
+/serial-logs/*
+!/serial-logs/README.md
+__pycache__/
