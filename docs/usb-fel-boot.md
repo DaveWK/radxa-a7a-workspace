@@ -120,7 +120,7 @@ since the firmware embeds the device tree that the image's
 
 ## Planned: fastboot over FEL
 
-**Not implemented yet.** The plan is a bt0 build that, after its FEL
+**Not in this repository yet.** The plan is a bt0 build that, after its FEL
 entry 1, enumerates on USB-C as a **fastboot** device instead of handing
 back to FEL. You could then write the microSD card (or its firmware region)
 from the host with `fastboot flash` without a card reader, and boot it. It

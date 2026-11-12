@@ -100,6 +100,9 @@ only `out/firmware/firmware.bin` at sector 256 of an existing card. See
 enumerates as a fastboot device, so the microSD can be flashed over USB.
 See [docs/usb-fel-boot.md](docs/usb-fel-boot.md#planned-fastboot-over-fel).
 
+**Installing** the firmware and an OS (Fedora today; Debian planned; going
+back to Radxa's images): [docs/flashing.md](docs/flashing.md).
+
 Serial console: UART0 at 115200 8N1 (`make serial`; `scripts/serial-log.sh
 attach` reattaches).
 
@@ -139,7 +142,7 @@ Fedora's own packages.
 | `firmware/edk2-platforms` | DaveWK/edk2-platforms `radxa-cubie-a7a` (on `sbc-common`): `Platform/Radxa/CubieA7APkg`, `Silicon/Allwinner/A733Pkg`, shared packages in `OreEdk2Boot/` |
 | `fedora` | DaveWK/radxa-a7a-fedora `radxa-cubie-a7a`: DTS, DKMS kmods, RPM specs, `build-rpms.sh`, `mkdevcard.sh` |
 | `scripts/` | image assembly (`mkimage.py`, `lib/`), EDK2 build, USB FEL boot, xfel build, vendor fetch, serial logger, vendor-image register capture |
-| `docs/` | bring-up status, USB FEL boot, SD card, sources |
+| `docs/` | bring-up status, USB FEL boot, SD card, flashing, sources |
 | `Containerfile`, `Makefile` | build |
 
 Update the submodules to their branch heads with
