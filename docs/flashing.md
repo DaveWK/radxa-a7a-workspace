@@ -22,8 +22,10 @@ yet (see [README](../README.md#dram)).
   - a card written from this workspace runs oreboot bt0 from sector 256,
     then oreboot main and EDK2 ([sd-card.md](sd-card.md));
   - a card with Radxa's Debian image runs Allwinner's boot0 and U-Boot.
-    Radxa's A733 U-Boot package writes boot0 at sector 256 (128 KiB), the
-    same place as this workspace's bt0, and its boot package at 12 MiB;
+    Radxa's boot code sits at sector 256 (128 KiB), the same place as this
+    workspace's bt0. In the R7 images it is one U-Boot SPL image carrying
+    TF-A's BL31, the SCP/ARISC firmware and U-Boot; the older R6 images use
+    Allwinner's boot0 there and a boot package at 12 MiB;
   - a card or module with Radxa's Android image runs the Allwinner boot
     chain from the Android firmware package.
 - Writing one kind of image over another replaces the card's firmware along
@@ -172,7 +174,8 @@ All read on 2026-11-12.
 | <https://docs.radxa.com/en/cubie/a7a/other-system/android/install-system> | Android only as a Phoenix image |
 | <https://github.com/radxa-docs/docs> (commit `862054f`) | Markdown source of the Radxa pages above |
 | <https://github.com/radxa-build/radxa-a733/releases> | R6 (Debian 11) and R7 (Debian 13) images and `.sha512sum` files; no Ubuntu image; R7 recipe (`rsdk-r7` `config.yaml`, `build-512-image`, `manifest`): `u-boot-radxa-a733`, `u-boot-menu`, `/boot/extlinux/extlinux.conf`, "Skip systemd-boot installation", `linux-image-6.6.98-6-aw2511` |
-| <https://github.com/radxa-pkg/u-boot-aw2501> | Radxa's A733 U-Boot package: `setup/u-boot_setup-allwinner-a733.sh` writes boot0 at sector 256 and the boot package at sector 24576 (12 MiB); `arisc` is a submodule of the package |
+| <https://github.com/radxa-pkg/u-boot-aw2501> | Radxa's A733 U-Boot package: `setup/u-boot_setup-allwinner-a733.sh` writes boot0 at sector 256 and the boot package at sector 24576 (12 MiB); `arisc` is a submodule of the package (the R6-era layout) |
+| `radxa-a733_trixie_cli_r7.output_512.img.xz` from the R7 release, inspected | sector 256 holds a single `u-boot-sunxi-with-spl.bin` from `u-boot-radxa-a733` 2026.04-4: an eGON SPL plus a FIT with BL31, the SCP firmware and U-Boot; nothing at 12 MiB |
 | <https://github.com/radxa/allwinner-device/blob/device-a733-v1.4.6/configs/default/boot_package.cfg> | A733 boot package: `u-boot`, `monitor`, `scp` |
 | <https://github.com/radxa/allwinner-android-manifests/releases> | Android 13 A7A zips and release notes; the `.img` starts with `IMAGEWTY` and contains `boot0_sdcard.fex`, `u-boot.fex` and `boot_package.fex` (read with HTTP range requests) |
 | <https://dl.radxa.com/tools/> (PhoenixCard V4.3.2, PhoenixSuit V2.0.4, LiveSuit V3.0.8 zips) | the tools are binaries (`.exe`/`.dll`, a `.run` installer) with no source |
