@@ -14,7 +14,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         acpica-tools dtc cpp curl xz zstd tar cpio openssl file which \
         findutils diffutils util-linux e2fsprogs dosfstools mtools \
         rpm-build redhat-rpm-config systemd-rpm-macros dnf5 \
-        python3-libselinux qemu-user-static-aarch64 \
+        python3-libselinux qemu-user-static-aarch64 systemd \
         libusb1-devel pkgconf-pkg-config \
     && dnf clean all
 
