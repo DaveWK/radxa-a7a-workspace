@@ -1,4 +1,4 @@
-# USB FEL boot (and planned fastboot)
+# USB FEL boot and fastboot
 
 The A733 mask ROM has a USB download mode, **FEL**. The board in FEL shows
 up on the host as USB device `1f3a:efe8`. `scripts/fel-boot.sh` uses it to
@@ -118,11 +118,51 @@ and display. Use the root image from the same commit (`make fedora-image`),
 since the firmware embeds the device tree that the image's
 `cubie-a7a-dtb` expects.
 
-## Planned: fastboot over FEL
+## Fastboot over FEL
 
-**Not in this repository yet.** The plan is a bt0 build that, after its FEL
-entry 1, enumerates on USB-C as a **fastboot** device instead of handing
-back to FEL. You could then write the microSD card (or its firmware region)
-from the host with `fastboot flash` without a card reader, and boot it. It
-would reuse the fastboot device design of oreboot's SpacemiT K1 bt0. Nothing
-in this repository implements it today, and no build target produces it.
+**Works on a development build of bt0; not in this workspace yet** (no
+build target here produces it). After its FEL entry for DRAM init, this bt0
+enumerates on the USB-C port as a fastboot device (`18d1:4ee0`, product
+`cubie-a7a`) instead of handing back to FEL, and the stock `fastboot` tool
+talks to it:
+
+- `fastboot stage <file>` / `download`: into DRAM, up to 128 MiB per
+  transfer (`max-download-size`);
+- `fastboot fetch download <file>`: reads the downloaded data back;
+  `fetch` also reads (only reads) the USB disk, the SD card and the SPI NOR;
+- `fastboot boot` with a firmware bundle (oreboot main + EDK2, the same
+  layout table as entry 2): bt0 checks the images' CRCs and hands over as
+  in [Boot](#boot) step 5;
+- `fastboot reboot-bootloader` or `oem fel`: back to the mask ROM's FEL
+  with DRAM still up; `fastboot reboot`: watchdog reset, back in FEL after
+  about 1.8 s;
+- `oem help`, `oem log`, `oem read32`: diagnostics.
+
+It writes no storage: there is no `flash` for the microSD or a USB disk.
+SPI NOR writes exist only in a separate, guarded build, which is not used.
+
+Measured on the board on 2026-11-12 (MB = 10^6 bytes):
+
+| | Earlier build | Current build |
+|---|---|---|
+| Download (64 and 128 MiB) | 10.3 MB/s | **25.7 MB/s** |
+| Upload (`fetch download`) | not available | **40-42.6 MB/s** |
+| Bundle check at `boot` (5 MiB bundle) | 1031 ms | 29 ms |
+| `reboot-bootloader` to FEL | 0.4-0.7 s | 0.4-0.7 s |
+
+- The gain comes from double-buffered USB endpoints, fewer register
+  accesses per packet and running with the MMU and data cache on.
+  Transfers are still programmed I/O, without USB DMA. The USB-C port is
+  USB 2.0 OTG (the only USB 3 port is a Type-A host port), so USB 2.0 high
+  speed is the ceiling.
+- All 24 round trips were bit-exact, including odd sizes, single short
+  packets and exact multiples of 512 bytes. A host that stalls or cancels
+  a transfer in either direction leaves the device usable after a 5 s
+  timeout. Every way out (`reboot-bootloader`, `oem fel`, giving up after
+  four failed USB sessions, `boot`) leaves memory coherent: the MMU and data
+  cache are off and the data is in DRAM.
+- `boot` with the current build reaches EDK2. Not yet re-tested with it:
+  booting on to Fedora, and a 1 GB read from the USB disk.
+- Open: a lab build that runs DRAM training experiments and returns the
+  results over fastboot does not come back to FEL through its watchdog
+  reset after a DRAM run (it does without one); that needs a USB-C replug.
