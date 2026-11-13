@@ -55,16 +55,15 @@ attempt; it did not change the result.
 | Video decoder (`cubie-a7a-vdec`, cedrus) | `/dev/video0`: MPEG-2, H.264, H.265, VP8 |
 | NPU (`cubie-a7a-npu`, vipcore) | `/dev/vipcore`, self-test passes |
 | RK1828 coprocessor on PCIe (`cubie-a7a-rk1828`) | packaged; needs the HAT |
-| GPU | not working: the GPU_CORE power domain does not come up |
-| Wi-Fi/Bluetooth (AIC8800D80) | chip enumerates on USB; the driver source is not redistributable, see `fedora/README.md` |
+| GPU | not working. Since 2026-11-12 the GPU power domains are off at boot and are switched on only when the GPU driver asks for them; GPU_CORE still does not switch on, so the driver stays blocked and there is no rendering |
+| Wi-Fi/Bluetooth (AIC8800D80) | works with the board's Wi-Fi package, which needs a local driver tree (`AIC8800_SRC`: the driver source is not redistributable, see `fedora/README.md`): Wi-Fi scans find networks, the Bluetooth controller powers up. Off on the protective test entry (HAT stack off) |
 | cpufreq | no driver yet; the CPUs stay at bt0's clocks |
 | Stability | three memory-corruption oopses in softirq context on 2026-11-12, two of them after the Wi-Fi driver loaded; on vendor DRAM. The cause is open. Test boots therefore use a read-only root (below) |
 
 ## Test boots: protective entries
 
-After a USB root disk failed on 2026-11-12, following several crashes and
-forced resets with its root mounted read-write, every test boot on our
-board uses a read-only root. The board's Fedora image script has this as
+Test boots on our board keep the root read-only, so a crash or a forced
+reset cannot corrupt it. The board's Fedora image script has this as
 an option (`BOOT_MODES=protective`, with `FIRST_BOOT=maintenance`). That
 version of the script is not yet in this workspace's `fedora` submodule,
 so `make fedora-image` does not add these entries yet.

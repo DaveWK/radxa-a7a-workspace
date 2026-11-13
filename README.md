@@ -48,9 +48,11 @@ vendor input.
 - **Works:** Gigabit Ethernet (about 108 MiB/s each way, no errors), SMCCC
   TRNG (Linux `/dev/hwrng`, EFI RNG), PSCI with warm reboot, EHCI/xHCI in
   firmware, HDMI in EDK2 at the monitor's native mode, and in Linux the
-  sunxidrm display, the cedrus video decoder (`/dev/video0`) and the NPU
-  (`/dev/vipcore`, self-test passes).
-- **Not yet:** the GPU (its power domain does not come up), cpufreq, the
+  sunxidrm display, the cedrus video decoder (`/dev/video0`), the NPU
+  (`/dev/vipcore`, self-test passes), and Wi-Fi scan and Bluetooth with the
+  AIC8800 package built from a local driver tree (`AIC8800_SRC`).
+- **Not yet:** the GPU (its power domains are now switched on only on
+  demand, but GPU_CORE still does not come up, so no rendering), cpufreq, the
   open DRAM driver as the default (or at 2400 MHz), and a cause for three
   memory-corruption oopses on 2026-11-12 (two followed the Wi-Fi driver's
   start). Persistent UEFI variables on the card are built
