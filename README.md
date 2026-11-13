@@ -28,18 +28,33 @@ vendor input.
   Fedora 7.3.3 (stock kernel) on all 8 cores, with the root on a USB disk in
   the blue port. DRAM is 4096 MiB at 2400 MHz through the vendor DRAM library
   path (the default, see "DRAM" below).
+- **DRAM without vendor code boots Fedora (development branch):** no
+  Allwinner DRAM library, no Synopsys PHY training firmware. 4096 MiB at
+  1200 MHz; memtester and a 3-minute stress-ng run pass, as on the
+  vendor-DRAM control boot. Not in this workspace's pin yet, and not the
+  default: the vendor path stays until the open one reaches 2400 MHz and
+  the same stability. See
+  [docs/bring-up-status.md](docs/bring-up-status.md#dram-without-vendor-code).
+- **Fastboot over FEL (development build):** firmware sent at 25.7 MB/s and
+  read back at about 42 MB/s over the USB 2.0 port, then booted from RAM.
+  Not in this workspace yet.
+- **Test boots use a read-only root** with the HAT, Wi-Fi and USB 3 stack
+  off by default, with separate maintenance and full entries
+  ([details](docs/bring-up-status.md#test-boots-protective-entries)).
 - **SD slot (our board):** it booted the same chain from microSD until
   2026-11-11. Since then every card reports `SD init failed: NoCard` and the
-  slot's data lines read low. The cause is not established yet; until it is,
-  this board boots over USB FEL.
+  slot's data lines read low. A fault in the slot's supply is suspected but
+  not measured; until it is fixed, this board boots over USB FEL.
 - **Works:** Gigabit Ethernet (about 108 MiB/s each way, no errors), SMCCC
   TRNG (Linux `/dev/hwrng`, EFI RNG), PSCI with warm reboot, EHCI/xHCI in
   firmware, HDMI in EDK2 at the monitor's native mode, and in Linux the
   sunxidrm display, the cedrus video decoder (`/dev/video0`) and the NPU
   (`/dev/vipcore`, self-test passes).
 - **Not yet:** the GPU (its power domain does not come up), cpufreq, the
-  open DRAM driver as the default. Persistent UEFI variables on the card are
-  built (`-D SD_VARSTORE_ENABLE=TRUE`) but not yet confirmed on the board.
+  open DRAM driver as the default (or at 2400 MHz), and a cause for three
+  memory-corruption oopses on 2026-11-12 (two followed the Wi-Fi driver's
+  start). Persistent UEFI variables on the card are built
+  (`-D SD_VARSTORE_ENABLE=TRUE`) but not yet confirmed on the board.
 
 Details: [docs/bring-up-status.md](docs/bring-up-status.md).
 
@@ -96,9 +111,11 @@ instructions are in [docs/usb-fel-boot.md](docs/usb-fel-boot.md):
 only `out/firmware/firmware.bin` at sector 256 of an existing card. See
 [docs/sd-card.md](docs/sd-card.md).
 
-**Fastboot over FEL is planned, not implemented.** The idea is a bt0 that
-enumerates as a fastboot device, so the microSD can be flashed over USB.
-See [docs/usb-fel-boot.md](docs/usb-fel-boot.md#planned-fastboot-over-fel).
+**Fastboot over FEL works on a development build, not yet in this
+workspace.** bt0 enumerates as a fastboot device after DRAM init; the host
+sends the firmware into RAM and boots it. It does not write the microSD or
+any other storage yet. See
+[docs/usb-fel-boot.md](docs/usb-fel-boot.md#fastboot-over-fel).
 
 **Installing** the firmware and an OS (Fedora today; Debian planned; going
 back to Radxa's images): [docs/flashing.md](docs/flashing.md).
@@ -116,8 +133,10 @@ open ones stay available as options:
 - `VENDOR_DRAM=no`: the open LPDDR5 driver (`cubie-a7a-dram` in the oreboot
   branch) does the controller and PHY set-up. Only the PHY's own training
   firmware is read from the library object, as data.
-- `BLOBLESS=yes`: no vendor input at all. This development stage runs the
-  open PHY training stages and then halts.
+- `BLOBLESS=yes`: no vendor input at all. In this workspace's pin this
+  development stage runs the open PHY training stages and then halts. A
+  later development branch, not in the pin yet, boots Fedora this way at
+  1200 MHz ([status](docs/bring-up-status.md#dram-without-vendor-code)).
 
 ## Vendor inputs
 

@@ -9,8 +9,11 @@ The firmware is oreboot bt0 and oreboot main, followed by EDK2 (UEFI). It
 does not use Allwinner's BL31, U-Boot, OP-TEE or ARISC firmware. One closed
 part remains: by default bt0 trains DRAM with Allwinner's DRAM library and
 the DDR PHY's Synopsys training firmware, both taken from Allwinner's DRAM
-library object. The open DRAM driver is in progress and is not the default
-yet (see [README](../README.md#dram)).
+library object. Our own DRAM code, with no vendor DRAM library and no PHY
+training firmware, booted Fedora at 1200 MHz on 2026-11-12 on a development
+branch. It is not the default and not in this workspace yet (see
+[README](../README.md#dram) and
+[bring-up-status.md](bring-up-status.md#dram-without-vendor-code)).
 
 ## Which firmware runs
 
@@ -61,9 +64,10 @@ before you remove the card.
 
 Our board's microSD slot has not booted any card since 2026-11-11, so we
 test over USB FEL for now ([bring-up-status.md](bring-up-status.md#sd-slot)).
-**Fastboot over FEL** (writing the card over USB without a card reader) is
-planned and not in this repository yet
-([usb-fel-boot.md](usb-fel-boot.md#planned-fastboot-over-fel)).
+**Fastboot over FEL** boots the firmware from RAM on a development build
+(not in this repository yet). It cannot write the card or any other storage
+yet, so you still need a card reader to write a card
+([usb-fel-boot.md](usb-fel-boot.md#fastboot-over-fel)).
 
 ## Fedora on this firmware
 
@@ -89,6 +93,10 @@ today, so use a card or disk of at least 8 GB.
   on a USB disk has not been tested.
 - **Login:** `root`, password `Fedora123`. sshd and DHCP are on. Change the
   password at first login.
+- **Protective boot entries** (read-only root by default, separate
+  maintenance and full entries, first boot one-shot maintenance) are what we
+  use for test boots. They are not in this workspace's image yet; see
+  [bring-up-status.md](bring-up-status.md#test-boots-protective-entries).
 
 ## Debian on this firmware (planned)
 
