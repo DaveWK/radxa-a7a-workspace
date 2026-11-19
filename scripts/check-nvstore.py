@@ -67,42 +67,74 @@ def check_fd(path):
     print(f"{path}:")
     check(len(fd) == FD_SIZE, f"FD is {FD_SIZE:#x} bytes")
     nv = fd[VAR_BASE - FD_BASE : VAR_BASE - FD_BASE + FV_LENGTH]
-    check(len(nv) == FV_LENGTH, f"NV FV ({FV_LENGTH:#x} bytes at {VAR_BASE:#x}) inside the FD")
+    check(
+        len(nv) == FV_LENGTH,
+        f"NV FV ({FV_LENGTH:#x} bytes at {VAR_BASE:#x}) inside the FD",
+    )
     if len(nv) != FV_LENGTH:
         return
 
     # EFI_FIRMWARE_VOLUME_HEADER
-    (fs_guid, fv_length, sig, attrs, hdr_len, _csum, ext_off, _rsvd, rev) = struct.unpack_from(
-        "<16sQIIHHHBB", nv, 16
+    fs_guid, fv_length, sig, attrs, hdr_len, _csum, ext_off, _rsvd, rev = (
+        struct.unpack_from("<16sQIIHHHBB", nv, 16)
     )
     check(nv[:16] == bytes(16), "FV ZeroVector")
     check(sig == 0x4856465F, "FV signature _FVH")
     check(fs_guid == SYSTEM_NV_DATA_FV, "FV FileSystemGuid gEfiSystemNvDataFvGuid")
-    check(fv_length == FV_LENGTH, f"FvLength {fv_length:#x} == store + FTW working + spare")
+    check(
+        fv_length == FV_LENGTH,
+        f"FvLength {fv_length:#x} == store + FTW working + spare",
+    )
     check(rev == 2, "FV revision 2")
     check(ext_off == 0, "no FV extended header")
-    check(hdr_len == 0x48, f"HeaderLength {hdr_len:#x} == 0x48 (one block map entry + terminator)")
-    check(attrs == 0xE36, f"FV attributes {attrs:#x} == 0xe36 (as SdVarStoreFvbDxe's FormatFv)")
+    check(
+        hdr_len == 0x48,
+        f"HeaderLength {hdr_len:#x} == 0x48 (one block map entry + terminator)",
+    )
+    check(
+        attrs == 0xE36,
+        f"FV attributes {attrs:#x} == 0xe36 (as SdVarStoreFvbDxe's FormatFv)",
+    )
     nblocks, blen, t0, t1 = struct.unpack_from("<IIII", nv, 0x38)
-    check((nblocks, blen) == (FV_LENGTH // BLOCK, BLOCK), f"block map {nblocks:#x} x {blen:#x}")
+    check(
+        (nblocks, blen) == (FV_LENGTH // BLOCK, BLOCK),
+        f"block map {nblocks:#x} x {blen:#x}",
+    )
     check((t0, t1) == (0, 0), "block map terminator")
-    check(sum(struct.unpack_from(f"<{hdr_len // 2}H", nv, 0)) & 0xFFFF == 0, "FV header checksum")
+    check(
+        sum(struct.unpack_from(f"<{hdr_len // 2}H", nv, 0)) & 0xFFFF == 0,
+        "FV header checksum",
+    )
 
     # VARIABLE_STORE_HEADER (what VariableRuntimeDxe checks, and asserts on)
     vs_sig, vs_size, fmt, state = struct.unpack_from("<16sIBB", nv, hdr_len)
-    check(vs_sig in (AUTH_VARIABLE, VARIABLE), "variable store signature (authenticated or plain)")
-    check(vs_size == VAR_SIZE - hdr_len, f"variable store Size {vs_size:#x} == {VAR_SIZE - hdr_len:#x}")
+    check(
+        vs_sig in (AUTH_VARIABLE, VARIABLE),
+        "variable store signature (authenticated or plain)",
+    )
+    check(
+        vs_size == VAR_SIZE - hdr_len,
+        f"variable store Size {vs_size:#x} == {VAR_SIZE - hdr_len:#x}",
+    )
     check(fmt == 0x5A, "variable store formatted (0x5a)")
     check(state == 0xFE, "variable store healthy (0xfe)")
     body = nv[hdr_len + 28 : VAR_SIZE]
-    check(body == b"\xff" * len(body), "variable store empty (no variables, erased to the end)")
+    check(
+        body == b"\xff" * len(body),
+        "variable store empty (no variables, erased to the end)",
+    )
 
     # FTW working block header (FaultTolerantWriteDxe's InitializeLocalWorkSpaceHeader)
     work = nv[VAR_SIZE : VAR_SIZE + WORK_SIZE]
-    expect = bytearray(WORKING_BLOCK_SIG + b"\xff" * 8 + struct.pack("<Q", WORK_SIZE - 32))
+    expect = bytearray(
+        WORKING_BLOCK_SIG + b"\xff" * 8 + struct.pack("<Q", WORK_SIZE - 32)
+    )
     struct.pack_into("<I", expect, 16, zlib.crc32(bytes(expect)))
     expect[20] = 0xFE  # WorkingBlockValid = 0, WorkingBlockInvalid = 1
-    check(work[:32] == bytes(expect), "FTW working block header (signature, CRC, valid, queue size)")
+    check(
+        work[:32] == bytes(expect),
+        "FTW working block header (signature, CRC, valid, queue size)",
+    )
     check(work[32:] == b"\xff" * (WORK_SIZE - 32), "FTW write queue empty")
     spare = nv[VAR_SIZE + WORK_SIZE :]
     check(spare == b"\xff" * SPARE_SIZE, "FTW spare erased")
@@ -110,7 +142,7 @@ def check_fd(path):
 
 def ffs_files(fv):
     """(name GUID, UI name, depex bytes or None) for each file of an FV."""
-    (fv_length, sig, _attrs, hdr_len, _c, ext_off) = struct.unpack_from("<QIIHHH", fv, 32)
+    fv_length, sig, _attrs, hdr_len, _c, ext_off = struct.unpack_from("<QIIHHH", fv, 32)
     if sig != 0x4856465F:
         sys.exit("FVMAIN.Fv: no FV header")
     off = hdr_len
@@ -183,18 +215,28 @@ def check_fv(path):
                 NV_VAR_STORE_FORMATTED in depex_guids(files[FILE_FTW][1]),
                 "FaultTolerantWriteDxe waits for gEdkiiNvVarStoreFormattedGuid",
             )
-        check(sd == [TIMER_ARCH], "SdVarStoreFvbDxe waits for the timer arch protocol only")
+        check(
+            sd == [TIMER_ARCH],
+            "SdVarStoreFvbDxe waits for the timer arch protocol only",
+        )
         # Same depex: the dispatcher starts them in FV order, so the card
         # window SunxiMmcDxe publishes is there when SdVarStoreFvbDxe looks.
         check(
-            FILE_SUNXIMMC in files and order.index(FILE_SUNXIMMC) < order.index(FILE_SDVARSTORE),
+            FILE_SUNXIMMC in files
+            and order.index(FILE_SUNXIMMC) < order.index(FILE_SDVARSTORE),
             "SdVarStoreFvbDxe after SunxiMmcDxe in the FV",
         )
     else:
-        check(not var_waits, "no SdVarStoreFvbDxe: VariableRuntimeDxe does not wait for a store driver")
+        check(
+            not var_waits,
+            "no SdVarStoreFvbDxe: VariableRuntimeDxe does not wait for a store driver",
+        )
         for name, (ui, depex) in files.items():
             if NV_VAR_STORE_FORMATTED in depex_guids(depex):
-                check(False, f"{ui or name.hex()} waits for gEdkiiNvVarStoreFormattedGuid, which nothing installs")
+                check(
+                    False,
+                    f"{ui or name.hex()} waits for gEdkiiNvVarStoreFormattedGuid, which nothing installs",
+                )
 
 
 def main():

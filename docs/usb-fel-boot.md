@@ -37,24 +37,71 @@ Check with `lsusb -d 1f3a:efe8`.
 
 ## Boot
 
-    make fel-image            # in the build container: out/fel/
+    make fel-image            # in the build container: out/fel/<mode>-<mhz>/
     make xfel                 # once, on the host
     make fel-boot             # on the host, board in FEL
 
-`make fel-boot` runs `scripts/fel-boot.sh out/fel` with `XFEL=out/tools/xfel`.
+`make fel-image` builds one bundle for the current DRAM mode and profile into
+`out/fel/<mode>-<mhz>/` (`blobfree-1200` by default, `blobfree-2400` with
+`DRAM_MHZ=2400`, `dramlib-2400` with `VENDOR_DRAM=yes` and `phyfw-2400`
+with `VENDOR_DRAM=phyfw`). The bundle holds `bt0-fel.bin`, `firmware.bin`,
+`firmware.seek` and `build-manifest.json`.
+
+**Threat model:** the gate protects against accidents on a single-user
+bench host: stale, mixed, mislabelled or env-contaminated builds being
+booted as blob-free, and measurement builds being booted without a
+recorded human authorization. It does not defend against a malicious
+local user who can edit the scripts or the local records.
+
+`make fel-image` checks the clean workspace, oreboot, board, EDK2 and
+EDK2-platforms source identities before and after compilation. The three
+submodule HEADs must match the workspace gitlinks. This build refuses
+`OREBOOT` and `BOARD` Make overrides and inherited `EDK2_DIR` and
+`EDK2_PLATFORMS_DIR`.
+
+FEL Cargo builds use an offline, job-private home seeded only with read-only
+copies of the registry index and crate archives. The gate refuses inherited
+and Cargo-configured `A7A_*` and `A733_*` knobs in all modes. Use the separate
+lab tooling for knob experiments. In a blob-free build the same `DRAM_MHZ`
+(default 1200) selects the slot, Cargo's `A7A_PROFILE` and the reported profile.
+Measurement builds require `DRAM_MHZ` to be unset and do not pass
+`A7A_PROFILE` to Cargo; the mode fixes the profile at 2400.
+
+Compilation and the packaging snapshot use private directories under the
+slot's `build/` directory. EDK2 embeds the private copy of the built DTB
+or of the file selected by `FEL_DTB_INPUT`. EDK2 builds serialize access
+to the shared checkout with `out/.edk2-build.lock`.
+Only the verified build publishes a record at
+`out/fel/.records/<bt0_fel_sha256>.json`, separate from the bundle. It
+records the mode, profile, features, source paths and commits, effective
+build knobs, EDK2 target and arguments, DTB source path and digest, and the
+intermediate and packaged digests. Rebuild old bundles: a manifest alone is
+not a build record.
+
+`make fel-boot` runs `scripts/fel-boot.sh out/fel/<mode>-<mhz>` with
+`XFEL=out/tools/xfel`, `EXPECT_MODE=<mode>` and `EXPECT_PROFILE=<mhz>`.
+Direct script invocations default to `blobfree` and `${DRAM_MHZ:-1200}`.
 The steps:
 
-1. **Check** that the FEL device is an A733 (`xfel version`, ID `0x00190300`).
-2. **Load bt0**: clear the mailbox at `0xdf000`, write `bt0-fel.bin` (bt0
-   built with feature `fel`, linked at `0x90000`) and read it back.
-3. **Entry 1** (`xfel exec 0x90040`): bt0 brings up clocks, PMIC and DRAM,
+1. **Stage and validate**: copy the bundle into a private directory (mode
+   0700). Hash the staged bt0 and use that digest to look up the local build
+   record. The record, not the manifest, determines the mode and profile.
+    The current `HEAD`s, requested mode and profile, bundle manifest and
+    staged file digests must agree with the record. Check the layout table, payload CRCs
+   and FEL window before probing USB. Staging is removed on exit; xfel sees
+   only the staged bytes.
+2. **Check** that the FEL device is an A733 (`xfel version`, ID `0x00190300`).
+3. **Load bt0**: clear the mailbox at `0xdf000`, write the staged
+   `bt0-fel.bin` (bt0 built with feature `fel`, linked at `0x90000`) and read
+   it back.
+4. **Entry 1** (`xfel exec 0x90040`): bt0 brings up clocks, PMIC and DRAM,
    boosts the CPUs and returns to FEL. The ROM answers `exec` before the code
    finishes, so the script polls the mailbox until it reports DRAM up, then
    prints the DRAM size and clock.
-4. **Load the images**: the layout table frame goes to `0xdf200`, oreboot
-   main to `0x40000000` and the EDK2 FD to `0x41000000`, all taken from
-   `firmware.bin`. Each write is read back and compared (SHA-256).
-5. **Entry 2** (`xfel exec 0x90044`): bt0 checks the layout table and the
+5. **Load the images**: the layout table frame goes to `0xdf200`, oreboot
+   main to `0x40000000` and the EDK2 FD to `0x41000000`, all taken from the
+   staged `firmware.bin`. Each write is read back and compared (SHA-256).
+6. **Entry 2** (`xfel exec 0x90044`): bt0 checks the layout table and the
    images' CRCs in DRAM and turns off the GIC state the ROM left behind (its
    USB runs on interrupts, and a pending interrupt blocks the warm reset).
    It then warm-resets into main at EL3, as the SD boot does. FEL does not
@@ -62,14 +109,32 @@ The steps:
    `0xe0` entry 1 not run, `0xe1` bad layout table, `0xe2` CRC mismatch), and
    the board stays in FEL.
 
-`out/fel/` holds `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and
-`SHA256SUMS`. Build options: `FEL_DRAM=dramlib` (default, vendor DRAM
-library) or `FEL_DRAM=open` (open DRAM driver), and `FEL_BRINGUP=` (features of
-the FEL main, default `gmac usb usb-hs-only trng`).
+### Measurement builds
+
+A `dramlib` or `phyfw` bundle is a measurement build. A plain `make fel-boot`
+refuses it. To boot one, write an authorization file naming the exact
+`bt0_fel_sha256` from the local build record and a human authorization
+reference (a DECISIONS date and a queue key), then use the same measurement
+mode as the build; for example:
+
+    make fel-boot VENDOR_DRAM=yes FEL_MEASUREMENT_AUTH=/path/to/auth.json
+
+The file records a human authorization; it grants nothing by itself. The
+script checks that the staged bt0's digest matches the file and prints the
+reference. `EXPECT_SOURCE_SHA`/`EXPECT_OREBOOT_SHA` override the SHAs the
+record must match (for example to replay an older bundle with its retained
+local record); they do not authorize a measurement build.
+
+Build options: `DRAM_MHZ=1200|2400` (the DRAM clock of our own DRAM driver,
+which is the default; 1200 unless set), `VENDOR_DRAM=yes` (the vendor DRAM
+library instead; see the [README](../README.md#dram)), and `FEL_BRINGUP=`
+(features of the FEL main, default `gmac usb usb-hs-only trng`).
 
 ## Expected serial output
 
-Abridged, from a boot of this flow (values vary by board and build):
+Abridged, from a boot of this flow with the vendor DRAM library (values
+vary by board and build). With the default DRAM driver the init line names
+1200 MHz and the driver's `[dram]` stage lines follow it:
 
     oreboot 🦀 bt0 | Radxa Cubie A7A | Allwinner A733
     [bt0] SoC rev B, DCXO 26000 kHz ...
@@ -111,8 +176,9 @@ Abridged, from a boot of this flow (values vary by board and build):
 
 ## Images
 
-`make fel-image` builds the current preferred FEL image: vendor-library DRAM
-init, main with `gmac usb usb-hs-only trng` (the SMCCC TRNG on the Crypto
+`make fel-image` builds the current FEL image: DRAM init by our own driver
+(`VENDOR_DRAM=yes` for the vendor library, with which the boots described
+here were made), main with `gmac usb usb-hs-only trng` (the SMCCC TRNG on the Crypto
 Engine, which Linux uses as `/dev/hwrng`), and EDK2 DEBUG with USB, Ethernet
 and display. Use the root image from the same commit (`make fedora-image`),
 since the firmware embeds the device tree that the image's
@@ -166,3 +232,36 @@ Measured on the board on 2026-11-12 (MB = 10^6 bytes):
 - Open: a lab build that runs DRAM training experiments and returns the
   results over fastboot does not come back to FEL through its watchdog
   reset after a DRAM run (it does without one); that needs a USB-C replug.
+# Gated source checkouts
+
+`make fel-image` requires full, clean workspace, oreboot, EDK2,
+edk2-platforms and Fedora trees before compilation and again before
+publication. Sparse checkout, hidden index entries and missing or mistyped
+tracked files are refused. Initialized nested submodules must pass the same
+checks at their parent's gitlink. Optional uninitialized gitlinks must be
+empty; the record distinguishes them from verified checkouts.
+
+At the pinned `439613accf` oreboot has no gitlinks. EDK2's
+`BaseTools/Source/C/GNUmakefile` builds BrotliCompress from its `brotli`
+submodule; `build-edk2.sh` requires BaseFdtLib's `libfdt`. The board DSC
+maps BaseFdtLib and ArmTransferListLib, whose INFs use `libfdt` and `libtl`,
+respectively. These three nested EDK2 checkouts must be initialized.
+
+The default DTB is built from the workspace's Fedora gitlink. Use
+`FEL_DTB_INPUT` for an external tree; booting such a blobfree bundle requires
+`EXPECT_DTB_SHA256` to match the input. Before publication the gate decodes
+the LZMA-guided FV from `firmware.bin` itself, checks the embedded FDT's
+size and digest, and records both offsets: the section in the package and
+the FDT in the decoded stream. The FDF name comes from the current EDK2
+build's `BuildOptions`, including when `EDK2_ARGS` overrides the DSC default.
+
+The first EDK2 build without `out/edk2-basetools.stamp.json` forces a C
+tool rebuild under the EDK2 lock. Later builds refuse an EDK2 revision
+or binary-set/digest mismatch; investigate it before intentionally starting
+a new stamp. Each build records the stamp digest and the three effective
+`Conf` file digests, checked on both sides of the build under that lock.
+
+Run `scripts/build-xfel.sh` to produce the default tool and its
+`out/tools/xfel.record.json`. For an explicit `XFEL` override, supply the
+known full `EXPECT_XFEL_SHA256`. Before any USB access the boot gate copies
+and hashes the tool in one pass, then runs only the verified private copy.

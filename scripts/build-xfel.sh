@@ -32,5 +32,5 @@ grep -c '&bytes, 10000);' "$SRC/fel.c" | grep -qx 2 || {
 sed -i 's/&bytes, 10000);/\&bytes, 60000);/' "$SRC/fel.c"
 make -C "$SRC" -s clean >/dev/null 2>&1 || true
 make -C "$SRC" -s
-cp "$SRC/xfel" "$TOP/out/tools/xfel"
+python3 -I "$TOP/scripts/fel-tools.py" record-xfel "$SRC" "$XFEL_COMMIT"
 echo "build-xfel: $TOP/out/tools/xfel (xfel $XFEL_TAG, 60 s USB timeout)"

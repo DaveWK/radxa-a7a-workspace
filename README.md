@@ -22,18 +22,21 @@ There is no vendor boot0, TF-A or U-Boot in this chain.
 `make fedora-image`. Never commit or upload a built image, firmware binary or
 vendor input.
 
-## Board status (2026-11-12)
+## Board status (2026-11-18)
 
 - **Boots to a Fedora 45 login over USB FEL:** bt0 → main → EDK2 → GRUB →
   Fedora 7.3.3 (stock kernel) on all 8 cores, with the root on a USB disk in
-  the blue port. DRAM is 4096 MiB at 2400 MHz through the vendor DRAM library
-  path (the default, see "DRAM" below).
-- **DRAM without vendor code boots Fedora (development branch):** no
-  Allwinner DRAM library, no Synopsys PHY training firmware. 4096 MiB at
-  1200 MHz; memtester and a 3-minute stress-ng run pass, as on the
-  vendor-DRAM control boot. Not in this workspace's pin yet, and not the
-  default: the vendor path stays until the open one reaches 2400 MHz and
-  the same stability. See
+  the blue port. DRAM is 4096 MiB at 2400 MHz; these boots used the vendor
+  DRAM library path (`VENDOR_DRAM=yes`, a measurement build; see "DRAM"
+  below).
+- **DRAM without vendor code is the default build:** no Allwinner DRAM
+  library, no Synopsys PHY training firmware. It runs DRAM at 1200 MHz and
+  boots Fedora: 4096 MiB, `memtester 2600M` once and a 5-minute `stress-ng`
+  run with verify pass, matching the vendor-DRAM control boot. At 2400 MHz
+  (`DRAM_MHZ=2400`) the kernel fails to decompress at the hand-over read
+  latency of 6; at 5 Linux starts but the memory tests fail on bit 37, so
+  2400 MHz is not usable yet. All of it on the 4 GB board over USB FEL: no
+  card or eMMC boot, and the 6 GB board, are still to run. See
   [docs/bring-up-status.md](docs/bring-up-status.md#dram-without-vendor-code).
 - **Fastboot over FEL (development build):** firmware sent at 25.7 MB/s and
   read back at about 42 MB/s over the USB 2.0 port, then booted from RAM.
@@ -52,8 +55,8 @@ vendor input.
   (`/dev/vipcore`, self-test passes), and Wi-Fi scan and Bluetooth with the
   AIC8800 package built from a local driver tree (`AIC8800_SRC`).
 - **Not yet:** the GPU (its power domains are now switched on only on
-  demand, but GPU_CORE still does not come up, so no rendering), cpufreq, the
-  open DRAM driver as the default (or at 2400 MHz), and a cause for three
+  demand, but GPU_CORE still does not come up, so no rendering), cpufreq, a
+  error-free 2400 MHz on our own DRAM driver, and a cause for three
   memory-corruption oopses on 2026-11-12 (two followed the Wi-Fi driver's
   start). Persistent UEFI variables on the card are built
   (`-D SD_VARSTORE_ENABLE=TRUE`) but not yet confirmed on the board.
@@ -66,7 +69,7 @@ Details: [docs/bring-up-status.md](docs/bring-up-status.md).
     cd radxa-a7a-workspace
     podman build -t a7a-build -f Containerfile .
     podman run --rm --userns=keep-id --security-opt label=disable \
-      -v "$PWD":/w -w /w a7a-build make vendor firmware fel-image rpms
+      -v "$PWD":/w -w /w a7a-build make firmware fel-image rpms
     podman run --rm --privileged -v "$PWD":/w -w /w a7a-build make fedora-image
 
 `make fedora-image` installs aarch64 Fedora packages and runs their
@@ -79,18 +82,18 @@ Fedora 45 host with the packages in `Containerfile`; there
 
 | Target | Output |
 |---|---|
-| `make vendor` | `vendor/dramlib/libdram`: the vendor DRAM library object, downloaded from its public source and checked by SHA-256 (see "Vendor inputs") |
 | `make dtb` | `out/dtb/sun60i-a733-cubie-a7a.dtb` |
-| `make firmware` | `out/firmware/firmware.bin` + `firmware.seek`: bt0, layout table, main, EDK2 (with the DTB), for the SD card at sector 256 |
-| `make fel-image` | `out/fel/`: `bt0-fel.bin` (bt0 linked at 0x90000) and a `firmware.bin` whose main runs USB in high-speed mode |
+| `make firmware` | `out/firmware/firmware.bin` + `firmware.seek`: bt0, layout table, main, EDK2 (with the DTB), for the SD card or the eMMC at sector 256 |
+| `make fel-image` | `out/fel/<mode>-<mhz>/` (`blobfree-1200`, `blobfree-2400`, `dramlib-2400`, `phyfw-2400`): `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and `build-manifest.json`; intermediates and the cargo target under `build/` |
 | `make xfel` | `out/tools/xfel`: xfel v1.4.0 built from source with a 60 s USB timeout |
-| `make fel-boot` | boots the board over USB FEL with `out/fel/` (run on the host, see below) |
+| `make fel-boot` | boots the board over USB FEL with `out/fel/<mode>-<mhz>/` (run on the host, see below). Refuses any mode but `blobfree`; a measurement build needs `FEL_MEASUREMENT_AUTH=<file>` |
 | `make rpms` | `out/fedora/rpmbuild/`: the `cubie-a7a-*` SRPMs and RPMs |
 | `make fedora-image` | `out/image/a7a-fedora45.img`: GPT, `firmware.bin` at sector 256, ESP, Fedora 45 root (grows to the card on first boot) |
 | `make serial` | UART0 logger: picocom in a detached screen session, logs in `serial-logs/` |
 | `make test` | host tests of the board crates and script checks |
+| `make vendor` | measurement builds only (`VENDOR_DRAM=yes`, `phyfw`, `FEL_DRAM=dramlib`): `vendor/dramlib/libdram`, the vendor DRAM library object, downloaded with `aria2c` from its public source and checked by SHA-256 (see "Vendor inputs") |
 
-Options: `VENDOR_DRAM=yes|no`, `BLOBLESS=yes`, `FEL_DRAM=dramlib|open`,
+Options: `DRAM_MHZ=1200|2400`, `VENDOR_DRAM=yes` (see "DRAM"),
 `BRINGUP=`/`FEL_BRINGUP=` (features of oreboot main), `EDK2_TARGET=DEBUG|RELEASE`,
 `EDK2_ARGS=`, `AIC8800_SRC=<tree>` (Wi-Fi driver, see
 [fedora/README.md](fedora/README.md)), `FWREPO=<tree>` (firmware log reader
@@ -108,6 +111,11 @@ instructions are in [docs/usb-fel-boot.md](docs/usb-fel-boot.md):
     dd if=out/image/a7a-fedora45.img of=/dev/sdX bs=4M conv=fsync   # USB disk, blue port
     make xfel                       # once
     make fel-boot                   # board in FEL on this host's USB (its USB-C port)
+
+`make fel-boot` boots the blob-free image (`out/fel/blobfree-1200/`). A
+`dramlib` or `phyfw` measurement build needs `FEL_MEASUREMENT_AUTH=<file>`
+naming the bundle's `bt0_fel_sha256` and a human authorization reference; the
+file records the authorization and grants nothing by itself.
 
 **SD card**: write `out/image/a7a-fedora45.img` to a microSD card, or write
 only `out/firmware/firmware.bin` at sector 256 of an existing card. See
@@ -127,28 +135,50 @@ attach` reattaches).
 
 ## DRAM
 
-`bt0` has three DRAM paths. The default is the one that boots today, and the
-open ones stay available as options:
+By default `bt0`, and the FEL `bt0`, bring DRAM up with this project's own
+LPDDR5 driver (`cubie-a7a-dram` in the oreboot branch) and nothing from a
+vendor: no DRAM library, no PHY training firmware, no PHY sequencer image.
+All training runs on the CPU in `bt0`, with the settings of the board runs
+built in, so `make firmware` and `make fel-image` need no `make vendor`.
 
-- `VENDOR_DRAM=yes` (default): DRAM init through Allwinner's DRAM library,
-  which is linked into bt0 from `vendor/`.
-- `VENDOR_DRAM=no`: the open LPDDR5 driver (`cubie-a7a-dram` in the oreboot
-  branch) does the controller and PHY set-up. Only the PHY's own training
-  firmware is read from the library object, as data.
-- `BLOBLESS=yes`: no vendor input at all. In this workspace's pin this
-  development stage runs the open PHY training stages and then halts. A
-  later development branch, not in the pin yet, boots Fedora this way at
-  1200 MHz ([status](docs/bring-up-status.md#dram-without-vendor-code)).
+- `DRAM_MHZ=1200|2400` picks the DRAM clock of those settings. Unset, it is
+  the firmware's default, 1200, the clock Fedora boots at. 2400 is there
+  for the work on it: it does not boot Linux yet (see the status above). The
+  vendor paths run 2400 MHz. The profile is part of the bundle path
+  (`out/fel/<mode>-<mhz>/`) and `make fel-boot` checks it.
+- `VENDOR_DRAM=yes`: measurement build. DRAM init through Allwinner's DRAM
+  library, linked into bt0 from `vendor/` (run `make vendor` first), at
+  2400 MHz. It is also what the 8 and 12 GB boards need for now: their
+  parameter sets run another DRAM clock, which our driver's stages refuse.
+  A plain `make fel-boot` refuses it; boot it with
+  `FEL_MEASUREMENT_AUTH=<file>`.
+- `VENDOR_DRAM=phyfw`: measurement build. Our driver with the PHY's own
+  training firmware, read from the library object as data (`make vendor` as
+  well). A plain `make fel-boot` refuses it; boot it with
+  `FEL_MEASUREMENT_AUTH=<file>`.
+
+One setting of our driver can be changed for a build by its `A7A_*`
+variable in the environment; the board README in `firmware/oreboot`
+(`src/mainboard/radxa/cubie-a7a/`) lists how. Earlier spellings:
+`BLOBLESS=yes` and `FEL_DRAM=open` are the default now, and
+`FEL_DRAM=dramlib` still builds only the FEL `bt0` with the library, a
+measurement build a plain `make fel-boot` refuses (`FEL_MEASUREMENT_AUTH=<file>`
+to boot it).
+
+When our driver's training does not end clean, `bt0` halts instead of
+booting: over USB FEL the board stays in FEL and `make fel-boot` reports
+the mailbox state; from a card the next start enters FEL.
 
 ## Vendor inputs
 
-The firmware build reads one closed input, Allwinner's A733 DRAM library
-object from the Tina SDK
+The default firmware build reads no closed input. The measurement builds
+(`VENDOR_DRAM=yes`, `VENDOR_DRAM=phyfw` and `FEL_DRAM=dramlib`) read one,
+Allwinner's A733 DRAM library object from the Tina SDK
 (`gitlab.com/tina5.0_aiot/lichee/dramlib`, commit `35e84c83`,
 `sun60iw2p1/spl_libdram/libdram`). `make vendor` downloads it to `vendor/`
-(gitignored) and checks its SHA-256. It is never committed here or in any
-submodule. Firmware built with it contains vendor code or data: keep it for
-your own use.
+(gitignored) with `aria2c` and checks its SHA-256. It is never committed here
+or in any submodule. Firmware built with it contains vendor code or data:
+keep it for your own use.
 
 No other closed binaries are involved: EDK2, oreboot and the board RPMs are
 built from source, and the Fedora image takes its firmware files from

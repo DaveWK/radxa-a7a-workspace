@@ -11,10 +11,16 @@ set -euo pipefail
 B=/proc/sys/fs/binfmt_misc
 [ "$(uname -m)" != aarch64 ] || exit 0
 if [ -e $B/qemu-aarch64 ]; then
-    grep -q '^flags: .*F' $B/qemu-aarch64 || { echo "binfmt: qemu-aarch64 has no F flag" >&2; exit 1; }
+    grep -q '^flags: .*F' $B/qemu-aarch64 || {
+        echo "binfmt: qemu-aarch64 has no F flag" >&2
+        exit 1
+    }
     exit 0
 fi
-[ "$(id -u)" = 0 ] || { echo "binfmt: no qemu-aarch64 handler; install qemu-user-static-aarch64 on the host" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || {
+    echo "binfmt: no qemu-aarch64 handler; install qemu-user-static-aarch64 on the host" >&2
+    exit 1
+}
 [ -e $B/register ] || mount -t binfmt_misc binfmt_misc $B
 sed -n 's/^\(:qemu-aarch64:.*\)$/\1/p' /usr/lib/binfmt.d/qemu-aarch64-static.conf >$B/register
 grep -q '^flags: .*F' $B/qemu-aarch64

@@ -1,0 +1,4 @@
+# shfmt reads this for scripts/*.sh; `make test` runs `shfmt -d scripts/*.sh`.
+[*.sh]
+indent_style = space
+indent_size = 4

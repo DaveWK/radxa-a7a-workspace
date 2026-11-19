@@ -3,24 +3,48 @@
 # under firmware/ and fedora/; outputs go to out/. Images are never committed
 # or uploaded: build your own.
 #
-#   make vendor        fetch the vendor DRAM library object (build input, see README)
 #   make dtb           the Cubie A7A device tree (out/dtb/)
-#   make firmware      bt0 + main + EDK2 -> out/firmware/firmware.bin (SD card, LBA 256)
-#   make fel-image     firmware + bt0 for USB FEL boot -> out/fel/
+#   make firmware      bt0 + main + EDK2 -> out/firmware/firmware.bin (SD card or eMMC, LBA 256)
+#   make fel-image     the FEL bundle for one mode and profile ->
+#                      out/fel/<mode>-<mhz>/ (blobfree-1200, blobfree-2400,
+#                      dramlib-2400, phyfw-2400). Private build and packaging
+#                      directories, and a build record under out/fel/.records/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
-#   make fel-boot      boot the board over USB FEL (board in FEL on the host's USB)
+#   make fel-boot      boot the board over USB FEL with out/fel/<mode>-<mhz>/
+#                      (board in FEL on the host's USB). Only a blobfree
+#                      bundle; a dramlib or phyfw measurement build needs
+#                      FEL_MEASUREMENT_AUTH=<file>
 #   make rpms          the cubie-a7a-* SRPMs and RPMs -> out/fedora/rpmbuild/
 #   make fedora-image  Fedora 45 image with the firmware at LBA 256 -> out/image/
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
 #   make test          host tests (oreboot board crates, scripts)
-#   make clean
+#   make vendor        fetch the vendor DRAM library object (measurement builds
+#                      only: VENDOR_DRAM=yes|phyfw, FEL_DRAM=dramlib)
+#   make clean         remove out/
+#   make mrproper      clean + vendor/ + the host cargo test targets (never the
+#                      submodule sources)
 #
-# VENDOR_DRAM=yes (default) bt0 initialises DRAM through Allwinner's DRAM
-#   library (the path that boots today); VENDOR_DRAM=no uses the open driver
-#   (cubie-a7a-dram) with only the PHY's training firmware read from the
-#   library as data; BLOBLESS=yes builds the open driver's firmware-free
-#   development stage (probes and halts). FEL_DRAM=dramlib|open likewise for
-#   the FEL bt0.
+# DRAM: by default bt0 (and the FEL bt0) brings DRAM up with this project's
+#   own driver and nothing from a vendor: no DRAM library, no PHY training
+#   firmware, so the build needs no `make vendor`.
+#   DRAM_MHZ=1200|2400   the DRAM clock of that driver's built-in settings.
+#                        Unset: the firmware's default, 1200, which boots
+#                        Linux; 2400 passes bt0's tests but does not boot
+#                        Linux yet. The vendor paths run 2400.
+#   VENDOR_DRAM=yes      measurement build: DRAM through Allwinner's DRAM
+#                        library instead (run `make vendor` first), at
+#                        2400 MHz. A plain `make fel-boot` refuses it; boot it
+#                        with FEL_MEASUREMENT_AUTH=<file>
+#   VENDOR_DRAM=phyfw    measurement build: our driver with the PHY's own
+#                        training firmware read from that library's object as
+#                        data (`make vendor` too). A plain `make fel-boot`
+#                        refuses it; boot it with FEL_MEASUREMENT_AUTH=<file>
+#   Earlier spellings: BLOBLESS=yes and FEL_DRAM=open are the default now;
+#   FEL_DRAM=dramlib builds only the FEL bt0 with the library (a measurement
+#   build; a plain `make fel-boot` refuses it; FEL_MEASUREMENT_AUTH=<file> to
+#   boot it).
+#   fel-image refuses inherited or Cargo-configured A7A_* and A733_* knobs.
+#   Use the separate lab tooling for individual driver settings.
 
 TOP      := $(abspath .)
 OUT      := $(TOP)/out
@@ -29,9 +53,8 @@ BOARD    := $(OREBOOT)/src/mainboard/radxa/cubie-a7a
 FEDORA   := $(TOP)/fedora
 DTS      := $(FEDORA)/fedora/dts
 
-VENDOR_DRAM ?= yes
-BLOBLESS    ?= no
-FEL_DRAM    ?= dramlib
+VENDOR_DRAM ?= no
+FEL_DRAM    ?=
 OTP         ?= no
 DRAM_LIB    ?= $(TOP)/vendor/dramlib/libdram
 # Peripheral bring-up in oreboot main (cargo features of main).
@@ -51,43 +74,90 @@ FWREPO      ?= none
 
 CARGO   := env -u RUSTUP_TOOLCHAIN -u RUSTFLAGS cargo
 OBJCOPY ?= llvm-objcopy
-BT0_MAX_BYTES := 262144
+# The longest bt0 the image tool wraps: 0x4a000 bytes, the length of the
+# vendor boot0 the mask ROM loads from this board's cards (scripts/mkimage.py
+# EGON_MAX). An earlier limit of 0x40000 belonged to bt0's hand-over to a
+# vendor SPL after a failed boot (larger images had not come back through
+# it); bt0 has no such hand-over any more, and with the vendor DRAM library
+# (VENDOR_DRAM=yes) it is larger than 0x40000. Image, bss and stack are
+# bounded separately by bt0's linker script.
+BT0_MAX_BYTES := 303104
 DRAM_LIB_OVERRIDES := dwc_ddrphy_phyinit_G_execFW mctl_com_set_controller_after_phy \
 	lp5_sw_mr_wr lp5_sw_mr_rd \
 	lpddr4_phyinit_D_loadIMEM lpddr4_phyinit_F_loadDMEM lpddr4_phyinit_I_loadPIEImage
 
 FW_OUT  := $(OUT)/firmware
-FEL_OUT := $(OUT)/fel
 TGT     := $(OUT)/target
 DTB     := $(OUT)/dtb/sun60i-a733-cubie-a7a.dtb
 DTB_VERSION = $(shell cat $(DTS)/DTB_VERSION)
 LIBDRAM_A := $(OUT)/oreboot/libdram-a733.a
 BT0_BIN := $(OUT)/oreboot/bt0.bin
-BT0_FEL_BIN := $(OUT)/oreboot/bt0-fel.bin
 MAIN_BIN := $(OUT)/oreboot/main.bin
-FEL_MAIN_BIN := $(OUT)/oreboot/main-fel.bin
 EDK2_FD := $(OUT)/edk2/CUBIEA7A_EFI.fd
 XFEL    ?= $(OUT)/tools/xfel
 IMAGE   := $(OUT)/image/a7a-fedora$(FEDORA_RELEASE).img
 
-BT0_FEATURES = $(strip $(if $(filter yes,$(BLOBLESS)),blobless,$(if $(filter yes,$(VENDOR_DRAM)),dramlib)) \
-	$(if $(filter yes,$(OTP)),otp))
-FEL_FEATURES = $(strip fel $(if $(filter dramlib,$(FEL_DRAM)),dramlib))
+# The DRAM path of bt0 and of the FEL bt0: no (ours, nothing from a vendor),
+# yes (the vendor library) or phyfw (ours with the PHY's firmware as data).
+ifneq ($(words $(filter no yes phyfw,$(VENDOR_DRAM))):$(words $(VENDOR_DRAM)),1:1)
+$(error VENDOR_DRAM=$(VENDOR_DRAM): no (default), yes or phyfw)
+endif
+ifneq ($(words $(filter 1200 2400,$(or $(DRAM_MHZ),1200))):$(words $(or $(DRAM_MHZ),1200)),1:1)
+$(error DRAM_MHZ=$(DRAM_MHZ): 1200 or 2400)
+endif
+override BT0_DRAM := $(VENDOR_DRAM)
+override FEL_BT0_DRAM := $(if $(filter dramlib,$(FEL_DRAM)),yes,$(VENDOR_DRAM))
+# dram-cargo <no|yes|phyfw>: the cargo arguments that select the path. bt0's
+# default features are the blob-free boot; the other two are built without
+# them.
+dram-cargo = $(if $(filter no,$(1)),,--no-default-features)
+dram-feature = $(if $(filter yes,$(1)),dramlib)
+# dram-env <no|yes|phyfw>: what the build reads from outside the tree, and
+# the clock of the built-in settings (only our driver alone has them). The
+# vendor paths run 2400 MHz, so DRAM_MHZ=2400 is accepted there and any other
+# value is refused.
+dram-env = $(if $(filter yes,$(1)),A733_DRAM_LIB=$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),A733_PHY_FW_OBJ=$(DRAM_LIB)) \
+	$(if $(filter no,$(1)),$(if $(DRAM_MHZ),A7A_PROFILE=$(DRAM_MHZ)),$(if $(DRAM_MHZ),$(if $(filter 2400,$(DRAM_MHZ)),,$(error DRAM_MHZ=$(DRAM_MHZ): the vendor DRAM path runs 2400 MHz))))
+# dram-dep <no|yes|phyfw>: the vendor file the build needs, if any.
+dram-dep = $(if $(filter yes,$(1)),$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),$(DRAM_LIB))
+dram-tag = $(if $(filter no,$(1)),blobfree,$(if $(filter yes,$(1)),dramlib,phyfw))
+# Each DRAM mode and profile gets its own FEL build and output directory, so
+# two builds never share or overwrite the same intermediate or bundle.
+override FEL_TAG_MODE := $(call dram-tag,$(FEL_BT0_DRAM))
+override PROFILE := $(if $(filter blobfree,$(FEL_TAG_MODE)),$(or $(DRAM_MHZ),1200),2400)
+override FEL_SLOT := $(FEL_TAG_MODE)-$(PROFILE)
+ifneq ($(or $(FEL_IMAGE_EXPECT),$(FEL_SLOT)),$(FEL_SLOT))
+$(error FEL compile slot $(FEL_SLOT) does not match the requested $(FEL_IMAGE_EXPECT))
+endif
+override FEL_OUT := $(OUT)/fel/$(FEL_SLOT)
+override FEL_BUILD := $(or $(FEL_RUN_DIR),$(FEL_OUT)/build)
+override FEL_TGT := $(FEL_BUILD)/target
+override FEL_DTB := $(FEL_BUILD)/dtb/sun60i-a733-cubie-a7a.dtb
+override FEL_EDK2_DIR := $(FEL_BUILD)/edk2
+override FEL_BT0 := $(FEL_BUILD)/bt0.bin
+override FEL_BT0_FEL := $(FEL_BUILD)/bt0-fel.bin
+override FEL_MAIN := $(FEL_BUILD)/main-fel.bin
+BT0_FEATURES = $(strip $(call dram-feature,$(BT0_DRAM)) $(if $(filter yes,$(OTP)),otp))
+override FEL_FEATURES = $(strip fel $(call dram-feature,$(FEL_BT0_DRAM)))
+# The old FEL_DRAM=dramlib alias uses the vendor library only in the FEL bt0.
+# Its SD bt0 is blob-free at the pinned default, with no profile override.
+override FEL_SD_ENV = $(if $(filter blobfree,$(FEL_TAG_MODE)),A7A_PROFILE=$(PROFILE),$(call dram-env,$(BT0_DRAM)))
+override FEL_BT0_ENV = $(if $(filter blobfree,$(FEL_TAG_MODE)),A7A_PROFILE=$(PROFILE),$(call dram-env,$(FEL_BT0_DRAM)))
+fel-profile-check = $(if $(filter-out blobfree,$(FEL_TAG_MODE)),$(if $(filter-out undefined,$(origin DRAM_MHZ)),$(error DRAM_MHZ must be unset for FEL measurement mode $(FEL_TAG_MODE), which runs at 2400 MHz)))
 empty :=
 space := $(empty) $(empty)
-# The vendor library archive, unless the build reads nothing from it.
-LIBDRAM_DEP = $(if $(filter yes,$(BLOBLESS)),,$(LIBDRAM_A))
+shell-quote = '$(subst ','"'"',$(1))'
 
 define check-bt0-size
 	@s=$$(stat -c %s $(1)); if [ $$s -gt $(BT0_MAX_BYTES) ]; then \
-		echo "$(1): $$s bytes, above the 0x40000 limit"; exit 1; fi; \
+		echo "$(1): $$s bytes, above the $(BT0_MAX_BYTES) byte limit"; exit 1; fi; \
 	echo "$(1): $$s bytes (limit $(BT0_MAX_BYTES))"
 endef
 
-# bt0_build <features> <target dir> <output .bin>
+# bt0_build <features> <target dir> <output .bin> <DRAM path> <env assignments>
 define bt0_build
-	cd $(BOARD)/bt0 && A733_PHY_FW_OBJ=$(DRAM_LIB) A733_DRAM_LIB=$(LIBDRAM_A) CARGO_TARGET_DIR=$(2) \
-		$(CARGO) build --release --locked $(if $(1),--features "$(1)")
+	cd $(BOARD)/bt0 && env $(5) CARGO_TARGET_DIR=$(2) \
+		$(CARGO) build --release --locked $(call dram-cargo,$(4)) $(if $(1),--features "$(1)")
 	$(OBJCOPY) -O binary $(2)/armv7a-none-eabi/release/oreboot-cubie-a7a-bt0 $(3)
 	$(call check-bt0-size,$(3))
 endef
@@ -98,8 +168,8 @@ define main_build
 	$(OBJCOPY) -O binary $(2)/aarch64-unknown-none-softfloat/release/oreboot-cubie-a7a-main $(3)
 endef
 
-.PHONY: help check-sources vendor dtb bt0 bt0-fel main main-fel edk2 firmware fel-image xfel fel-boot \
-	rpms fedora-image serial test clean FORCE
+.PHONY: help check-sources vendor dtb bt0 bt0-fel main main-fel edk2 fel-dtb fel-edk2 fel-bt0 \
+	firmware fel-image xfel fel-boot rpms fedora-image serial test clean mrproper FORCE
 
 help:
 	@sed -n '/^$$/q;s/^# \{0,1\}//p' Makefile
@@ -132,35 +202,58 @@ dtb: check-sources
 	mkdir -p $(dir $(DTB))
 	$(MAKE) -C $(DTS) OUT=$(DTB) DTB_ORIGIN=firmware
 
-bt0: check-sources $(LIBDRAM_DEP) | $(OUT)/oreboot
-	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(or $(BT0_FEATURES),open)),$(BT0_BIN))
+bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(OUT)/oreboot
+	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM),$(strip $(call dram-env,$(BT0_DRAM))))
 
-bt0-fel: check-sources $(LIBDRAM_A) | $(OUT)/oreboot
-	$(call bt0_build,$(FEL_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(FEL_FEATURES)),$(BT0_FEL_BIN))
-	@echo "$(BT0_FEL_BIN): linked at 0x90000"
+$(FEL_BUILD):
+	mkdir -p $@
+
+fel-dtb: check-sources
+	mkdir -p $(dir $(FEL_DTB))
+	$(MAKE) -C $(DTS) OUT=$(FEL_DTB) DTB_ORIGIN=firmware
+
+fel-edk2: check-sources $(if $(FEL_DTB_INPUT),,fel-dtb)
+	EDK2_OUT=$(FEL_EDK2_DIR) BUILD_TAG=$(FEL_SLOT) scripts/build-edk2.sh $(EDK2_TARGET) $(EDK2_ARGS) -D DTB_FILE=$(or $(FEL_DTB_INPUT),$(FEL_DTB))
+
+fel-bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(FEL_BUILD)
+	$(fel-profile-check)
+	$(call bt0_build,$(BT0_FEATURES),$(FEL_TGT)/bt0-sd,$(FEL_BT0),$(BT0_DRAM),$(strip $(FEL_SD_ENV)))
+
+bt0-fel: check-sources $(call dram-dep,$(FEL_BT0_DRAM)) | $(FEL_BUILD)
+	$(fel-profile-check)
+	$(call bt0_build,$(FEL_FEATURES),$(FEL_TGT)/bt0-fel,$(FEL_BT0_FEL),$(FEL_BT0_DRAM),$(strip $(FEL_BT0_ENV)))
+	@echo "$(FEL_BT0_FEL): linked at 0x90000"
 
 main: check-sources | $(OUT)/oreboot
 	$(call main_build,$(BRINGUP),$(TGT)/main,$(MAIN_BIN))
 
-main-fel: check-sources | $(OUT)/oreboot
-	$(call main_build,$(FEL_BRINGUP),$(TGT)/main-fel,$(FEL_MAIN_BIN))
+main-fel: check-sources | $(FEL_BUILD)
+	$(call main_build,$(FEL_BRINGUP),$(FEL_TGT)/main-fel,$(FEL_MAIN))
 
 edk2: check-sources dtb
 	EDK2_OUT=$(OUT)/edk2 scripts/build-edk2.sh $(EDK2_TARGET) $(EDK2_ARGS) -D DTB_FILE=$(DTB)
 
-# SD card firmware: firmware.bin goes at firmware.seek (sector 256, 128 KiB).
+# SD card and eMMC firmware: firmware.bin goes at firmware.seek (sector 256,
+# 128 KiB); bt0 boots from whichever of the two the mask ROM loaded it from.
 firmware: bt0 main edk2
 	python3 scripts/mkimage.py --bt0 $(BT0_BIN) --main $(MAIN_BIN) --payload $(EDK2_FD) \
 		--out $(FW_OUT) --egon-offset $(EGON_OFFSET)
 	cd $(FW_OUT) && sha256sum firmware.bin firmware.seek | tee SHA256SUMS
 
-# USB FEL boot set for scripts/fel-boot.sh: bt0-fel.bin plus a firmware.bin
-# whose layout table names main (FEL_BRINGUP) and EDK2.
-fel-image: bt0 bt0-fel main-fel edk2
-	python3 scripts/mkimage.py --bt0 $(BT0_BIN) --main $(FEL_MAIN_BIN) --payload $(EDK2_FD) \
-		--out $(FEL_OUT) --egon-offset $(EGON_OFFSET)
-	cp $(BT0_FEL_BIN) $(FEL_OUT)/bt0-fel.bin
-	cd $(FEL_OUT) && sha256sum bt0-fel.bin firmware.bin firmware.seek | tee SHA256SUMS
+# The recursive Make invocation inherits the jobserver. The orchestrator
+# handles -n without acquiring locks, creating directories or compiling.
+fel-image:
+	$(fel-profile-check)
+	$(foreach var,TOP OREBOOT BOARD CARGO FEDORA DTS,$(if $(filter file,$(origin $(var))),,$(error fel-image refuses $(var) override (origin: $(origin $(var))))))
+	$(if $(findstring t,$(filter-out -%,$(firstword $(MAKEFLAGS)))),:,python3 -I scripts/fel-manifest.py build \
+		--make "$(MAKE)" $(if $(findstring n,$(filter-out -%,$(firstword $(MAKEFLAGS)))),--dry-run) \
+		--out-dir "$(FEL_OUT)" --mode $(FEL_TAG_MODE) --profile $(PROFILE) \
+		--features "$(FEL_FEATURES)" --sd-features "$(BT0_FEATURES)" \
+		--main-features "$(FEL_BRINGUP)" --fel-env "$(strip $(FEL_BT0_ENV))" \
+		--sd-env "$(strip $(FEL_SD_ENV))" --egon-offset $(EGON_OFFSET) \
+		--edk2-target=$(call shell-quote,$(or $(EDK2_TARGET),DEBUG)) \
+		--edk2-args=$(call shell-quote,$(EDK2_ARGS)) \
+		--fel-dtb-input=$(call shell-quote,$(FEL_DTB_INPUT)))
 
 xfel: $(XFEL)
 $(XFEL):
@@ -168,10 +261,14 @@ $(XFEL):
 
 # Needs the board in FEL (USB 1f3a:efe8) on this host and root for xfel
 # (SUDO=, with xfel's udev rule installed, runs it as you). Run it on the
-# host, not in the build container.
+# host, not in the build container. The workspace build record, looked up
+# by staged bt0 digest, must agree with the bundle and the requested mode/profile.
+# A dramlib or phyfw measurement build needs
+# FEL_MEASUREMENT_AUTH=<file> naming this bt0 and a human authorization.
 fel-boot: $(XFEL)
+	$(fel-profile-check)
 	@test -f $(FEL_OUT)/bt0-fel.bin || { echo "run make fel-image first (in the container)" >&2; exit 1; }
-	XFEL=$(XFEL) scripts/fel-boot.sh $(FEL_OUT)
+	$(if $(filter-out file,$(origin XFEL)),XFEL=$(call shell-quote,$(XFEL))) EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh $(FEL_OUT)
 
 rpms: check-sources
 	FWREPO=$(FWREPO) FEDORA_RELEASE=$(FEDORA_RELEASE) $(if $(AIC8800_SRC),AIC8800_SRC=$(abspath $(AIC8800_SRC))) \
@@ -202,8 +299,18 @@ serial:
 test: check-sources
 	cd $(BOARD)/dram && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	cd $(BOARD)/common && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
-	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py
+	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/fel-fmmt.py scripts/fel-check.py scripts/fel-tools.py scripts/test-fel-manifest.py
+	python3 -I scripts/test-fel-manifest.py
 	bash -n scripts/fel-boot.sh scripts/build-edk2.sh scripts/serial-log.sh scripts/fetch-vendor.sh scripts/build-xfel.sh scripts/binfmt-aarch64.sh
+	shellcheck scripts/*.sh
+	shfmt -d scripts/*.sh
+	black --check scripts/*.py
 
 clean:
 	rm -rf $(OUT)
+
+# Everything clean removes, plus the fetched vendor input and the host cargo
+# test targets. Never the submodule sources.
+mrproper: clean
+	rm -rf $(TOP)/vendor
+	rm -rf $(TGT)/host

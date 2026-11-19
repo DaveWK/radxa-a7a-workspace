@@ -6,13 +6,14 @@ stack. Vendor facts come from the pages in [Sources](#sources), read on
 2026-11-12.
 
 The firmware is oreboot bt0 and oreboot main, followed by EDK2 (UEFI). It
-does not use Allwinner's BL31, U-Boot, OP-TEE or ARISC firmware. One closed
-part remains: by default bt0 trains DRAM with Allwinner's DRAM library and
-the DDR PHY's Synopsys training firmware, both taken from Allwinner's DRAM
-library object. Our own DRAM code, with no vendor DRAM library and no PHY
-training firmware, booted Fedora at 1200 MHz on 2026-11-12 on a development
-branch. It is not the default and not in this workspace yet (see
-[README](../README.md#dram) and
+does not use Allwinner's BL31, U-Boot, OP-TEE or ARISC firmware. By default
+no closed part remains: bt0 trains DRAM with our own code, with no vendor
+DRAM library and no PHY training firmware. It runs DRAM at 1200 MHz, the
+clock Fedora booted at on 2026-11-12 (2400 MHz, `DRAM_MHZ=2400`, does not
+boot Linux yet), and every run so far was over USB FEL on the 4 GB
+board. `VENDOR_DRAM=yes` builds bt0 with Allwinner's DRAM library
+and the DDR PHY's Synopsys training firmware instead, the path every boot
+from a card has used so far (see [README](../README.md#dram) and
 [bring-up-status.md](bring-up-status.md#dram-without-vendor-code)).
 
 ## Which firmware runs
@@ -57,9 +58,9 @@ before you remove the card.
 
 | Medium | State |
 |---|---|
-| microSD card | **Works.** The full Fedora image carries the firmware (below). To put only the firmware onto an existing card, see [sd-card.md](sd-card.md#firmware-only) |
+| microSD card | **Not accepted on our board.** The image is written to a card (below), but the slot has not booted any card since 2026-11-11, so no card boot is accepted. To put only the firmware onto an existing card, see [sd-card.md](sd-card.md#firmware-only) |
 | USB FEL | **Works, and is the tested path today.** The host loads the firmware into the board over USB-C, so nothing is written to the board. See [usb-fel-boot.md](usb-fel-boot.md) |
-| eMMC module | **Planned.** It is the next boot medium. Not documented yet |
+| eMMC module | **Not accepted.** Planned as the next boot medium; not documented yet |
 | SPI NOR | Not used |
 
 Our board's microSD slot has not booted any card since 2026-11-11, so we
@@ -71,7 +72,8 @@ yet, so you still need a card reader to write a card
 
 ## Fedora on this firmware
 
-This is the working, tested path. **No images are hosted.** Build your own
+The tested path is USB FEL with the root on a USB disk. **No images are
+hosted.** Build your own
 with `make fedora-image` (see [Build](../README.md#build)). The build writes
 `out/image/a7a-fedora45.img` and `.img.xz`, which contain:
 
@@ -86,7 +88,9 @@ today, so use a card or disk of at least 8 GB.
     sudo dd if=out/image/a7a-fedora45.img of=/dev/sdX bs=4M conv=fsync,sparse status=progress
     # or: xzcat out/image/a7a-fedora45.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
 
-- **microSD card:** the card holds both the firmware and Fedora.
+- **microSD card:** the card holds both the firmware and Fedora, but our
+  board's slot has not booted any card since 2026-11-11, so no card boot is
+  accepted (above).
 - **USB disk:** write the same image to a USB disk, plug it into the blue
   USB-A port and boot over [USB FEL](usb-fel-boot.md). Radxa lists no USB
   disk among the A7A's boot media. Firmware on a microSD card with the root
