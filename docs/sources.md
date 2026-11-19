@@ -16,7 +16,7 @@ share. The board branches sit on top of them.
 
 | What | From | Used by |
 |---|---|---|
-| Allwinner A733 DRAM library object (`libdram`) | <https://gitlab.com/tina5.0_aiot/lichee/dramlib>, commit `35e84c835b26f8d933e50299869657365e996363`, `sun60iw2p1/spl_libdram/libdram`, sha256 `d05bc328…f6c42c8e` | bt0: linked (`VENDOR_DRAM=yes`, `FEL_DRAM=dramlib`) or read for the PHY training firmware (`VENDOR_DRAM=no`) |
+| Allwinner A733 DRAM library object (`libdram`) | <https://gitlab.com/tina5.0_aiot/lichee/dramlib>, commit `35e84c835b26f8d933e50299869657365e996363`, `sun60iw2p1/spl_libdram/libdram`, sha256 `d05bc328…f6c42c8e` | bt0, only when asked for: linked (`VENDOR_DRAM=yes`) or read for the PHY training firmware (`VENDOR_DRAM=phyfw`). The default build does not fetch it |
 | xfel v1.4.0 source | <https://github.com/xboot/xfel>, commit `445e8aefe6` | `make xfel` (built with a 60 s USB timeout) |
 | Fedora 45 packages | Fedora's `fedora` and `updates` repositories (signature-checked by dnf) | `make fedora-image` |
 | Rust nightly-2026-05-06 | rustup | the build container |

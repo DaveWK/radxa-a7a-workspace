@@ -6,13 +6,14 @@ stack. Vendor facts come from the pages in [Sources](#sources), read on
 2026-11-12.
 
 The firmware is oreboot bt0 and oreboot main, followed by EDK2 (UEFI). It
-does not use Allwinner's BL31, U-Boot, OP-TEE or ARISC firmware. One closed
-part remains: by default bt0 trains DRAM with Allwinner's DRAM library and
-the DDR PHY's Synopsys training firmware, both taken from Allwinner's DRAM
-library object. Our own DRAM code, with no vendor DRAM library and no PHY
-training firmware, booted Fedora at 1200 MHz on 2026-11-12 on a development
-branch. It is not the default and not in this workspace yet (see
-[README](../README.md#dram) and
+does not use Allwinner's BL31, U-Boot, OP-TEE or ARISC firmware. By default
+no closed part remains: bt0 trains DRAM with our own code, with no vendor
+DRAM library and no PHY training firmware. It runs DRAM at 1200 MHz, the
+clock Fedora booted at on 2026-11-12 (2400 MHz, `DRAM_MHZ=2400`, does not
+boot Linux yet), and every run so far was over USB FEL on the 4 GB
+board. `VENDOR_DRAM=yes` builds bt0 with Allwinner's DRAM library
+and the DDR PHY's Synopsys training firmware instead, the path every boot
+from a card has used so far (see [README](../README.md#dram) and
 [bring-up-status.md](bring-up-status.md#dram-without-vendor-code)).
 
 ## Which firmware runs

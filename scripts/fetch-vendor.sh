@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Fetch the closed vendor inputs the firmware build reads, from their public
-# sources, into vendor/ (gitignored; never committed, never redistributed):
+# Fetch the closed vendor input two optional firmware builds read, from its
+# public source, into vendor/ (gitignored; never committed, never
+# redistributed). The default build reads nothing from a vendor.
 #
 #   vendor/dramlib/libdram   Allwinner's A733 DRAM library object from the
 #                            Tina SDK (gitlab.com/tina5.0_aiot/lichee/dramlib,
@@ -10,11 +11,10 @@
 #                            below), checked by SHA-256.
 #
 # What reads it:
-#   - the default bt0 (open DRAM driver) extracts the DRAM PHY's training
-#     firmware and PIE images from it as data, by symbol name and hash;
-#   - VENDOR_DRAM=yes / bt0-fel with FEL_DRAM=dramlib link it (DRAM init
-#     through the vendor library);
-#   - BLOBLESS=yes builds read nothing from it.
+#   - VENDOR_DRAM=yes (and the FEL bt0 with FEL_DRAM=dramlib) links it: DRAM
+#     init through the vendor library;
+#   - VENDOR_DRAM=phyfw extracts the DRAM PHY's training firmware and PIE
+#     images from it as data, by symbol name and hash.
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)

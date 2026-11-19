@@ -63,13 +63,17 @@ The steps:
    the board stays in FEL.
 
 `out/fel/` holds `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and
-`SHA256SUMS`. Build options: `FEL_DRAM=dramlib` (default, vendor DRAM
-library) or `FEL_DRAM=open` (open DRAM driver), and `FEL_BRINGUP=` (features of
-the FEL main, default `gmac usb usb-hs-only trng`).
+`SHA256SUMS`. Build options: `DRAM_MHZ=1200|2400` (the DRAM clock of our
+own DRAM driver, which is the default; 1200 unless set), `VENDOR_DRAM=yes`
+(the vendor DRAM library instead; see the [README](../README.md#dram)), and
+`FEL_BRINGUP=` (features of the FEL main, default `gmac usb usb-hs-only
+trng`).
 
 ## Expected serial output
 
-Abridged, from a boot of this flow (values vary by board and build):
+Abridged, from a boot of this flow with the vendor DRAM library (values
+vary by board and build). With the default DRAM driver the init line names
+1200 MHz and the driver's `[dram]` stage lines follow it:
 
     oreboot 🦀 bt0 | Radxa Cubie A7A | Allwinner A733
     [bt0] SoC rev B, DCXO 26000 kHz ...
@@ -111,8 +115,9 @@ Abridged, from a boot of this flow (values vary by board and build):
 
 ## Images
 
-`make fel-image` builds the current preferred FEL image: vendor-library DRAM
-init, main with `gmac usb usb-hs-only trng` (the SMCCC TRNG on the Crypto
+`make fel-image` builds the current FEL image: DRAM init by our own driver
+(`VENDOR_DRAM=yes` for the vendor library, with which the boots described
+here were made), main with `gmac usb usb-hs-only trng` (the SMCCC TRNG on the Crypto
 Engine, which Linux uses as `/dev/hwrng`), and EDK2 DEBUG with USB, Ethernet
 and display. Use the root image from the same commit (`make fedora-image`),
 since the firmware embeds the device tree that the image's

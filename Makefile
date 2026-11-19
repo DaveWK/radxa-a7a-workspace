@@ -3,9 +3,8 @@
 # under firmware/ and fedora/; outputs go to out/. Images are never committed
 # or uploaded: build your own.
 #
-#   make vendor        fetch the vendor DRAM library object (build input, see README)
 #   make dtb           the Cubie A7A device tree (out/dtb/)
-#   make firmware      bt0 + main + EDK2 -> out/firmware/firmware.bin (SD card, LBA 256)
+#   make firmware      bt0 + main + EDK2 -> out/firmware/firmware.bin (SD card or eMMC, LBA 256)
 #   make fel-image     firmware + bt0 for USB FEL boot -> out/fel/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
 #   make fel-boot      boot the board over USB FEL (board in FEL on the host's USB)
@@ -13,14 +12,24 @@
 #   make fedora-image  Fedora 45 image with the firmware at LBA 256 -> out/image/
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
 #   make test          host tests (oreboot board crates, scripts)
+#   make vendor        fetch the vendor DRAM library object (only for VENDOR_DRAM=yes|phyfw)
 #   make clean
 #
-# VENDOR_DRAM=yes (default) bt0 initialises DRAM through Allwinner's DRAM
-#   library (the path that boots today); VENDOR_DRAM=no uses the open driver
-#   (cubie-a7a-dram) with only the PHY's training firmware read from the
-#   library as data; BLOBLESS=yes builds the open driver's firmware-free
-#   development stage (probes and halts). FEL_DRAM=dramlib|open likewise for
-#   the FEL bt0.
+# DRAM: by default bt0 (and the FEL bt0) brings DRAM up with this project's
+#   own driver and nothing from a vendor: no DRAM library, no PHY training
+#   firmware, so the build needs no `make vendor`.
+#   DRAM_MHZ=1200|2400   the DRAM clock of that driver's built-in settings.
+#                        Unset: the firmware's default, 1200, which boots
+#                        Linux; 2400 passes bt0's tests but does not boot
+#                        Linux yet
+#   VENDOR_DRAM=yes      the comparison build: DRAM through Allwinner's DRAM
+#                        library instead (run `make vendor` first)
+#   VENDOR_DRAM=phyfw    our driver with the PHY's own training firmware read
+#                        from that library's object as data (`make vendor` too)
+#   Earlier spellings: BLOBLESS=yes and FEL_DRAM=open are the default now;
+#   FEL_DRAM=dramlib builds only the FEL bt0 with the library.
+#   A7A_* variables in the environment reach the bt0 build and override
+#   single settings of our driver (see the board README in firmware/oreboot).
 
 TOP      := $(abspath .)
 OUT      := $(TOP)/out
@@ -29,9 +38,9 @@ BOARD    := $(OREBOOT)/src/mainboard/radxa/cubie-a7a
 FEDORA   := $(TOP)/fedora
 DTS      := $(FEDORA)/fedora/dts
 
-VENDOR_DRAM ?= yes
-BLOBLESS    ?= no
-FEL_DRAM    ?= dramlib
+VENDOR_DRAM ?= no
+DRAM_MHZ    ?=
+FEL_DRAM    ?=
 OTP         ?= no
 DRAM_LIB    ?= $(TOP)/vendor/dramlib/libdram
 # Peripheral bring-up in oreboot main (cargo features of main).
@@ -56,8 +65,8 @@ OBJCOPY ?= llvm-objcopy
 # EGON_MAX). An earlier limit of 0x40000 belonged to bt0's hand-over to a
 # vendor SPL after a failed boot (larger images had not come back through
 # it); bt0 has no such hand-over any more, and with the vendor DRAM library
-# it is larger than 0x40000. Image, bss and stack are bounded separately by
-# bt0's linker script.
+# (VENDOR_DRAM=yes) it is larger than 0x40000. Image, bss and stack are
+# bounded separately by bt0's linker script.
 BT0_MAX_BYTES := 303104
 DRAM_LIB_OVERRIDES := dwc_ddrphy_phyinit_G_execFW mctl_com_set_controller_after_phy \
 	lp5_sw_mr_wr lp5_sw_mr_rd \
@@ -77,13 +86,32 @@ EDK2_FD := $(OUT)/edk2/CUBIEA7A_EFI.fd
 XFEL    ?= $(OUT)/tools/xfel
 IMAGE   := $(OUT)/image/a7a-fedora$(FEDORA_RELEASE).img
 
-BT0_FEATURES = $(strip $(if $(filter yes,$(BLOBLESS)),blobless,$(if $(filter yes,$(VENDOR_DRAM)),dramlib)) \
-	$(if $(filter yes,$(OTP)),otp))
-FEL_FEATURES = $(strip fel $(if $(filter dramlib,$(FEL_DRAM)),dramlib))
+# The DRAM path of bt0 and of the FEL bt0: no (ours, nothing from a vendor),
+# yes (the vendor library) or phyfw (ours with the PHY's firmware as data).
+ifeq ($(filter no yes phyfw,$(VENDOR_DRAM)),)
+$(error VENDOR_DRAM=$(VENDOR_DRAM): no (default), yes or phyfw)
+endif
+ifeq ($(filter 1200 2400,$(or $(DRAM_MHZ),1200)),)
+$(error DRAM_MHZ=$(DRAM_MHZ): 1200 or 2400)
+endif
+BT0_DRAM := $(VENDOR_DRAM)
+FEL_BT0_DRAM := $(if $(filter dramlib,$(FEL_DRAM)),yes,$(VENDOR_DRAM))
+# dram-cargo <no|yes|phyfw>: the cargo arguments that select the path. bt0's
+# default features are the blob-free boot; the other two are built without
+# them.
+dram-cargo = $(if $(filter no,$(1)),,--no-default-features)
+dram-feature = $(if $(filter yes,$(1)),dramlib)
+# dram-env <no|yes|phyfw>: what the build reads from outside the tree, and
+# the clock of the built-in settings (only our driver alone has them).
+dram-env = $(if $(filter yes,$(1)),A733_DRAM_LIB=$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),A733_PHY_FW_OBJ=$(DRAM_LIB)) \
+	$(if $(filter no,$(1)),$(if $(DRAM_MHZ),A7A_PROFILE=$(DRAM_MHZ)),$(if $(DRAM_MHZ),$(error DRAM_MHZ sets the clock of our own DRAM settings; VENDOR_DRAM=$(1) has none)))
+# dram-dep <no|yes|phyfw>: the vendor file the build needs, if any.
+dram-dep = $(if $(filter yes,$(1)),$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),$(DRAM_LIB))
+dram-tag = $(if $(filter no,$(1)),blobfree,$(if $(filter yes,$(1)),dramlib,phyfw))
+BT0_FEATURES = $(strip $(call dram-feature,$(BT0_DRAM)) $(if $(filter yes,$(OTP)),otp))
+FEL_FEATURES = $(strip fel $(call dram-feature,$(FEL_BT0_DRAM)))
 empty :=
 space := $(empty) $(empty)
-# The vendor library archive, unless the build reads nothing from it.
-LIBDRAM_DEP = $(if $(filter yes,$(BLOBLESS)),,$(LIBDRAM_A))
 
 define check-bt0-size
 	@s=$$(stat -c %s $(1)); if [ $$s -gt $(BT0_MAX_BYTES) ]; then \
@@ -91,10 +119,10 @@ define check-bt0-size
 	echo "$(1): $$s bytes (limit $(BT0_MAX_BYTES))"
 endef
 
-# bt0_build <features> <target dir> <output .bin>
+# bt0_build <features> <target dir> <output .bin> <DRAM path: no|yes|phyfw>
 define bt0_build
-	cd $(BOARD)/bt0 && A733_PHY_FW_OBJ=$(DRAM_LIB) A733_DRAM_LIB=$(LIBDRAM_A) CARGO_TARGET_DIR=$(2) \
-		$(CARGO) build --release --locked $(if $(1),--features "$(1)")
+	cd $(BOARD)/bt0 && env $(strip $(call dram-env,$(4))) CARGO_TARGET_DIR=$(2) \
+		$(CARGO) build --release --locked $(call dram-cargo,$(4)) $(if $(1),--features "$(1)")
 	$(OBJCOPY) -O binary $(2)/armv7a-none-eabi/release/oreboot-cubie-a7a-bt0 $(3)
 	$(call check-bt0-size,$(3))
 endef
@@ -139,11 +167,11 @@ dtb: check-sources
 	mkdir -p $(dir $(DTB))
 	$(MAKE) -C $(DTS) OUT=$(DTB) DTB_ORIGIN=firmware
 
-bt0: check-sources $(LIBDRAM_DEP) | $(OUT)/oreboot
-	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(or $(BT0_FEATURES),open)),$(BT0_BIN))
+bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(OUT)/oreboot
+	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM))
 
-bt0-fel: check-sources $(LIBDRAM_A) | $(OUT)/oreboot
-	$(call bt0_build,$(FEL_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(FEL_FEATURES)),$(BT0_FEL_BIN))
+bt0-fel: check-sources $(call dram-dep,$(FEL_BT0_DRAM)) | $(OUT)/oreboot
+	$(call bt0_build,$(FEL_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(FEL_BT0_DRAM)) $(FEL_FEATURES))),$(BT0_FEL_BIN),$(FEL_BT0_DRAM))
 	@echo "$(BT0_FEL_BIN): linked at 0x90000"
 
 main: check-sources | $(OUT)/oreboot
@@ -155,7 +183,8 @@ main-fel: check-sources | $(OUT)/oreboot
 edk2: check-sources dtb
 	EDK2_OUT=$(OUT)/edk2 scripts/build-edk2.sh $(EDK2_TARGET) $(EDK2_ARGS) -D DTB_FILE=$(DTB)
 
-# SD card firmware: firmware.bin goes at firmware.seek (sector 256, 128 KiB).
+# SD card and eMMC firmware: firmware.bin goes at firmware.seek (sector 256,
+# 128 KiB); bt0 boots from whichever of the two the mask ROM loaded it from.
 firmware: bt0 main edk2
 	python3 scripts/mkimage.py --bt0 $(BT0_BIN) --main $(MAIN_BIN) --payload $(EDK2_FD) \
 		--out $(FW_OUT) --egon-offset $(EGON_OFFSET)
