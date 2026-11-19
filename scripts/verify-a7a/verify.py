@@ -579,6 +579,7 @@ class Harness:
             )
         }
         self.input_digests: dict[str, str] = {}
+        self.input_formats: dict[str, str] = {}
         self.env.update(
             A733_DRAM_LIB=str(self.input_paths["dram-lib"]),
             A733_PHY_FW_OBJ=str(self.input_paths["phyfw-obj"]),
@@ -671,8 +672,25 @@ class Harness:
             if actual != expected:
                 raise ValueError(f"{label} SHA256 {actual} does not match {expected}")
             with snapshot.open("rb") as src:
+                magic = src.read(8)
+                src.seek(0)
                 if hashlib.file_digest(src, "sha256").hexdigest() != actual:
                     raise ValueError(f"{label} snapshot SHA256 changed: {snapshot}")
+            if label in ("dram-lib", "phyfw-obj"):
+                if magic == b"!<arch>\n":
+                    self.input_formats[label] = "normal ar archive"
+                elif magic == b"!<thin>\n":
+                    raise ValueError(
+                        f"{label} snapshot is a thin ar archive; external members "
+                        "are not pinned"
+                    )
+                elif label == "phyfw-obj" and magic.startswith(b"\x7fELF"):
+                    self.input_formats[label] = "ELF object"
+                else:
+                    formats = "a normal ar archive"
+                    if label == "phyfw-obj":
+                        formats += " or an ELF object"
+                    raise ValueError(f"{label} snapshot must be {formats}")
             self.input_digests[label] = actual
 
     def read_limits(self) -> None:
@@ -1636,6 +1654,8 @@ class Harness:
         print(f"gate base: {self.gate_base}  head: {self.gate_head}")
         for label, path in self.input_paths.items():
             print(f"{label}: SHA256 {self.input_digests[label]} ({path})")
+            if label in self.input_formats:
+                print(f"{label} snapshot format: {self.input_formats[label]}")
         print(f"toolchain: {self.toolchain.get('channel')}")
         for key in ("rustc_version", "cargo_version"):
             print(self.toolchain.get(key, "").rstrip())

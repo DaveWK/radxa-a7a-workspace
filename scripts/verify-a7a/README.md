@@ -29,9 +29,12 @@ baseline directory is the retained matrix output at the gate base, and its
 two build inputs are external private artifacts and are never vendored here.
 Each requires a full 64-hex SHA256. Before creating the job directory, the
 harness opens each input once, hashing while copying to private staging, then
-rehashes the copy. Only those verified files move into the job; the linker,
-PHY extractor and gate use the copies, not the original paths. The report
-lists their SHA256 values and snapshot paths.
+rehashes the copy. The DRAM library snapshot must have normal ar magic
+(`!<arch>\n`); the PHY input must have normal ar or ELF magic. Thin archives
+are refused because they can reference unpinned external members. Only the
+verified files move into the job; the linker, PHY extractor and gate use the
+copies, not the original paths. The report lists their SHA256 values, snapshot
+paths and detected binary input formats.
 
 ## Threat model
 

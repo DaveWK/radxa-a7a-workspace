@@ -274,8 +274,8 @@ class CliTest(unittest.TestCase):
         self.phyfw = self.root / "libdram"
         self.gate = self.root / "gate.py"
         for path, content in (
-            (self.dram_lib, b"dummy archive"),
-            (self.phyfw, b"dummy object"),
+            (self.dram_lib, b"!<arch>\n"),
+            (self.phyfw, b"\x7fELFfixture"),
             (self.gate, b"print('fixture gate')\n"),
         ):
             path.write_bytes(content)
@@ -653,7 +653,7 @@ class CliTest(unittest.TestCase):
         self.gate.write_bytes(b"print('stale gate still exits zero')\n")
         self.assert_identity_refused_without_build("gate")
 
-    def make_archive(self, name, marker):
+    def make_archive(self, name, marker, *, thin=False):
         obj = self.root / f"{name}.o"
         archive = self.root / f"{name}.a"
         self.host_command(
@@ -666,8 +666,49 @@ class CliTest(unittest.TestCase):
             "-",
             source=f'const char *marker(void) {{ return "{marker}"; }}\n',
         )
-        self.host_command("ar", "rcs", archive, obj)
+        self.host_command("ar", "rcsT" if thin else "rcs", archive, obj.name)
         return archive.read_bytes()
+
+    def assert_format_refused_without_build(self, name, path, data, diagnostic):
+        path.write_bytes(data)
+        self.input_digests[name] = digest(data)
+        self.check(1, f"{name} snapshot {diagnostic}")
+        self.assertEqual(self.tools.cargo_invocations, [])
+        self.assertFalse(self.out.exists())
+        self.assertEqual(list(self.root.glob(".verify-a7a-*")), [])
+
+    def test_pinned_thin_dram_archive_refused_before_cargo(self):
+        data = self.make_archive("thin", "fixture member", thin=True)
+        self.assertTrue(data.startswith(b"!<thin>\n"))
+        self.assert_format_refused_without_build(
+            "dram-lib", self.dram_lib, data, "is a thin ar archive"
+        )
+
+    def test_pinned_non_archive_dram_input_refused_before_cargo(self):
+        self.assert_format_refused_without_build(
+            "dram-lib", self.dram_lib, b"\x7fELFfixture", "must be a normal ar archive"
+        )
+
+    def test_pinned_thin_phy_archive_refused_before_cargo(self):
+        data = self.make_archive("thin-phy", "fixture member", thin=True)
+        self.assertTrue(data.startswith(b"!<thin>\n"))
+        self.assert_format_refused_without_build(
+            "phyfw-obj", self.phyfw, data, "is a thin ar archive"
+        )
+
+    def test_pinned_unknown_phy_format_refused_before_cargo(self):
+        self.assert_format_refused_without_build(
+            "phyfw-obj",
+            self.phyfw,
+            b"not an archive or an ELF object",
+            "must be a normal ar archive or an ELF object",
+        )
+
+    def test_pinned_normal_phy_archive_is_identified(self):
+        data = self.make_archive("normal-phy", "fixture member")
+        self.phyfw.write_bytes(data)
+        self.input_digests["phyfw-obj"] = digest(data)
+        self.check(0, "phyfw-obj snapshot format: normal ar archive")
 
     def test_byte_flipped_dram_archive_refused(self):
         data = bytearray(self.make_archive("original", "verified archive"))

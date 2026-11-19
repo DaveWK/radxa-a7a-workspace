@@ -285,8 +285,8 @@ class HarnessRegressionTest(unittest.TestCase):
         self.baseline = make_baseline(self.tmp / "baseline")
         self.gate = self.tmp / "gate.py"
         self.gate.write_text("pass\n", encoding="utf-8")
-        (self.tmp / "libdram-a733.a").write_bytes(b"fixture")
-        (self.tmp / "libdram").write_bytes(b"fixture")
+        (self.tmp / "libdram-a733.a").write_bytes(b"!<arch>\n")
+        (self.tmp / "libdram").write_bytes(b"\x7fELFfixture")
         self.out = self.tmp / "out"
 
     def tearDown(self):
