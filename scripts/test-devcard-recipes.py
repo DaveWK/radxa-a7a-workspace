@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Run the workspace devcard recipes on stubs, without building an image."""
 
+from hashlib import sha256
+import json
 import os
 from pathlib import Path
 import shutil
@@ -105,21 +107,37 @@ if Path(sys.argv[-1]) == pointer:
 
 STUB_CARGO = """\
 #!/usr/bin/env python3
+import json
 import os
 from pathlib import Path
 import sys
 import tomllib
 
 home = Path(os.environ["CARGO_HOME"])
+(Path(os.environ["HOME"]) / "cargo-invoked").touch()
+cwd = Path.cwd()
+config = {}
+for directory in reversed((cwd, *cwd.parents)):
+    path = directory / ".cargo/config.toml"
+    if path.is_file():
+        config.update(tomllib.loads(path.read_text()))
 if sys.argv[1:3] == ["-Zunstable-options", "config"]:
+    if "env" in config:
+        print(json.dumps({"env": config["env"]}))
+        sys.exit(0)
     print("error: config value `env` is not set", file=sys.stderr)
     sys.exit(101)
 profile = os.environ["A7A_PROFILE"]
-config = home / "config.toml"
-if config.exists():
-    forced = tomllib.loads(config.read_text())["env"]["A7A_PROFILE"]
+home_config = home / "config.toml"
+if home_config.exists():
+    forced = tomllib.loads(home_config.read_text())["env"]["A7A_PROFILE"]
     if forced["force"]:
         profile = forced["value"]
+if ({"RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS",
+     "CARGO_ENCODED_RUSTFLAGS"} & os.environ.keys()
+    or any(key.startswith("CARGO_BUILD_") for key in os.environ)
+    or "rustc-wrapper" in config.get("build", {}) or "RUSTC_WRAPPER" in config.get("env", {})):
+    profile = "2400"
 assert (home / "registry/cache/fixture").is_file(), "registry cache not seeded"
 output = (Path(os.environ["CARGO_TARGET_DIR"]) / "armv7a-none-eabi/release"
           / "oreboot-cubie-a7a-bt0")
@@ -140,6 +158,8 @@ shared = Path(os.environ["TEST_OUT"])
 assert private.is_relative_to(shared) and private != shared, private
 (private / "firmware").mkdir()
 (private / "firmware/firmware.bin").write_text("invocation firmware")
+(private / "oreboot").mkdir()
+(private / "oreboot/bt0.bin").write_bytes(os.environ.get("TEST_BT0", "stub-1200").encode())
 (shared / "firmware/firmware.bin").write_text("competing firmware")
 """
 
@@ -147,6 +167,18 @@ assert private.is_relative_to(shared) and private != shared, private
 def executable(path, payload):
     path.write_text(payload)
     path.chmod(0o700)
+
+
+BT0_CASES = {
+    "forced-cargo-profile",
+    "sd-env-cli",
+    "sd-env-inherited",
+    "rustc-wrapper",
+    "encoded-rustflags",
+    "ancestor-build",
+    "ancestor-env-profile",
+    "ancestor-env-wrapper",
+}
 
 
 def run_case(case):
@@ -178,7 +210,24 @@ def run_case(case):
             path = root / prerequisite
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
-        env = {"PATH": os.environ["PATH"], "TEST_OUT": str(root / "out")}
+        (root / "firmware/oreboot/rust-toolchain.toml").write_text(
+            '[toolchain]\nchannel = "nightly-2026-05-06"\n'
+        )
+        helper = ROOT / "scripts/sd-bt0-cargo.py"
+        shutil.copyfile(helper, root / "scripts" / helper.name)
+        (root / "scripts/sd-bt0-fingerprints.json").write_text(
+            json.dumps(
+                {
+                    sha256(f"stub-{mhz}".encode()).hexdigest(): f"blobfree-{mhz}"
+                    for mhz in (1200, 2400)
+                }
+            )
+        )
+        env = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(root),
+            "TEST_OUT": str(root / "out"),
+        }
         command = [
             "make",
             "--no-print-directory",
@@ -194,10 +243,7 @@ def run_case(case):
         firmware_make = binfmt.with_name("make-firmware")
         executable(firmware_make, STUB_FIRMWARE_MAKE)
         command.append(f"MAKE={firmware_make}")
-        if case == "forced-cargo-profile":
-            helper = ROOT / "scripts/sd-bt0-cargo.py"
-            if helper.exists():
-                shutil.copyfile(helper, root / "scripts" / helper.name)
+        if case in BT0_CASES:
             executable(binfmt.with_name("cargo"), STUB_CARGO)
             objcopy = binfmt.with_name("objcopy")
             executable(objcopy, '#!/bin/sh\nshift 2\ncp -- "$1" "$2"\n')
@@ -212,9 +258,48 @@ def run_case(case):
                 PATH=f"{binfmt.parent}{os.pathsep}{env['PATH']}",
                 CARGO_HOME=str(home),
             )
-            subprocess.run(
-                [*command, f"OBJCOPY={objcopy}", "bt0"], cwd=root, env=env, check=True
+            config = {
+                "ancestor-build": '[build]\nrustc-wrapper = "/stub/wrapper"\n',
+                "ancestor-env-profile": (
+                    '[env]\nA7A_PROFILE = { value = "2400", force = true }\n'
+                ),
+                "ancestor-env-wrapper": '[env]\nRUSTC_WRAPPER = "/stub/wrapper"\n',
+            }.get(case)
+            if config:
+                (root / ".cargo").mkdir()
+                (root / ".cargo/config.toml").write_text(config)
+            if case == "sd-env-cli":
+                command.append("sd-bt0-env=A7A_PROFILE=2400")
+            if case == "sd-env-inherited":
+                env["sd-bt0-env"] = "A7A_PROFILE=2400"
+            if case == "rustc-wrapper":
+                env["RUSTC_WRAPPER"] = "/stub/wrapper"
+            if case == "encoded-rustflags":
+                env["CARGO_ENCODED_RUSTFLAGS"] = "--cfg\x1fforced"
+            reject = "does not accept sd-bt0-env" if case.startswith("sd-env-") else ""
+            if config:
+                # R3 asked Cargo about [env] before rejecting a reported
+                # A7A_PROFILE. R4 rejects the file before it starts Cargo.
+                reject = (
+                    "Cargo [env] must not set A7A_PROFILE"
+                    if case == "ancestor-env-profile"
+                    else "unapproved Cargo config"
+                )
+            result = subprocess.run(
+                [*command, f"OBJCOPY={objcopy}", "bt0"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
             )
+            if reject:
+                assert result.returncode == 2 and reject in result.stderr, result
+                assert not (
+                    root / "cargo-invoked"
+                ).exists(), "started Cargo with a rejected config"
+                assert not (root / "out/oreboot/bt0.bin").exists()
+                return
+            assert result.returncode == 0, result
             built = (root / "out/oreboot/bt0.bin").read_text()
             assert built == "1200", f"compiled profile was {built!r}, expected '1200'"
             return
@@ -250,6 +335,25 @@ def run_case(case):
             command.append("XZ=no")
         if case == "private-firmware":
             env["TEST_PRIVATE_FIRMWARE"] = "1"
+        if case in ("wrong-binary-profile", "unknown-binary"):
+            wrong_profile = case == "wrong-binary-profile"
+            env["TEST_BT0"] = "stub-2400" if wrong_profile else "unknown bt0 bytes"
+            result = subprocess.run(
+                [*command, "fedora-image"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 2, result
+            reason = (
+                "bt0 fingerprint is blobfree-2400, expected blobfree-1200"
+                if wrong_profile
+                else "unknown bt0 fingerprint"
+            )
+            assert reason in result.stderr, result
+            assert not (root / "out/fedora/rpmbuild").exists()
+            return
         goals = (
             ["fedora-image"] if case == "competing-run" else ["rpms", "fedora-image"]
         )
@@ -266,8 +370,10 @@ def main():
         "label-cli",
         "competing-run",
         "no-xz",
-        "forced-cargo-profile",
         "private-firmware",
+        *sorted(BT0_CASES),
+        "wrong-binary-profile",
+        "unknown-binary",
     )
     for case in sys.argv[1:] or cases:
         assert case in cases, case

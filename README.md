@@ -111,6 +111,15 @@ Options: `DRAM_MHZ=1200|2400`, `VENDOR_DRAM=yes` (see "DRAM"),
 [fedora/README.md](fedora/README.md)), `FWREPO=<tree>` (firmware log reader
 package). `make help` lists them.
 
+The SD/eMMC bt0 build ignores the caller's Cargo-home configuration and
+rejects unapproved Cargo config in the workspace and source ancestors. For
+`make fedora-image`, the built raw bt0 must match a reviewed fingerprint for
+the expected DRAM profile. The current fingerprints cover the pinned oreboot
+default at 1200 and 2400 MHz, and 1200 MHz with `OTP=yes`; unknown bytes,
+including unlisted measurement builds, are not put into an image. Refresh
+`scripts/sd-bt0-fingerprints.json` from independently reproduced SD/eMMC
+bt0 builds when updating that pin or supporting another build variant.
+
 Image policy: root is the only login, the password is `Fedora123`, sshd and
 DHCP are on, and there are no SSH keys of anyone in the image (host keys
 are generated on first boot). Change the password on first login.

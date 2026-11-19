@@ -15,7 +15,8 @@
 #                      sealed run path noted in out/fedora/run (for operators)
 #   make fedora-image  Fedora 45 image with firmware at LBA 256 and verification
 #                      sidecars -> out/image/; uses a private firmware build
-#                      and self-checks against the build receipt
+#                      with a known bt0 fingerprint; self-checks against the
+#                      build receipt
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
 #   make test          host tests (oreboot board crates, scripts)
 #   make vendor        fetch the vendor DRAM library object (measurement builds
@@ -124,8 +125,9 @@ ifneq ($(origin DRAM_FIRMWARE_IDENTITY),undefined)
 $(error DRAM_FIRMWARE_IDENTITY is derived from VENDOR_DRAM and DRAM_MHZ; do not set it directly)
 endif
 override DRAM_FIRMWARE_IDENTITY := $(call dram-tag,$(BT0_DRAM))-$(BT0_PROFILE)
-sd-bt0-env = -u A7A_PROFILE -u RUSTUP_TOOLCHAIN -u RUSTFLAGS \
-	$(if $(filter no,$(BT0_DRAM)),A7A_PROFILE=$(BT0_PROFILE),$(call dram-env,$(BT0_DRAM)))
+ifneq ($(origin sd-bt0-env),undefined)
+$(error SD/eMMC bt0 does not accept sd-bt0-env; use the validated VENDOR_DRAM and DRAM_MHZ inputs)
+endif
 # Each DRAM mode and profile gets its own FEL build and output directory, so
 # two builds never share or overwrite the same intermediate or bundle.
 override FEL_TAG_MODE := $(call dram-tag,$(FEL_BT0_DRAM))
@@ -160,10 +162,9 @@ define check-bt0-size
 endef
 
 # bt0_build <features> <target dir> <output .bin> <DRAM path> <env assignments>
-#           [<Cargo command>]
 define bt0_build
 	cd $(BOARD)/bt0 && env $(5) CARGO_TARGET_DIR=$(2) \
-		$(or $(6),$(CARGO)) build --release --locked $(call dram-cargo,$(4)) $(if $(1),--features "$(1)")
+		$(CARGO) build --release --locked $(call dram-cargo,$(4)) $(if $(1),--features "$(1)")
 	$(OBJCOPY) -O binary $(2)/armv7a-none-eabi/release/oreboot-cubie-a7a-bt0 $(3)
 	$(call check-bt0-size,$(3))
 endef
@@ -209,7 +210,13 @@ dtb: check-sources
 	$(MAKE) -C $(DTS) OUT=$(DTB) DTB_ORIGIN=firmware
 
 bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(OUT)/oreboot
-	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM),$(strip $(sd-bt0-env)),python3 -I "$(TOP)/scripts/sd-bt0-cargo.py" "$(OUT)/oreboot")
+	$(if $(filter-out no,$(BT0_DRAM)),$(if $(filter-out 2400,$(DRAM_MHZ)),$(error the vendor DRAM path runs at 2400 MHz)))
+	python3 -I scripts/sd-bt0-cargo.py build "$(DRAM_FIRMWARE_IDENTITY)" "$(OUT)/oreboot" \
+		"$(TGT)/bt0-$(DRAM_FIRMWARE_IDENTITY)$(if $(filter yes,$(OTP)),-otp)" \
+		$(if $(filter yes,$(OTP)),--otp) \
+		$(if $(filter yes,$(BT0_DRAM)),--vendor-input "$(LIBDRAM_A)",$(if $(filter phyfw,$(BT0_DRAM)),--vendor-input "$(DRAM_LIB)"))
+	$(OBJCOPY) -O binary "$(TGT)/bt0-$(DRAM_FIRMWARE_IDENTITY)$(if $(filter yes,$(OTP)),-otp)/armv7a-none-eabi/release/oreboot-cubie-a7a-bt0" "$(BT0_BIN)"
+	$(call check-bt0-size,$(BT0_BIN))
 
 $(FEL_BUILD):
 	mkdir -p $@
@@ -309,6 +316,7 @@ fedora-image: fel-image
 	mkdir -p "$(dir $(IMAGE))" "$(FEDORA)/build" "$(DEVCARD_SCRATCH)"
 	mkdir -- "$(DEVCARD_FW_BUILD)"
 	$(MAKE) OUT="$(DEVCARD_FW_BUILD)" firmware
+	python3 -I scripts/sd-bt0-cargo.py verify "$(DRAM_FIRMWARE_IDENTITY)" "$(DEVCARD_FW_BUILD)/oreboot/bt0.bin"
 	scripts/binfmt-aarch64.sh
 	set -eu; \
 		$(build-rpm-run); \
