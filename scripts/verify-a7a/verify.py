@@ -32,12 +32,18 @@ Exit status is 0 only when every stage passes. The job output directory must be
 fresh (it is never reused); it holds the build logs, the produced images, the
 suite logs, the gate log and a SHA256SUMS file. The source checkout is never
 written to; cargo targets and TMPDIR stay under the job output directory.
+
+Threat model: prevent false greens from accidents on a single-user bench host:
+stale, mixed, truncated or empty inputs and outputs; ambient Git, Cargo or
+toolchain configuration; a parent repository mistaken for the source; and a
+missing section, binary or test result counted as success. This does not defend
+against a malicious local user who can edit the harness.
 """
 
 from __future__ import annotations
 
 import argparse
-import filecmp
+import ast
 import hashlib
 import json
 import os
@@ -52,6 +58,8 @@ from pathlib import Path
 BT0_DIR = "src/mainboard/radxa/cubie-a7a/bt0"
 MAIN_DIR = "src/mainboard/radxa/cubie-a7a/main"
 COMMON_LIB = "src/mainboard/radxa/cubie-a7a/common/src/lib.rs"
+BT0_BUILD = f"{BT0_DIR}/build.rs"
+MKIMAGE = Path(__file__).resolve().parents[1] / "mkimage.py"
 
 # The five host suites required by the retained verification record. The board
 # fastboot and bootlog suites live at these paths at the verified SHA; there is
@@ -62,6 +70,19 @@ SUITE_DIRS = (
     "src/mainboard/radxa/cubie-a7a/common",
     "src/lib/bootlog",
     "src/lib/dram-train",
+)
+DOC_TESTS = dict(
+    zip(
+        SUITE_DIRS,
+        (
+            "cubie_a7a_dram",
+            "cubie_a7a_fastboot",
+            "cubie_a7a_common",
+            "bootlog",
+            "dram_train",
+        ),
+        strict=True,
+    )
 )
 
 # OLD: every feature set of the matrix before the default changed, built with
@@ -166,11 +187,6 @@ MAIN_SETS = (
 # The four retained default images, checked by full SHA256.
 DIGEST_NAMES = ("default", "default-fel", "default@2400", "default-fel@2400")
 
-# scripts/mkimage.py: EGON_MAX (the vendor boot0 length) and EGON_PAD.
-EGON_MAX = 0x4A000
-EGON_PAD = 0x2000
-# bt0/build.rs MEMORY_FEL: the FEL link window length.
-FEL_MAX = 0x4F000
 # The raw eGON.BT0 header (bt0/src/main.rs global_asm, fastboot/src/egon.rs,
 # scripts/mkimage.py): magic at 4, checksum at 12, length at 16, header size at
 # 20, run address at 32. The image tool fills length and checksum; the raw
@@ -206,24 +222,33 @@ BASELINE_SAME = "= base"
 BASELINE_NEW = "no baseline (new)"
 
 TEST_RESULT_RE = re.compile(
-    r"^test result: (?:ok|FAILED)\.\s+(\d+) passed; (\d+) failed; " r"(\d+) ignored;",
+    r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+    r"0 measured; 0 filtered out; finished in [0-9.]+s"
+)
+SECTION_RE = re.compile(
+    r"^\s*\[\s*\d+\]\s+(\.dram|\.phyfw)\s+\S+\s+[0-9a-fA-F]+\s+"
+    r"[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s",
     re.M,
 )
-RUNNING_RE = re.compile(r"^\s*Running\s+.*?\((\S+)\)\s*$", re.M)
+SECTION_COUNT_RE = re.compile(r"^There are (\d+) section headers,", re.M)
+SECTION_ROW_RE = re.compile(r"^\s*\[\s*\d+\]", re.M)
 MAIN_MAX_RE = re.compile(
-    r"MAIN_MAX_SIZE\s*:\s*usize\s*=\s*(0x[0-9A-Fa-f_]+|\d[\d_]*)\s*;"
+    r"^\s*pub const MAIN_MAX_SIZE:\s*usize\s*=\s*(0x[0-9A-Fa-f_]+|\d[\d_]*)\s*;",
+    re.M,
 )
+FEL_MAX_RE = re.compile(
+    r'^const MEMORY_FEL: &str = "SRAM\s*:\s*ORIGIN\s*=\s*0x[0-9A-Fa-f_]+,'
+    r'\s*LENGTH\s*=\s*(0x[0-9A-Fa-f_]+|\d[\d_]*)";$',
+    re.M,
+)
+SUM_LINE_RE = re.compile(r"([0-9A-Fa-f]{64}) [ *]([A-Za-z0-9@+._-]+\.bin)")
 WARNING_RE = re.compile(r"^warning: (.*)$")
 WARNING_SUMMARY_RE = re.compile(r"^`[^`]+`\s+\(.*\)\s+generated\s+\d+\s+warnings?")
 WARNING_LOCATION_RE = re.compile(r"^\s*-->\s*(\S+?):(\d+):(\d+)\s*$")
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def le32(data: bytes, offset: int) -> int:
@@ -242,7 +267,13 @@ class CommandResult:
     argv: tuple[str, ...]
     cwd: str
     returncode: int
-    output: str
+    stdout: str
+    stderr: str = ""
+
+    @property
+    def output(self) -> str:
+        """Human-readable aggregate only; never parse it as a protocol."""
+        return self.stdout + self.stderr
 
 
 @dataclass
@@ -254,6 +285,7 @@ class BuildResult:
     size: int | None = None
     warnings: int = 0
     detail: str = ""
+    extensions: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -365,42 +397,66 @@ class SubprocessRunner:
                 text=True,
                 errors="replace",
             )
-            output = proc.stdout + proc.stderr
+            stdout, stderr = proc.stdout, proc.stderr
             returncode = proc.returncode
         except FileNotFoundError as exc:
-            output = f"{argv[0]}: {exc}\n"
+            stdout, stderr = "", f"{argv[0]}: {exc}\n"
             returncode = 127
         except OSError as exc:
-            output = f"{argv[0]}: {exc}\n"
+            stdout, stderr = "", f"{argv[0]}: {exc}\n"
             returncode = 126
         if log is not None:
             log.parent.mkdir(parents=True, exist_ok=True)
-            log.write_text(output, encoding="utf-8")
-        return CommandResult(tuple(argv), str(cwd), returncode, output)
+            log.write_text(
+                f"=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}", encoding="utf-8"
+            )
+        return CommandResult(tuple(argv), str(cwd), returncode, stdout, stderr)
 
 
-def build_env(args: Config, out: Path) -> dict[str, str]:
-    env = dict(os.environ)
-    for key in list(env):
-        if key.startswith("A7A_") or key in ("RUSTFLAGS", "RUSTUP_TOOLCHAIN"):
-            del env[key]
-    env["CARGO_NET_OFFLINE"] = "true"
-    env["GIT_OPTIONAL_LOCKS"] = "0"
-    env["RUSTUP_AUTO_INSTALL"] = "0"
-    env["A733_DRAM_LIB"] = str(args.dram_lib)
-    env["A733_PHY_FW_OBJ"] = str(args.phyfw_obj)
-    env["TMPDIR"] = str(out / "tmp")
-    return env
+def git_env() -> dict[str, str]:
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": str(Path.home()),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+
+
+def expected_sections(features: list[str], no_default: bool) -> tuple[str, ...]:
+    """Payload section contract from bt0's Cargo.toml, build.rs and dram.rs."""
+    selected = set(features)
+    dram_lab = "dram-lab" in selected
+    # dram-lab and the write variants enable fastboot; fastboot adds DRAM_EXT.
+    sections = []
+    if selected & {"fastboot", "fastboot-emmc-write", "fastboot-nor-write", "dram-lab"}:
+        sections.append(".dram")
+    # The linker reserves .phyfw for dram-lab, but only dram/open.rs supplies
+    # its statics. bl-mission implies blobless and excludes that backend.
+    blobfree = not no_default or bool(selected & {"blobfree", "blobless", "bl-mission"})
+    if dram_lab and not blobfree and "dramlib" not in selected:
+        sections.append(".phyfw")
+    return tuple(sections)
+
+
+def image_names(stem: str, sections: tuple[str, ...]) -> list[str]:
+    # Keep the historical filename when a row has a single extension.
+    suffixes = ["-ext"] if len(sections) == 1 else ["-" + s[1:] for s in sections]
+    return [f"{stem}{suffix}.bin" for suffix in ("", *suffixes)]
 
 
 def required_baseline_names() -> list[str]:
     names = []
     for set_name in OLD_SETS:
         tag = "old-" + (set_name.replace(" ", "+") or "default")
-        names.append(f"bt0-{tag}.bin")
-    for tag, _profile, _features, baseline_required in NEW_ENTRIES:
+        names.extend(
+            image_names(f"bt0-{tag}", expected_sections(set_name.split(), True))
+        )
+    for tag, _profile, features, baseline_required in NEW_ENTRIES:
         if baseline_required:
-            names.append(f"bt0-{tag}.bin")
+            names.extend(
+                image_names(f"bt0-{tag}", expected_sections(list(features), False))
+            )
     for set_name in MAIN_SETS:
         tag = set_name.replace(" ", "+") or "none"
         names.append(f"main-{tag}.bin")
@@ -420,44 +476,37 @@ def negative_contract_ok(
     """A negative row must fail with its own exact diagnostic."""
     if returncode == 0:
         return False, "expected the build to fail, got exit 0"
-    if expected not in output:
+    if not diagnostic_found(output, expected):
         return False, "build failed without the expected diagnostic"
     return True, "expected diagnostic found"
 
 
-def has_section(readelf_output: str, name: str) -> bool:
-    """True when readelf lists a section (its lines are indented)."""
-    return (
-        re.search(rf"^\s*\[\s*\d+\]\s+{re.escape(name)}\b", readelf_output, re.M)
-        is not None
-    )
+def diagnostic_found(stderr: str, expected: str) -> bool:
+    return f"error: {expected}" in stderr.splitlines()
 
 
-def parse_test_results(output: str) -> tuple[int, int, int, bool]:
-    passed = failed = ignored = 0
-    found = False
-    for match in TEST_RESULT_RE.finditer(output):
-        found = True
-        passed += int(match.group(1))
-        failed += int(match.group(2))
-        ignored += int(match.group(3))
-    return passed, failed, ignored, found
-
-
-def parse_running_paths(output: str) -> list[str]:
-    """The executable paths from cargo's `Running ... (<path>)` lines."""
-    return RUNNING_RE.findall(output)
-
-
-def read_main_max(source: Path) -> int | None:
-    """MAIN_MAX_SIZE from the source, not a hard-coded copy."""
-    path = source / COMMON_LIB
-    if not path.is_file():
-        return None
-    match = MAIN_MAX_RE.search(path.read_text(encoding="utf-8"))
+def completed_test_result(stdout: str) -> tuple[bool, int, int, int] | None:
+    lines = [line for line in stdout.splitlines() if line.startswith("test result:")]
+    match = TEST_RESULT_RE.fullmatch(lines[0]) if len(lines) == 1 else None
     if match is None:
         return None
-    return int(match.group(1), 0)
+    status, passed, failed, ignored = match.groups()
+    return status == "ok", int(passed), int(failed), int(ignored)
+
+
+def read_cap(path: Path, pattern: re.Pattern[str]) -> int:
+    matches = pattern.findall(path.read_text(encoding="utf-8"))
+    if len(matches) != 1 or (value := int(matches[0], 0)) <= 0:
+        raise ValueError(f"expected one positive limit in {path}")
+    return value
+
+
+def reject_cache_links(directory: str, names: list[str]) -> list[str]:
+    for name in names:
+        path = Path(directory) / name
+        if path.is_symlink():
+            raise ValueError(f"offline Cargo cache contains a symlink: {path}")
+    return []
 
 
 def check_egon_header(data: bytes) -> str | None:
@@ -498,149 +547,201 @@ class Harness:
     def __init__(self, args: Config, runner: SubprocessRunner | None = None):
         self.args = args
         self.runner = runner or SubprocessRunner()
-        self.env = build_env(args, args.out)
+        self.git_env = git_env()
+        self.env = {
+            **self.git_env,
+            "CARGO_HOME": str(args.out / "cargo-home"),
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TERM_COLOR": "never",
+            "RUSTUP_AUTO_INSTALL": "0",
+            "A733_DRAM_LIB": str(args.dram_lib),
+            "A733_PHY_FW_OBJ": str(args.phyfw_obj),
+            "TMPDIR": str(args.out / "tmp"),
+        }
         self.source_head: str | None = None
         self.gate_base: str | None = None
         self.gate_head: str | None = None
+        self.baseline_digests: dict[str, str] = {}
+        self.image_digests: dict[str, str] = {}
+        self.media_max: int | None = None
+        self.media_pad: int | None = None
+        self.fel_max: int | None = None
         self.main_max: int | None = None
         self.warnings: dict[str, int] = {}
-        self._host_checked = False
         self._host: str | None = None
+        self.toolchain: dict[str, str] = {}
+        self.cargo = "cargo"
 
     # -- fail-closed path checks ------------------------------------------
+
+    def protected_inputs(self) -> tuple[tuple[str, Path], ...]:
+        a = self.args
+        return (
+            ("source", a.source),
+            ("baseline", a.baseline),
+            ("dram-lib", a.dram_lib),
+            ("phyfw-obj", a.phyfw_obj),
+            ("gate", a.gate),
+            ("host Cargo cache", Path.home() / ".cargo"),
+        )
 
     def check_paths(self) -> list[str]:
         a = self.args
         errors: list[str] = []
         # Overlap first: nothing is created when the job would write into a
         # protected input.
-        for label, path in (
-            ("source", a.source),
-            ("baseline", a.baseline),
-            ("dram-lib", a.dram_lib),
-            ("phyfw-obj", a.phyfw_obj),
-            ("gate", a.gate),
-        ):
-            if paths_overlap(a.out, path):
+        for label, path in self.protected_inputs():
+            if paths_overlap(a.out.resolve(), path.resolve()):
                 errors.append(f"output directory overlaps the {label}: {path}")
         if errors:
             return errors
-        if a.out.exists():
-            if not a.out.is_dir():
-                errors.append(f"output path is not a directory: {a.out}")
-                return errors
-            if any(a.out.iterdir()):
-                errors.append(f"output directory exists and is not empty: {a.out}")
-                return errors
-        else:
-            a.out.mkdir(parents=True)
-        for sub in (
-            "matrix/out",
-            "matrix/logs",
-            "target/bt0",
-            "target/main",
-            "target/test",
-            "target/negative",
-            "tests",
-            "tmp",
-        ):
-            (a.out / sub).mkdir(parents=True, exist_ok=True)
+        if a.out.exists() or a.out.is_symlink():
+            return [f"output path already exists: {a.out}"]
+        if not a.out.parent.is_dir():
+            return [f"output parent directory not found: {a.out.parent}"]
         if not a.source.is_dir():
             errors.append(f"source directory not found: {a.source}")
         else:
             self._check_source(errors)
             for rel in (BT0_DIR, MAIN_DIR, *SUITE_DIRS):
-                if not (a.source / rel).is_dir():
+                path = a.source / rel
+                if not path.is_dir() or not path.resolve().is_relative_to(a.source):
                     errors.append(f"required source directory missing: {rel}")
-            self.main_max = read_main_max(a.source)
-            if self.main_max is None:
-                errors.append(f"MAIN_MAX_SIZE not found in the source: {COMMON_LIB}")
+            try:
+                self.read_limits()
+            except (OSError, ValueError, SyntaxError) as exc:
+                errors.append(f"could not read image caps: {exc}")
+            errors.extend(self.check_cargo_config())
         if not a.baseline.is_dir():
             errors.append(f"baseline directory not found: {a.baseline}")
         else:
-            for name in required_baseline_names():
-                if not (a.baseline / name).is_file():
-                    errors.append(f"required baseline image missing: {name}")
             errors.extend(self._check_baseline_sums())
         for label, path in (
             ("dram-lib", a.dram_lib),
             ("phyfw-obj", a.phyfw_obj),
             ("gate", a.gate),
         ):
-            if not path.is_file():
-                errors.append(f"{label} not found: {path}")
-        errors.extend(self.check_tooling())
+            if not path.is_file() or not path.stat().st_size:
+                errors.append(f"{label} missing or empty: {path}")
+        if not errors:
+            errors.extend(self.check_tooling())
         return errors
+
+    def read_limits(self) -> None:
+        # Read integer constants as syntax, not by importing the image builder.
+        tree = ast.parse(MKIMAGE.read_bytes(), filename=str(MKIMAGE))
+        values = {}
+        for name in ("EGON_MAX", "EGON_PAD"):
+            matches = [
+                node.value.value
+                for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+                and isinstance(node.value, ast.Constant)
+                and type(node.value.value) is int
+            ]
+            if len(matches) != 1 or matches[0] <= 0:
+                raise ValueError(f"expected one positive {name} in {MKIMAGE}")
+            values[name] = matches[0]
+        self.media_max, self.media_pad = values["EGON_MAX"], values["EGON_PAD"]
+        self.fel_max = read_cap(self.args.source / BT0_BUILD, FEL_MAX_RE)
+        self.main_max = read_cap(self.args.source / COMMON_LIB, MAIN_MAX_RE)
+
+    def check_cargo_config(self) -> list[str]:
+        a = self.args
+        dirs = set(a.source.parents)
+        for rel in (BT0_DIR, MAIN_DIR, *SUITE_DIRS):
+            dirs.update((a.source / rel, *(a.source / rel).parents))
+        errors = []
+        for directory in sorted(dirs):
+            for name in ("config", "config.toml"):
+                path = directory / ".cargo" / name
+                if not (path.exists() or path.is_symlink()):
+                    continue
+                if (
+                    not path.is_relative_to(a.source)
+                    or not path.is_file()
+                    or path.resolve() != path
+                    or self.git(
+                        "ls-files", "--error-unmatch", "--", str(path)
+                    ).returncode
+                ):
+                    errors.append(
+                        f"ambient Cargo configuration would affect the build: {path}"
+                    )
+        return errors
+
+    def prepare_output(self) -> None:
+        out = self.args.out
+        out.mkdir(mode=0o700)
+        for sub in ("matrix/out", "matrix/logs", "tests", "tmp/images", "cargo-home"):
+            (out / sub).mkdir(parents=True)
+        # Cargo's offline cache can still be written to while building. Use
+        # copies of the archives, indexes and Git databases, not the host cache
+        # or its config, credentials, extracted sources or checked-out trees.
+        for rel in ("registry/cache", "registry/index", "git/db"):
+            source = Path.home() / ".cargo" / rel
+            if source.is_dir():
+                shutil.copytree(
+                    source, out / "cargo-home" / rel, ignore=reject_cache_links
+                )
+
+    def cargo_env(self, group: str) -> dict[str, str]:
+        env = dict(self.env)
+        for key, directory in (
+            ("CARGO_TARGET_DIR", "target"),
+            ("CARGO_BUILD_BUILD_DIR", "build"),
+        ):
+            path = (self.args.out / directory / group).resolve()
+            if not path.is_relative_to(self.args.out) or any(
+                paths_overlap(path, protected.resolve())
+                for _label, protected in self.protected_inputs()
+            ):
+                raise ValueError(f"{key} is not private to the job: {path}")
+            env[key] = str(path)
+        return env
+
+    def git(self, *argv: str) -> CommandResult:
+        source = self.args.source
+        return self.runner.run(["git", "-C", str(source), *argv], source, self.git_env)
+
+    def source_is_worktree_root(self) -> bool:
+        root = self.git("rev-parse", "--show-toplevel")
+        return root.returncode == 0 and root.stdout.rstrip("\n") == str(
+            self.args.source
+        )
 
     def _check_source(self, errors: list[str]) -> None:
         a = self.args
-        git_dir = self.runner.run(
-            ["git", "-C", str(a.source), "rev-parse", "--git-dir"], a.source, self.env
-        )
-        if git_dir.returncode != 0:
-            errors.append(f"source is not a git repository: {a.source}")
+        if not self.source_is_worktree_root():
+            errors.append(f"source is not the root of its own git worktree: {a.source}")
             return
-        head = self.runner.run(
-            ["git", "-C", str(a.source), "rev-parse", "HEAD"], a.source, self.env
-        )
+        head = self.git("rev-parse", "HEAD")
         if head.returncode != 0:
             errors.append("could not read the source HEAD")
             return
-        actual_head = head.output.strip()
-        expected = self.runner.run(
-            [
-                "git",
-                "-C",
-                str(a.source),
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                f"{a.source_sha}^{{commit}}",
-            ],
-            a.source,
-            self.env,
-        )
-        if expected.returncode != 0:
-            errors.append(f"--source-sha is not a commit in the source: {a.source_sha}")
-        elif actual_head != expected.output.strip():
+        actual_head = head.stdout.strip()
+        if actual_head != a.source_sha.lower():
             errors.append(
                 f"source HEAD {actual_head} does not match --source-sha "
-                f"{expected.output.strip()}"
+                f"{a.source_sha}"
             )
         else:
             self.source_head = actual_head
-        base = self.runner.run(
-            [
-                "git",
-                "-C",
-                str(a.source),
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                f"{a.base}^{{commit}}",
-            ],
-            a.source,
-            self.env,
+        base = self.git(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            f"{a.base}^{{commit}}",
         )
         if base.returncode != 0:
             errors.append(f"base revision not found in source: {a.base}")
             return
-        base_sha = base.output.strip()
+        base_sha = base.stdout.strip()
         if self.source_head is None:
             return
-        ancestor = self.runner.run(
-            [
-                "git",
-                "-C",
-                str(a.source),
-                "merge-base",
-                "--is-ancestor",
-                base_sha,
-                self.source_head,
-            ],
-            a.source,
-            self.env,
-        )
+        ancestor = self.git("merge-base", "--is-ancestor", base_sha, self.source_head)
         if ancestor.returncode != 0:
             errors.append(
                 f"base {base_sha} is not an ancestor of HEAD {self.source_head}"
@@ -648,12 +749,10 @@ class Harness:
         else:
             self.gate_base = base_sha
             self.gate_head = self.source_head
-        status = self.runner.run(
-            ["git", "-C", str(a.source), "status", "--porcelain"], a.source, self.env
-        )
+        status = self.git("status", "--porcelain", "--untracked-files=all")
         if status.returncode != 0:
             errors.append("could not read the source worktree status")
-        elif status.output.strip():
+        elif status.stdout.strip():
             errors.append("source worktree is dirty; check out a clean commit")
 
     def _check_baseline_sums(self) -> list[str]:
@@ -662,60 +761,136 @@ class Harness:
         if not sums.is_file():
             return [f"baseline SHA256SUMS not found: {sums}"]
         errors: list[str] = []
-        actual = sha256_file(sums)
+        data = sums.read_bytes()
+        actual = sha256(data)
         if actual != a.baseline_sums_sha256:
             errors.append(
                 f"baseline SHA256SUMS hash {actual} does not match the expected "
                 f"{a.baseline_sums_sha256}"
             )
             return errors
-        for line in sums.read_text(encoding="utf-8").splitlines():
-            parts = line.split(None, 1)
-            if len(parts) != 2:
-                continue
-            want, name = parts[0], parts[1].strip().lstrip("*")
+        manifest: dict[str, str] = {}
+        for line in data.decode("ascii").splitlines():
+            match = SUM_LINE_RE.fullmatch(line)
+            if not match:
+                return ["baseline SHA256SUMS contains a malformed line"]
+            want, name = match.groups()
+            if name in manifest:
+                return [f"baseline SHA256SUMS contains a duplicate entry: {name}"]
+            manifest[name] = want.lower()
+        for name in sorted(set(required_baseline_names()) - manifest.keys()):
+            errors.append(f"baseline SHA256SUMS is missing a compared image: {name}")
+        for name, want in manifest.items():
             path = a.baseline / name
+            if not path.resolve().is_relative_to(a.baseline):
+                errors.append(f"baseline image is outside its directory: {name}")
+                continue
             if not path.is_file():
                 errors.append(f"baseline SHA256SUMS names a missing file: {name}")
-            elif sha256_file(path) != want:
-                errors.append(f"baseline file does not match SHA256SUMS: {name}")
+                continue
+            data = path.read_bytes()
+            if not data or sha256(data) != want:
+                errors.append(
+                    f"baseline file empty or does not match SHA256SUMS: {name}"
+                )
+        if not errors:
+            self.baseline_digests = manifest
         return errors
 
     def check_tooling(self) -> list[str]:
         """Fail clearly when the pinned toolchain or a target is missing."""
         errors: list[str] = []
-        for tool in ("cargo", "rustc", "llvm-readelf", "llvm-objcopy"):
-            if shutil.which(tool) is None:
+        for tool in ("rustup", "llvm-readelf", "llvm-objcopy"):
+            if shutil.which(tool, path=self.env["PATH"]) is None:
                 errors.append(f"required tool not found: {tool}")
         toolchain = self.args.source / "rust-toolchain.toml"
         if not toolchain.is_file():
-            return errors
+            return errors + ["rust-toolchain.toml is missing"]
         try:
             data = tomllib.loads(toolchain.read_text(encoding="utf-8"))
         except (tomllib.TOMLDecodeError, OSError) as exc:
             return errors + [f"could not read rust-toolchain.toml: {exc}"]
         spec = data.get("toolchain", {})
         channel = spec.get("channel")
-        if not channel:
-            return errors + ["rust-toolchain.toml has no channel"]
-        probe = self.runner.run(
-            ["rustup", "run", channel, "rustc", "-vV"], self.args.source, self.env
-        )
-        if probe.returncode != 0:
-            errors.append(f"pinned toolchain {channel} is not installed")
+        if not isinstance(channel, str) or not re.fullmatch(
+            r"(?:\d+\.\d+\.\d+|nightly-\d{4}-\d{2}-\d{2})", channel
+        ):
+            return errors + ["rust-toolchain.toml has no exact channel pin"]
+        if errors:
             return errors
+        # Resolve in the source, not in the caller's directory. An accidental
+        # rustup directory override must not change what will be invoked.
+        probe_env = {**self.git_env, "RUSTUP_AUTO_INSTALL": "0"}
+        for tool in ("rustc", "cargo", "rustdoc"):
+            resolved = self.runner.run(
+                ["rustup", "which", tool], self.args.source, probe_env
+            )
+            pinned = self.runner.run(
+                ["rustup", "which", "--toolchain", channel, tool],
+                self.args.source,
+                probe_env,
+            )
+            path = Path(resolved.stdout.strip())
+            if (
+                resolved.returncode
+                or pinned.returncode
+                or resolved.stdout != pinned.stdout
+                or not path.is_absolute()
+                or not path.is_file()
+                or not (
+                    path.parent.parent.name == channel
+                    or path.parent.parent.name.startswith(channel + "-")
+                )
+            ):
+                return [f"source resolves {tool} outside the installed pin {channel}"]
+            self.toolchain[tool] = str(path)
+        rustc = self.runner.run(
+            [self.toolchain["rustc"], "-vV"], self.args.source, probe_env
+        )
+        cargo = self.runner.run(
+            [self.toolchain["cargo"], "-V"], self.args.source, probe_env
+        )
+        release = re.search(r"^release: (\S+)$", rustc.stdout, re.M)
+        cargo_version = re.match(r"^cargo (\S+)", cargo.stdout)
+        host = re.search(r"^host: (\S+)$", rustc.stdout, re.M)
+
+        def matches_channel(version: re.Match[str] | None) -> bool:
+            return bool(
+                version
+                and (
+                    re.fullmatch(r"\d+\.\d+\.\d+-nightly", version[1])
+                    if channel.startswith("nightly-")
+                    else version[1] == channel
+                )
+            )
+
+        if (
+            rustc.returncode
+            or cargo.returncode
+            or not host
+            or not all(matches_channel(version) for version in (release, cargo_version))
+        ):
+            return [f"resolved rustc and cargo versions do not match {channel}"]
+        self._host = host[1]
+        self.cargo = self.toolchain["cargo"]
+        self.env.update(
+            RUSTC=self.toolchain["rustc"], RUSTDOC=self.toolchain["rustdoc"]
+        )
+        self.toolchain.update(
+            channel=channel, rustc_version=rustc.stdout, cargo_version=cargo.stdout
+        )
         targets = spec.get("targets") or []
         if not targets:
             return errors
         installed = self.runner.run(
             ["rustup", "target", "list", "--installed", "--toolchain", channel],
             self.args.source,
-            self.env,
+            probe_env,
         )
         if installed.returncode != 0:
             errors.append(f"could not list the targets of toolchain {channel}")
             return errors
-        have = set(installed.output.split())
+        have = set(installed.stdout.split())
         for target in targets:
             if target not in have:
                 errors.append(f"target {target} is not installed for {channel}")
@@ -801,13 +976,12 @@ class Harness:
     def _write_sha256sums(self) -> None:
         out_dir = self.args.out / "matrix" / "out"
         lines = [
-            f"{sha256_file(path)}  {path.name}\n"
-            for path in sorted(out_dir.glob("*.bin"))
+            f"{digest}  {name}\n" for name, digest in sorted(self.image_digests.items())
         ]
         (out_dir / "SHA256SUMS").write_text("".join(lines), encoding="utf-8")
 
     def _cargo_bt0(self, features: list[str], no_default: bool) -> list[str]:
-        argv = ["cargo", "build", "--offline", "--locked", "--release"]
+        argv = [self.cargo, "build", "--offline", "--locked", "--release"]
         if no_default:
             argv.append("--no-default-features")
         if features:
@@ -823,10 +997,9 @@ class Harness:
         section: str,
         baseline_required: bool,
     ) -> BuildResult:
-        env = dict(self.env)
+        env = self.cargo_env("bt0")
         if profile:
             env["A7A_PROFILE"] = profile
-        env["CARGO_TARGET_DIR"] = str(self.args.out / "target" / "bt0")
         log = self.args.out / "matrix" / "logs" / f"bt0-{tag}.log"
         res = self.runner.run(
             self._cargo_bt0(features, no_default), self.args.source / BT0_DIR, env, log
@@ -851,105 +1024,31 @@ class Harness:
             return BuildResult(
                 tag, section, False, "build failed", detail=f"missing ELF {elf}"
             )
-        warnings = self._count_warnings(log)
-        readelf_log = self.args.out / "matrix" / "logs" / f"bt0-{tag}-readelf.log"
-        readelf = self.runner.run(
-            ["llvm-readelf", "-S", "-W", str(elf)],
-            self.args.source / BT0_DIR,
-            env,
-            readelf_log,
-        )
-        if readelf.returncode != 0:
-            return BuildResult(
-                tag, section, False, "build failed", detail="llvm-readelf failed"
-            )
-        has_dram = has_section(readelf.output, ".dram")
-        has_phyfw = has_section(readelf.output, ".phyfw")
-        bin_path = self.args.out / "matrix" / "out" / f"bt0-{tag}.bin"
-        strip_argv = ["llvm-objcopy", "-O", "binary"]
-        if has_dram:
-            strip_argv.append("--remove-section=.dram")
-        if has_phyfw:
-            strip_argv.append("--remove-section=.phyfw")
-        strip_argv += [str(elf), str(bin_path)]
-        strip_log = self.args.out / "matrix" / "logs" / f"bt0-{tag}-objcopy.log"
-        strip = self.runner.run(strip_argv, self.args.source / BT0_DIR, env, strip_log)
-        if strip.returncode != 0 or not bin_path.is_file():
-            return BuildResult(
-                tag, section, False, "build failed", detail="llvm-objcopy failed"
-            )
-        ext_path: Path | None = None
-        if has_dram or has_phyfw:
-            ext_path = self.args.out / "matrix" / "out" / f"bt0-{tag}-ext.bin"
-            ext_section = ".dram" if has_dram else ".phyfw"
-            ext_log = self.args.out / "matrix" / "logs" / f"bt0-{tag}-ext-objcopy.log"
-            ext = self.runner.run(
-                [
-                    "llvm-objcopy",
-                    "-O",
-                    "binary",
-                    f"--only-section={ext_section}",
-                    str(elf),
-                    str(ext_path),
-                ],
-                self.args.source / BT0_DIR,
-                env,
-                ext_log,
-            )
-            if (
-                ext.returncode != 0
-                or not ext_path.is_file()
-                or ext_path.stat().st_size == 0
-            ):
-                return BuildResult(
-                    tag,
-                    section,
-                    False,
-                    "build failed",
-                    detail=f"extension {ext_section} missing or empty",
-                    warnings=warnings,
-                )
-        image_error = self._validate_bt0_image(features, bin_path)
-        if image_error is not None:
-            return BuildResult(
-                tag,
-                section,
-                False,
-                "invalid image",
-                detail=image_error,
-                warnings=warnings,
-            )
-        baseline, detail = self._compare_baseline(
-            f"bt0-{tag}", bin_path, ext_path, baseline_required
-        )
-        if baseline == "missing baseline":
-            return BuildResult(
-                tag, section, False, baseline, detail=detail, warnings=warnings
-            )
-        return BuildResult(
+        expected = expected_sections(features, no_default)
+        medium = not {
+            "fel",
+            "fastboot",
+            "fastboot-emmc-write",
+            "fastboot-nor-write",
+            "dram-lab",
+        }.intersection(features)
+        return self.export_images(
+            f"bt0-{tag}",
             tag,
             section,
-            True,
-            baseline,
-            size=bin_path.stat().st_size,
-            warnings=warnings,
-            detail=detail,
+            elf,
+            self.args.source / BT0_DIR,
+            env,
+            expected,
+            self.media_max if medium else self.fel_max,
+            baseline_required,
+            self._count_warnings(log),
+            media=medium,
         )
-
-    def _validate_bt0_image(self, features: list[str], bin_path: Path) -> str | None:
-        size = bin_path.stat().st_size
-        if size == 0:
-            return "primary image is empty"
-        limit = FEL_MAX if "fel" in features else EGON_MAX
-        if size > limit:
-            return f"primary image is {size:#x} bytes, over the {limit:#x} limit"
-        if "fel" not in features:
-            return check_egon_header(bin_path.read_bytes())
-        return None
 
     def build_main(self, tag: str, features: list[str]) -> BuildResult:
         argv = [
-            "cargo",
+            self.cargo,
             "build",
             "--offline",
             "--locked",
@@ -958,8 +1057,7 @@ class Harness:
         ]
         if features:
             argv += ["--features", " ".join(features)]
-        env = dict(self.env)
-        env["CARGO_TARGET_DIR"] = str(self.args.out / "target" / "main")
+        env = self.cargo_env("main")
         log = self.args.out / "matrix" / "logs" / f"main-{tag}.log"
         res = self.runner.run(argv, self.args.source / MAIN_DIR, env, log)
         if res.returncode != 0:
@@ -986,93 +1084,138 @@ class Harness:
                 "build failed",
                 detail=f"missing ELF {elf}",
             )
-        bin_path = self.args.out / "matrix" / "out" / f"main-{tag}.bin"
-        copy_log = self.args.out / "matrix" / "logs" / f"main-{tag}-objcopy.log"
-        copy = self.runner.run(
-            ["llvm-objcopy", "-O", "binary", str(elf), str(bin_path)],
+        return self.export_images(
+            f"main-{tag}",
+            f"main-{tag}",
+            "main",
+            elf,
             self.args.source / MAIN_DIR,
             env,
-            copy_log,
-        )
-        if copy.returncode != 0 or not bin_path.is_file():
-            return BuildResult(
-                "main-" + tag,
-                "main",
-                False,
-                "build failed",
-                detail="llvm-objcopy failed",
-            )
-        warnings = self._count_warnings(log)
-        image_error = self._validate_main_image(bin_path)
-        if image_error is not None:
-            return BuildResult(
-                "main-" + tag,
-                "main",
-                False,
-                "invalid image",
-                detail=image_error,
-                warnings=warnings,
-            )
-        baseline, detail = self._compare_baseline(f"main-{tag}", bin_path, None, True)
-        if baseline == "missing baseline":
-            return BuildResult(
-                "main-" + tag,
-                "main",
-                False,
-                baseline,
-                detail=detail,
-                warnings=warnings,
-            )
-        return BuildResult(
-            "main-" + tag,
-            "main",
+            (),
+            self.main_max,
             True,
-            baseline,
-            size=bin_path.stat().st_size,
-            warnings=warnings,
-            detail=detail,
+            self._count_warnings(log),
         )
 
-    def _validate_main_image(self, bin_path: Path) -> str | None:
-        size = bin_path.stat().st_size
-        if size == 0:
-            return "main image is empty"
-        if self.main_max is None:
-            return "MAIN_MAX_SIZE is not known"
-        if size > self.main_max:
-            return f"main image is {size:#x} bytes, over MAIN_MAX {self.main_max:#x}"
-        return None
-
-    def _compare_baseline(
+    def export_images(
         self,
         stem: str,
-        bin_path: Path,
-        ext_path: Path | None,
+        tag: str,
+        row: str,
+        elf: Path,
+        cwd: Path,
+        env: dict[str, str],
+        expected: tuple[str, ...],
+        limit: int | None,
         required: bool,
-    ) -> tuple[str, str]:
-        base_bin = self.args.baseline / f"{stem}.bin"
-        if not base_bin.is_file():
-            if required:
-                return (
-                    "missing baseline",
-                    f"required baseline image missing: {base_bin}",
+        warnings: int,
+        *,
+        media: bool = False,
+    ) -> BuildResult:
+        logs = self.args.out / "matrix" / "logs"
+        readelf = self.runner.run(
+            ["llvm-readelf", "-S", "-W", str(elf)],
+            cwd,
+            env,
+            logs / f"{stem}-readelf.log",
+        )
+        count = SECTION_COUNT_RE.search(readelf.stdout)
+        found = SECTION_RE.findall(readelf.stdout)
+        if (
+            readelf.returncode
+            or not count
+            or int(count[1]) != len(SECTION_ROW_RE.findall(readelf.stdout))
+        ):
+            return BuildResult(
+                tag,
+                row,
+                False,
+                "invalid ELF",
+                warnings=warnings,
+                detail="incomplete llvm-readelf section table",
+            )
+        if sorted(name for name, _ in found) != sorted(expected):
+            return BuildResult(
+                tag,
+                row,
+                False,
+                "invalid ELF",
+                warnings=warnings,
+                detail=f"expected payload sections {expected}, found {tuple(n for n, _ in found)}",
+            )
+        sections = {name: int(size, 16) for name, size in found}
+        names = image_names(stem, expected)
+        images = {}
+        for name, section in zip(names, (None, *expected), strict=True):
+            staged = self.args.out / "tmp" / "images" / name
+            options = (
+                [f"--only-section={section}"]
+                if section
+                else [f"--remove-section={item}" for item in expected]
+            )
+            copy = self.runner.run(
+                ["llvm-objcopy", "-O", "binary", *options, str(elf), str(staged)],
+                cwd,
+                env,
+                logs / f"{Path(name).stem}-objcopy.log",
+            )
+            error = None
+            cap = sections[section] if section else limit
+            if copy.returncode or not staged.is_file():
+                error = (
+                    f"extension {section} missing" if section else "llvm-objcopy failed"
                 )
-            return BASELINE_NEW, "no historical baseline"
-        same = filecmp.cmp(base_bin, bin_path, shallow=False)
-        detail = ""
-        if ext_path is not None:
-            base_ext = self.args.baseline / f"{stem}-ext.bin"
-            if not base_ext.is_file():
-                return (
-                    "missing baseline",
-                    f"required baseline ext image missing: {base_ext}",
+            elif cap is None:
+                error = "image size limit not known"
+            else:
+                with staged.open("rb") as stream:
+                    data = stream.read(cap + 1)
+                if section and (not data or len(data) != cap):
+                    error = f"extension {section} empty or size differs from ELF ({cap} bytes)"
+                elif not data:
+                    error = "primary image is empty"
+                elif len(data) > cap:
+                    error = f"primary is over the {cap:#x} limit"
+                elif not section and media:
+                    error = check_egon_header(data)
+                    pad = self.media_pad
+                    if not pad or (len(data) + pad - 1) // pad * pad > cap:
+                        error = f"padded media image exceeds the {cap:#x} limit"
+            if error:
+                return BuildResult(
+                    tag, row, False, "invalid image", warnings=warnings, detail=error
                 )
-            if not filecmp.cmp(base_ext, ext_path, shallow=False):
-                same = False
-                detail = " (ext differs)"
-        if same:
-            return BASELINE_SAME, ""
-        return "DIFFERS from base", f"size {bin_path.stat().st_size}{detail}"
+            images[name] = data
+        for name, data in images.items():
+            self.image_digests[name] = sha256(data)
+            # Publish the exact in-memory snapshot, not the staging file.
+            (self.args.out / "matrix" / "out" / name).write_bytes(data)
+        baseline, detail, ok = self.compare_baseline(names, required)
+        return BuildResult(
+            tag, row, ok, baseline, len(images[names[0]]), warnings, detail, sections
+        )
+
+    def compare_baseline(
+        self, names: list[str], required: bool
+    ) -> tuple[str, str, bool]:
+        if not required:
+            return BASELINE_NEW, "no historical baseline", True
+        if any(name not in self.baseline_digests for name in names):
+            return (
+                "missing baseline",
+                "missing compared image in sealed manifest",
+                False,
+            )
+        differs = [
+            name
+            for name in names
+            if self.image_digests[name] != self.baseline_digests[name]
+        ]
+        if not differs:
+            return BASELINE_SAME, "", True
+        # Historical primary changes are expected, but an unchanged primary
+        # with a mismatched extension is a mixed row, not a passing comparison.
+        return "DIFFERS from base", ", ".join(differs), names[0] in differs
 
     def _count_warnings(self, log: Path) -> int:
         if not log.is_file():
@@ -1110,39 +1253,36 @@ class Harness:
     def run_negative(self) -> NegativesResult:
         results: list[NegativeResult] = []
         for tag, features, no_default, expected in NEGATIVE_ENTRIES:
-            env = dict(self.env)
-            env["CARGO_TARGET_DIR"] = str(self.args.out / "target" / "negative")
-            argv = ["cargo", "build", "--offline", "--locked", "--release"]
-            if no_default:
-                argv.append("--no-default-features")
-            argv += ["--features", " ".join(features)]
+            env = self.cargo_env("negative")
             log = self.args.out / "matrix" / "logs" / f"negative-{tag}.log"
-            res = self.runner.run(argv, self.args.source / BT0_DIR, env, log)
-            ok, detail = negative_contract_ok(res.returncode, res.output, expected)
+            res = self.runner.run(
+                self._cargo_bt0(list(features), no_default),
+                self.args.source / BT0_DIR,
+                env,
+                log,
+            )
+            ok, detail = negative_contract_ok(res.returncode, res.stderr, expected)
             results.append(
                 NegativeResult(
-                    tag, ok, res.returncode, expected, expected in res.output, detail
+                    tag,
+                    ok,
+                    res.returncode,
+                    expected,
+                    diagnostic_found(res.stderr, expected),
+                    detail,
                 )
             )
         return NegativesResult(all(result.ok for result in results), results)
 
     # -- host suites -------------------------------------------------------
 
-    def host_triple(self) -> str | None:
-        if not self._host_checked:
-            self._host_checked = True
-            res = self.runner.run(["rustc", "-vV"], self.args.source, self.env)
-            match = re.search(r"^host: (\S+)", res.output, re.M)
-            self._host = match.group(1) if match and res.returncode == 0 else None
-        return self._host
-
     def _expected_test_binaries(
         self, host: str, cwd: Path, env: dict[str, str]
-    ) -> tuple[list[str], str]:
+    ) -> tuple[list[Path], str]:
         log = self.args.out / "tests" / (cwd.name + "-no-run.log")
         res = self.runner.run(
             [
-                "cargo",
+                self.cargo,
                 "test",
                 "--offline",
                 "--locked",
@@ -1157,21 +1297,42 @@ class Harness:
         )
         if res.returncode != 0:
             return [], f"cargo test --no-run exited {res.returncode}"
-        executables: list[str] = []
-        for line in res.output.splitlines():
+        executables: list[Path] = []
+        finished = False
+        target_dir = Path(env["CARGO_TARGET_DIR"])
+        for line in res.stdout.splitlines():
             try:
                 message = json.loads(line)
             except ValueError:
+                return [], "malformed Cargo inventory JSON"
+            if finished or not isinstance(message, dict):
+                return [], "unexpected record in Cargo inventory"
+            if message.get("reason") == "build-finished":
+                if message.get("success") is not True:
+                    return [], "Cargo inventory reported a failed build"
+                finished = True
                 continue
-            if message.get("reason") != "compiler-artifact":
-                continue
-            executable = message.get("executable")
-            if executable and message.get("target", {}).get("test"):
-                executables.append(str(executable))
+            if message.get("reason") == "compiler-artifact" and message.get(
+                "profile", {}
+            ).get("test"):
+                executable = message.get("executable")
+                if not isinstance(executable, str):
+                    return [], "Cargo test artifact has no executable"
+                path = Path(executable)
+                if (
+                    not path.is_absolute()
+                    or path.resolve() != path
+                    or not path.is_relative_to(target_dir)
+                    or path in executables
+                ):
+                    return [], f"unexpected or duplicate executable: {path}"
+                executables.append(path)
+        if not finished or not executables:
+            return [], "Cargo inventory is incomplete or has no executables"
         return executables, ""
 
     def run_suites(self) -> SuitesResult:
-        host = self.host_triple()
+        host = self._host
         if host is None:
             return SuitesResult(
                 False,
@@ -1196,59 +1357,82 @@ class Harness:
                     SuiteResult(rel, False, 0, 0, 0, 0, 0, "suite directory missing")
                 )
                 continue
-            env = dict(self.env)
-            env["CARGO_TARGET_DIR"] = str(self.args.out / "target" / "test")
+            env = self.cargo_env("test")
             expected, inventory_error = self._expected_test_binaries(host, cwd, env)
-            log = self.args.out / "tests" / (rel.replace("/", "-") + ".log")
-            res = self.runner.run(
-                ["cargo", "test", "--offline", "--locked", "--target", host],
-                cwd,
-                env,
-                log,
-            )
-            passed, failed, ignored, parsed = parse_test_results(res.output)
-            run_paths = parse_running_paths(res.output)
-            expected_set, run_set = set(expected), set(run_paths)
-            inventory_ok = expected_set == run_set
-            ok = (
-                res.returncode == 0
-                and parsed
-                and failed == 0
-                and passed > 0
-                and inventory_ok
-                and not inventory_error
-            )
-            detail = (
-                f"exit {res.returncode}; passed {passed}, failed {failed}, "
-                f"ignored {ignored}; binaries expected {len(expected_set)}, "
-                f"run {len(run_set)}"
-            )
+            passed = failed = ignored = completed = 0
+            details = []
+            logs = self.args.out / "tests" / rel.replace("/", "-")
+            logs.mkdir()
+            errors = []
             if inventory_error:
-                detail += f"; inventory error: {inventory_error}"
-            if not parsed:
-                detail += "; no 'test result:' line found"
-            if parsed and passed == 0:
-                detail += "; no executed test"
-            if not inventory_ok:
-                missing = sorted(expected_set - run_set)
-                extra = sorted(run_set - expected_set)
-                if missing:
-                    detail += "; missing binaries: " + ", ".join(missing)
-                if extra:
-                    detail += "; unexpected binaries: " + ", ".join(extra)
+                errors.append(f"inventory error: {inventory_error}")
+            for index, binary in enumerate(expected, start=1):
+                if not binary.is_file():
+                    errors.append(f"missing test binary: {binary}")
+                    continue
+                log = logs / f"{index:02d}-{binary.name}.log"
+                res = self.runner.run([str(binary)], cwd, env, log)
+                summary = completed_test_result(res.stdout)
+                if summary is None:
+                    errors.append(
+                        f"{binary.name}: exit {res.returncode}; missing or invalid test result"
+                    )
+                    continue
+                completed += 1
+                success, p, f, i = summary
+                passed += p
+                failed += f
+                ignored += i
+                details.append(f"{binary.name}: exit {res.returncode}, {p}/{f}/{i}")
+                if res.returncode or not success or f or not p:
+                    errors.append(f"{binary.name}: failed or no executed test")
+            if not inventory_error:
+                doc_name = DOC_TESTS[rel]
+                doc = self.runner.run(
+                    [
+                        self.cargo,
+                        "test",
+                        "--offline",
+                        "--locked",
+                        "--doc",
+                        "--target",
+                        host,
+                    ],
+                    cwd,
+                    env,
+                    logs / "doctest.log",
+                )
+                units = re.findall(r"^\s*Doc-tests (\S+)$", doc.stderr, re.M)
+                if (
+                    doc.returncode
+                    or units != [doc_name]
+                    or completed_test_result(doc.stdout) != (True, 0, 0, 0)
+                ):
+                    errors.append(
+                        f"{doc_name} doctest: expected one successful zero-test result"
+                    )
+                else:
+                    details.append(f"{doc_name} doctest: 0/0/0 (named exception)")
+            detail = f"binaries expected {len(expected)}, completed {completed}"
+            if errors:
+                detail += "; " + "; ".join(errors)
+            if details:
+                detail += "\n    " + "\n    ".join(details)
             results.append(
                 SuiteResult(
                     rel,
-                    ok,
+                    not errors and completed == len(expected) and passed > 0,
                     passed,
                     failed,
                     ignored,
-                    len(expected_set),
-                    len(run_set),
+                    len(expected),
+                    completed,
                     detail,
                 )
             )
-        return SuitesResult(all(result.ok for result in results), results)
+        return SuitesResult(
+            bool(results) and all(result.ok for result in results), results
+        )
 
     # -- external gate -----------------------------------------------------
 
@@ -1262,7 +1446,7 @@ class Harness:
             self.gate_head or "",
         ]
         log = self.args.out / "gate.log"
-        res = self.runner.run(argv, self.args.source, self.env, log)
+        res = self.runner.run(argv, self.args.source, self.git_env, log)
         return GateResult(res.returncode == 0, res.returncode, res.output)
 
     # -- retained default digests -----------------------------------------
@@ -1271,11 +1455,10 @@ class Harness:
         results = []
         for name in DIGEST_NAMES:
             expected = self.args.expected_digests.get(name)
-            path = self.args.out / "matrix" / "out" / f"bt0-{name}.bin"
-            if expected is None or not path.is_file():
+            actual = self.image_digests.get(f"bt0-{name}.bin")
+            if expected is None or actual is None:
                 results.append(DigestResult(name, expected, None, False))
                 continue
-            actual = sha256_file(path)
             results.append(DigestResult(name, expected, actual, actual == expected))
         return DigestsResult(all(result.ok for result in results), results)
 
@@ -1283,26 +1466,20 @@ class Harness:
 
     def verify_source_unchanged(self) -> list[str]:
         errors: list[str] = []
-        head = self.runner.run(
-            ["git", "-C", str(self.args.source), "rev-parse", "HEAD"],
-            self.args.source,
-            self.env,
-        )
+        if not self.source_is_worktree_root():
+            return ["source is no longer the root of its own Git worktree"]
+        head = self.git("rev-parse", "HEAD")
         if head.returncode != 0:
             errors.append("could not read the source HEAD after the build")
-        elif self.source_head is not None and head.output.strip() != self.source_head:
+        elif self.source_head is not None and head.stdout.strip() != self.source_head:
             errors.append(
-                f"source HEAD changed during the run: {head.output.strip()} "
+                f"source HEAD changed during the run: {head.stdout.strip()} "
                 f"(was {self.source_head})"
             )
-        status = self.runner.run(
-            ["git", "-C", str(self.args.source), "status", "--porcelain"],
-            self.args.source,
-            self.env,
-        )
+        status = self.git("status", "--porcelain", "--untracked-files=all")
         if status.returncode != 0:
             errors.append("could not read the source worktree status after the build")
-        elif status.output.strip():
+        elif status.stdout.strip():
             errors.append("source worktree is dirty after the build")
         return errors
 
@@ -1321,6 +1498,16 @@ class Harness:
         print(f"source: {a.source}")
         print(f"source HEAD: {self.source_head} (expected {a.source_sha})")
         print(f"gate base: {self.gate_base}  head: {self.gate_head}")
+        print(f"toolchain: {self.toolchain.get('channel')}")
+        for key in ("rustc_version", "cargo_version"):
+            print(self.toolchain.get(key, "").rstrip())
+        for name, source, value in (
+            ("eGON media", MKIMAGE, self.media_max),
+            ("FEL", a.source / BT0_BUILD, self.fel_max),
+            ("main", a.source / COMMON_LIB, self.main_max),
+        ):
+            if value is not None:
+                print(f"{name} cap: {value:#x} ({source})")
         print()
         print("=== matrix ===")
         print(
@@ -1340,8 +1527,14 @@ class Harness:
             f"main: {matrix.main_ok}/{matrix.main_total} built; "
             f"identical to base {matrix.main_identical}"
         )
-        if matrix.failures:
-            print("failed builds: " + ", ".join(matrix.failures))
+        for build in matrix.builds:
+            if build.extensions:
+                sizes = ", ".join(
+                    f"{name}: {size} bytes" for name, size in build.extensions.items()
+                )
+                print(f"{build.section}/{build.tag} payload sections: {sizes}")
+            if not build.ok:
+                print(f"{build.section}/{build.tag}: {build.baseline}: {build.detail}")
         print()
         print("=== warnings (reported, not suppressed) ===")
         if self.warnings:
@@ -1383,6 +1576,14 @@ class Harness:
             )
 
     def run(self) -> int:
+        try:
+            return self._run()
+        except (OSError, ValueError) as exc:
+            print(f"verification error: {exc}")
+            print("VERDICT: FAIL")
+            return 1
+
+    def _run(self) -> int:
         errors = self.check_paths()
         if errors:
             print("path checks failed:")
@@ -1390,6 +1591,7 @@ class Harness:
                 print(f"  - {error}")
             print("VERDICT: FAIL")
             return 1
+        self.prepare_output()
         matrix = self.run_matrix()
         negative = self.run_negative()
         suites = self.run_suites()
@@ -1482,16 +1684,19 @@ def parse_args(argv: list[str] | None = None) -> Config:
         dram_lib=Path(ns.dram_lib).resolve(),
         phyfw_obj=Path(ns.phyfw_obj).resolve(),
         gate=Path(ns.gate).resolve(),
-        out=Path(ns.out).resolve(),
+        out=Path(ns.out).parent.resolve() / Path(ns.out).name,
         expected_digests=dict(ns.expect_digest),
     )
 
 
 def validate_args(args: Config) -> list[str]:
+    errors = []
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", args.source_sha):
+        errors.append("--source-sha must be a full 40-digit commit SHA")
     missing = [name for name in DIGEST_NAMES if name not in args.expected_digests]
     if missing:
-        return ["missing required --expect-digest for: " + ", ".join(missing)]
-    return []
+        errors.append("missing required --expect-digest for: " + ", ".join(missing))
+    return errors
 
 
 def main(argv: list[str] | None = None) -> int:

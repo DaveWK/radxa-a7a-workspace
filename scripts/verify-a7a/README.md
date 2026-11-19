@@ -25,6 +25,15 @@ baseline directory is the retained matrix output at the gate base, and its
 `SHA256SUMS` manifest must hash to `--baseline-sums-sha256`. The gate and the
 two build inputs are external private artifacts and are never vendored here.
 
+## Threat model
+
+The harness guards against false greens from accidents on a single-user bench
+host: stale, mixed, truncated or empty inputs and outputs; ambient Git, Cargo
+or toolchain configuration; a parent repository mistaken for the source; and
+a missing section, binary or test result counted as success. It does not
+defend against a malicious local user who can edit the harness. It uses no
+signing or daemon.
+
 ## What it checks
 
 - **Matrix**: the 38 OLD feature sets built with `--no-default-features`, the
@@ -35,7 +44,11 @@ two build inputs are external private artifacts and are never vendored here.
   (57 positive `bt0` builds), plus the 11 `main` sets. OLD and NEW are compared
   with the baseline; the lab and new no-baseline rows are labelled new. The
   historical OLD/NEW differences stay visible in the report. Every `main` image
-  must be byte-identical to the baseline.
+  must be byte-identical to the baseline. The manifest is read once: the parsed
+  bytes are the hashed bytes, and every compared primary and extension is
+  required. An unchanged primary with a different extension fails as a mixed
+  row. Both the baseline comparison and emitted `SHA256SUMS` use the digests of
+  the validated bytes, not reopened paths.
 - **Negative contract**: each negative row must fail with its own exact
   `compile_error` diagnostic, not for an arbitrary reason. The rows are the
   default feature plus `dram-lab`, `dramlib` or `blobless` (the `blobfree`
@@ -43,18 +56,24 @@ two build inputs are external private artifacts and are never vendored here.
   `fel` plus `spinor`.
 - **Images by content**: every produced image is checked, not trusted from
   `objcopy`'s exit status. The primary must be nonempty and within its class
-  limit (eGON media `bt0` 0x4A000 per `scripts/mkimage.py`; FEL `bt0` 0x4F000
-  per `bt0/build.rs`; `main` `MAIN_MAX_SIZE` read from the source). Media rows
+  limit (padded eGON media `bt0` from `EGON_MAX` and `EGON_PAD` in
+  `scripts/mkimage.py`; FEL `bt0` from `MEMORY_FEL` in the source's `bt0/build.rs`;
+  `main` from `MAIN_MAX_SIZE` in `common/src/lib.rs`). Media rows
   must carry the raw eGON.BT0 header (magic, header size, media run address and
-  the unfilled length/checksum placeholders). Every `.dram`/`.phyfw` extension
-  is extracted, validated nonempty (including lab rows with no baseline) and
-  compared with the baseline when one exists.
+  the unfilled length/checksum placeholders). The row's features declare which
+  `.dram` and `.phyfw` payload sections must be present or absent. Each expected
+  section is stripped from the primary and exported separately, with its
+  nonzero size checked against the ELF. At the verified source, `lab-drift`
+  and `lab-full-speed` each carry a **4-byte `.dram` marker** (`A7AX`), not a
+  `.phyfw` extension: `dram-lab` enables fastboot and `bl-mission` selects the
+  blobless backend.
 - **Host suites**: `dram`, `fastboot`, `common`, `src/lib/bootlog` and
   `src/lib/dram-train`. The expected test binaries are taken from
-  `cargo test --no-run --message-format=json` and reconciled with the binaries
-  `cargo test` actually runs; every `test result:` line is aggregated, at least
-  one test must execute, and a missing suite directory, a missing result line or
-  a nonzero exit is a failure. Individual zero-test doctests are allowed.
+  `cargo test --no-run --message-format=json`. Each executable is run directly
+  and must exit zero with exactly one completed, successful `test result:` line
+  on stdout and at least one passing test. Each binary has a separate log with
+  stdout and stderr in stream order. The five named library doctest targets
+  run separately and are expected to report zero tests.
 - **External gate**: the gate script is run with the source path and the
   resolved full base and head SHAs; its real exit status and full output are
   reported.
@@ -64,18 +83,23 @@ two build inputs are external private artifacts and are never vendored here.
 ## Fail-closed behaviour
 
 Every stage's real exit status is checked. A missing source, baseline directory,
-required baseline image, suite directory, build input or gate is a failure. The
-source must be a clean git worktree at `--source-sha` with the base as an
-ancestor; the HEAD and the worktree cleanliness are rechecked after the build,
-before PASS. The output directory must be fresh: an existing non-empty
-directory is refused, so no stale `.bin` can reach `SHA256SUMS`. The output,
-`TMPDIR` and the cargo target directories must not overlap the source, the
-baseline or any input. Every path is resolved to an absolute path at entry.
+required baseline image, suite directory, build input or gate is a failure.
+`--source` must be the absolute root of its own clean Git worktree at
+`--source-sha`, with the base as an ancestor. The root, HEAD and cleanliness
+are rechecked before PASS. Input checks finish before creating the output
+directory exclusively (0700); even an existing empty output is refused. The
+output, `TMPDIR` and both Cargo output locations must not overlap any input.
 
-Cargo runs with `--locked`, `GIT_OPTIONAL_LOCKS=0` and `RUSTUP_AUTO_INSTALL=0`;
-the pinned toolchain and its targets from `rust-toolchain.toml` are checked
-before the build. No `grep`/`tail` pipeline or last-successful-stage summary can
-hide a failure. Warnings are reported with their file and line, not suppressed.
+Git runs with only `PATH`, `HOME` and the harness's isolation settings: no
+inherited Git variables, no system or global config, and optional locks
+disabled. Cargo runs offline and locked in a clean environment with both
+`CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` set explicitly. It seeds a
+private Cargo home from the local offline caches under `~/.cargo` without
+sharing configuration, credentials or write locations. The executable paths
+resolved by `rustup which` in the source must match the exact channel in
+`rust-toolchain.toml`; the installed targets are checked and the actual
+`rustc -vV` and `cargo -V` recorded. Toolchain auto-install is disabled.
+Warnings are reported, not suppressed.
 
 Exit status is `0` only when every stage passes; `1` for a verification failure;
 `2` for bad arguments.
@@ -83,8 +107,8 @@ Exit status is `0` only when every stage passes; `1` for a verification failure;
 ## Job output
 
 `<job-output-dir>` receives `matrix/logs/`, `matrix/out/` (with `SHA256SUMS`),
-`target/`, `tests/` and `gate.log`. Cargo targets and `TMPDIR` stay under this
-directory; the source checkout is never written to.
+`target/`, `build/`, `cargo-home/`, `tests/`, `tmp/` and `gate.log`. The source
+checkout is never written to.
 
 The job output is private: it contains vendor-library variants and PHY
 extraction, so it is never published or committed. Keep it under the job
@@ -93,11 +117,14 @@ directory (or another private scratch area), not in Git.
 ## Regression tests
 
     python3 -I -B scripts/verify-a7a/tests/test_verify.py
+    python3 -I -B scripts/verify-a7a/tests/test_h2.py
 
 The suite is quick and needs no cargo: it drives the fail-closed orchestration
 with controlled stage results and real path checks (matrix failure, failing,
 empty or missing suite, inventory reconciliation, failing or missing gate, a
 gate given the wrong SHA, missing baseline, digest mismatch, stale output,
 output overlap, wrong source SHA, a non-ancestor base, a dirty tree after the
-build, image size/extension/header validation, all-green). The tests use a
-HOME-scoped `TMPDIR`, never `/tmp`.
+build, image size/extension/header validation, all-green). The H2 tests drive
+the real CLI entry point with controlled build and inventory outputs and
+exercise hash-time replacements, ambient configuration, section inventory and
+per-binary completion. The tests use a HOME-scoped `TMPDIR`, never `/tmp`.

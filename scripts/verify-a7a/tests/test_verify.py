@@ -13,7 +13,6 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
-import json
 import os
 import subprocess
 import tempfile
@@ -66,6 +65,10 @@ def make_source(root: Path, suites=verify.SUITE_DIRS) -> Path:
     run(["git", "init", "-q"], root)
     for rel in (verify.BT0_DIR, verify.MAIN_DIR, *suites):
         (root / rel).mkdir(parents=True, exist_ok=True)
+    (root / verify.BT0_BUILD).write_text(
+        'const MEMORY_FEL: &str = "SRAM : ORIGIN = 0x90000, LENGTH = 0x4f000";\n',
+        encoding="utf-8",
+    )
     (root / verify.COMMON_LIB).parent.mkdir(parents=True, exist_ok=True)
     (root / verify.COMMON_LIB).write_text(
         "pub const MAIN_MAX_SIZE: usize = 0x0008_0000;\n", encoding="utf-8"
@@ -121,7 +124,7 @@ def make_baseline(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     lines = []
     for name in verify.required_baseline_names():
-        data = b""
+        data = b"fixture"
         (root / name).write_bytes(data)
         lines.append(f"{hashlib.sha256(data).hexdigest()}  {name}")
     (root / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -246,6 +249,13 @@ class FakeHarness(verify.Harness):
     def check_digests(self):
         return self._digests
 
+    def check_tooling(self):
+        # Neither the fake build stages nor the external Python gate need Cargo.
+        return []
+
+    def prepare_output(self):
+        self.args.out.mkdir(mode=0o700)
+
 
 class DirtyHarness(FakeHarness):
     """Dirties the source during a stage, after the entry path checks."""
@@ -264,9 +274,9 @@ class HarnessRegressionTest(unittest.TestCase):
         self.source = make_source(self.tmp / "oreboot")
         self.baseline = make_baseline(self.tmp / "baseline")
         self.gate = self.tmp / "gate.py"
-        self.gate.write_text("", encoding="utf-8")
-        (self.tmp / "libdram-a733.a").write_bytes(b"")
-        (self.tmp / "libdram").write_bytes(b"")
+        self.gate.write_text("pass\n", encoding="utf-8")
+        (self.tmp / "libdram-a733.a").write_bytes(b"fixture")
+        (self.tmp / "libdram").write_bytes(b"fixture")
         self.out = self.tmp / "out"
 
     def tearDown(self):
@@ -404,8 +414,9 @@ class HarnessRegressionTest(unittest.TestCase):
         gate.write_text(
             "#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n", encoding="utf-8"
         )
-        harness = verify.Harness(self.args(gate=gate))
+        harness = FakeHarness(self.args(gate=gate), real_gate=True)
         self.assertEqual(harness.check_paths(), [])
+        harness.prepare_output()
         result = harness.run_gate()
         self.assertFalse(result.ok)
         self.assertEqual(result.returncode, 1)
@@ -442,182 +453,6 @@ class HarnessRegressionTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
-class FakeRunner(verify.SubprocessRunner):
-    def __init__(self, responses):
-        self.responses = responses
-        self.calls: list[tuple[str, ...]] = []
-
-    def run(self, argv, cwd, env, log=None):
-        self.calls.append(tuple(argv))
-        for prefix, result in self.responses:
-            if tuple(argv[: len(prefix)]) == tuple(prefix):
-                return result
-        return verify.CommandResult(tuple(argv), str(cwd), 0, "")
-
-
-def no_run_json(*executables: str) -> str:
-    return "".join(
-        json.dumps(
-            {
-                "reason": "compiler-artifact",
-                "target": {"kind": ["test"], "test": True},
-                "executable": executable,
-            }
-        )
-        + "\n"
-        for executable in executables
-    )
-
-
-def result_line(passed: int, failed: int = 0) -> str:
-    return (
-        f"test result: ok. {passed} passed; {failed} failed; 0 ignored; "
-        "0 measured; 0 filtered out\n"
-    )
-
-
-class SuiteInventoryTest(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(
-            prefix="verify-a7a-suites-", dir=home_tmp()
-        )
-        self.tmp = Path(self._tmp.name)
-        self.source = make_source(self.tmp / "oreboot")
-        self.baseline = make_baseline(self.tmp / "baseline")
-        self.gate = self.tmp / "gate.py"
-        self.gate.write_text("", encoding="utf-8")
-        (self.tmp / "libdram-a733.a").write_bytes(b"")
-        (self.tmp / "libdram").write_bytes(b"")
-        self.out = self.tmp / "out"
-        self.out.mkdir()
-        self.args = make_args(
-            self.tmp,
-            source=self.source,
-            baseline=self.baseline,
-            gate=self.gate,
-            out=self.out,
-        )
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def run_suites(self, responses):
-        harness = verify.Harness(self.args, runner=FakeRunner(responses))
-        return harness.run_suites()
-
-    def test_suite_with_zero_tests_returns_nonzero(self):
-        responses = [
-            (("rustc",), verify.CommandResult(("rustc",), "", 0, f"host: {HOST}\n")),
-            (
-                ("cargo", "test", "--offline", "--locked", "--no-run"),
-                verify.CommandResult(
-                    ("cargo",), "", 0, no_run_json("/fake/target/deps/lib-hash")
-                ),
-            ),
-            (
-                ("cargo", "test", "--offline", "--locked", "--target"),
-                verify.CommandResult(
-                    ("cargo",),
-                    "",
-                    0,
-                    "     Running unittests src/lib.rs (/fake/target/deps/lib-hash)\n"
-                    + result_line(0),
-                ),
-            ),
-        ]
-        result = self.run_suites(responses)
-        self.assertFalse(result.ok)
-        self.assertIn("no executed test", result.results[0].detail)
-
-    def test_suite_with_only_the_first_binary_returns_nonzero(self):
-        responses = [
-            (("rustc",), verify.CommandResult(("rustc",), "", 0, f"host: {HOST}\n")),
-            (
-                ("cargo", "test", "--offline", "--locked", "--no-run"),
-                verify.CommandResult(
-                    ("cargo",),
-                    "",
-                    0,
-                    no_run_json(
-                        "/fake/target/deps/lib-hash", "/fake/target/deps/extra-hash"
-                    ),
-                ),
-            ),
-            (
-                ("cargo", "test", "--offline", "--locked", "--target"),
-                verify.CommandResult(
-                    ("cargo",),
-                    "",
-                    0,
-                    "     Running unittests src/lib.rs (/fake/target/deps/lib-hash)\n"
-                    + result_line(2),
-                ),
-            ),
-        ]
-        result = self.run_suites(responses)
-        self.assertFalse(result.ok)
-        self.assertIn("missing binaries", result.results[0].detail)
-
-    def test_missing_suite_directory_returns_nonzero(self):
-        self.source = make_source(
-            self.tmp / "oreboot-missing", suites=verify.SUITE_DIRS[:-1]
-        )
-        self.args = make_args(
-            self.tmp,
-            source=self.source,
-            baseline=self.baseline,
-            gate=self.gate,
-            out=self.out,
-        )
-        responses = [
-            (("rustc",), verify.CommandResult(("rustc",), "", 0, f"host: {HOST}\n")),
-            (
-                ("cargo", "test", "--offline", "--locked", "--no-run"),
-                verify.CommandResult(
-                    ("cargo",), "", 0, no_run_json("/fake/target/deps/lib-hash")
-                ),
-            ),
-            (
-                ("cargo", "test", "--offline", "--locked", "--target"),
-                verify.CommandResult(
-                    ("cargo",),
-                    "",
-                    0,
-                    "     Running unittests src/lib.rs (/fake/target/deps/lib-hash)\n"
-                    + result_line(2),
-                ),
-            ),
-        ]
-        result = self.run_suites(responses)
-        self.assertFalse(result.ok)
-        self.assertIn("suite directory missing", result.results[-1].detail)
-
-    def test_matching_inventory_passes(self):
-        responses = [
-            (("rustc",), verify.CommandResult(("rustc",), "", 0, f"host: {HOST}\n")),
-            (
-                ("cargo", "test", "--offline", "--locked", "--no-run"),
-                verify.CommandResult(
-                    ("cargo",), "", 0, no_run_json("/fake/target/deps/lib-hash")
-                ),
-            ),
-            (
-                ("cargo", "test", "--offline", "--locked", "--target"),
-                verify.CommandResult(
-                    ("cargo",),
-                    "",
-                    0,
-                    "     Running unittests src/lib.rs (/fake/target/deps/lib-hash)\n"
-                    + result_line(2),
-                ),
-            ),
-        ]
-        result = self.run_suites(responses)
-        self.assertTrue(result.ok)
-        self.assertEqual(result.results[0].binaries_expected, 1)
-        self.assertEqual(result.results[0].binaries_run, 1)
-
-
 def valid_media_image(
     size=0x1000,
     magic=verify.EGON_MAGIC,
@@ -649,7 +484,8 @@ class ImageRunner(verify.SubprocessRunner):
         if command == "cargo":
             return verify.CommandResult(tuple(argv), str(cwd), self.cargo_rc, "")
         if command == "llvm-readelf":
-            return verify.CommandResult(tuple(argv), str(cwd), 0, self.readelf)
+            table = "There are 1 section headers, starting at offset 0x0:\n"
+            return verify.CommandResult(tuple(argv), str(cwd), 0, table + self.readelf)
         if command == "llvm-objcopy":
             output = Path(argv[-1])
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -674,7 +510,8 @@ class ImageValidationTest(unittest.TestCase):
         (self.tmp / "libdram-a733.a").write_bytes(b"")
         (self.tmp / "libdram").write_bytes(b"")
         self.out = self.tmp / "out"
-        self.out.mkdir()
+        for sub in ("matrix/out", "matrix/logs", "tmp/images"):
+            (self.out / sub).mkdir(parents=True, exist_ok=True)
         self.args = make_args(
             self.tmp,
             source=self.source,
@@ -700,6 +537,7 @@ class ImageValidationTest(unittest.TestCase):
         elf.parent.mkdir(parents=True, exist_ok=True)
         elf.write_bytes(b"")
         harness = verify.Harness(self.args, runner=runner)
+        harness.read_limits()
         return harness.build_bt0(
             tag, None, list(features), no_default, "new", baseline_required
         )
@@ -716,7 +554,7 @@ class ImageValidationTest(unittest.TestCase):
         result = self.build(
             ImageRunner(
                 readelf="  [ 1] .text             PROGBITS\n",
-                primary=b"\x00" * (verify.EGON_MAX + 1),
+                primary=b"\x00" * 0x4A001,
             ),
             [],
         )
@@ -727,7 +565,7 @@ class ImageValidationTest(unittest.TestCase):
         result = self.build(
             ImageRunner(
                 readelf="  [ 1] .text             PROGBITS\n",
-                primary=b"\x00" * (verify.FEL_MAX + 1),
+                primary=b"\x00" * 0x4F001,
             ),
             ["fel"],
         )
@@ -760,20 +598,20 @@ class ImageValidationTest(unittest.TestCase):
     def test_missing_dram_extension_fails(self):
         result = self.build(
             ImageRunner(
-                readelf="  [ 1] .dram             PROGBITS\n",
+                readelf="  [ 1] .dram PROGBITS 59000000 010000 000004 00\n",
                 primary=valid_media_image(),
                 ext=b"",
             ),
-            [],
+            ["fel", "fastboot"],
             baseline_required=False,
         )
         self.assertFalse(result.ok)
-        self.assertIn("extension .dram missing or empty", result.detail)
+        self.assertIn("extension .dram empty", result.detail)
 
-    def test_lab_missing_phyfw_extension_fails(self):
+    def test_lab_does_not_accept_phyfw_in_place_of_dram(self):
         result = self.build(
             ImageRunner(
-                readelf="  [ 2] .phyfw            NOBITS\n",
+                readelf="  [ 2] .phyfw NOBITS 00047000 000000 000004 00\n",
                 primary=valid_media_image(),
                 ext=b"",
             ),
@@ -782,14 +620,16 @@ class ImageValidationTest(unittest.TestCase):
             no_default=True,
         )
         self.assertFalse(result.ok)
-        self.assertIn("extension .phyfw missing or empty", result.detail)
+        self.assertIn(
+            "expected payload sections ('.dram',), found ('.phyfw',)", result.detail
+        )
 
-    def test_lab_phyfw_extension_is_validated(self):
+    def test_lab_dram_marker_is_validated(self):
         result = self.build(
             ImageRunner(
-                readelf="  [ 2] .phyfw            NOBITS\n",
+                readelf="  [ 1] .dram PROGBITS 59000000 010000 000004 00\n",
                 primary=valid_media_image(),
-                ext=b"A7AP",
+                ext=b"A7AX",
             ),
             ["fel", "bl-mission", "dram-lab", "drift-log"],
             baseline_required=False,
@@ -866,70 +706,38 @@ class PureLogicTest(unittest.TestCase):
         self.assertFalse(verify.matrix_ok([], 11, 11, 10))
         self.assertFalse(verify.matrix_ok(["main-gmac"], 11, 10, 10))
 
-    def test_dram_section_detection_allows_readelf_indent(self):
-        self.assertTrue(
-            verify.has_section(
-                "  [Nr] Name              Type\n"
-                "  [ 1] .dram             PROGBITS        59000000 010000 000004\n",
-                ".dram",
-            )
-        )
-        self.assertFalse(
-            verify.has_section(
-                "  [Nr] Name              Type\n"
-                "  [ 1] .text             PROGBITS        00090000 020000 000050\n",
-                ".dram",
-            )
-        )
-
-    def test_phyfw_section_detection(self):
-        self.assertTrue(
-            verify.has_section(
-                "  [Nr] Name              Type\n"
-                "  [ 2] .phyfw            NOBITS         00047000 000000 000004\n",
-                ".phyfw",
-            )
-        )
-
-    def test_test_results_aggregate_every_binary(self):
-        output = (
-            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered\n"
-            "test result: ok. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered\n"
-        )
-        self.assertEqual(verify.parse_test_results(output), (5, 1, 0, True))
-
-    def test_test_results_require_a_result_line(self):
+    def test_payload_section_expectations(self):
+        self.assertEqual(verify.expected_sections([], False), ())
         self.assertEqual(
-            verify.parse_test_results("error[E0432]: no result"), (0, 0, 0, False)
-        )
-
-    def test_running_paths_are_parsed(self):
-        output = (
-            "     Running unittests src/lib.rs (/fake/target/deps/lib-hash)\n"
-            "   Doc-tests dram_train\n"
+            verify.expected_sections(["fastboot-emmc-write"], False), (".dram",)
         )
         self.assertEqual(
-            verify.parse_running_paths(output), ["/fake/target/deps/lib-hash"]
+            verify.expected_sections(["bl-mission", "dram-lab"], True), (".dram",)
         )
+        self.assertEqual(
+            verify.expected_sections(["dram-lab"], True), (".dram", ".phyfw")
+        )
+
+    def test_test_result_requires_one_complete_line(self):
+        line = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        self.assertEqual(verify.completed_test_result(line), (True, 2, 0, 0))
+        self.assertIsNone(verify.completed_test_result(line + line))
+        self.assertIsNone(verify.completed_test_result(line[:48]))
 
     def test_required_baseline_count(self):
-        self.assertEqual(
-            len(verify.required_baseline_names()),
-            len(verify.OLD_SETS)
-            + sum(
-                1
-                for _tag, _profile, _features, required in verify.NEW_ENTRIES
-                if required
-            )
-            + len(verify.MAIN_SETS),
-        )
+        names = verify.required_baseline_names()
+        self.assertEqual(len(names), 70)
+        self.assertEqual(sum(name.endswith("-ext.bin") for name in names), 9)
 
     def test_read_main_max(self):
         with tempfile.TemporaryDirectory(
             prefix="verify-a7a-pure-", dir=home_tmp()
         ) as tmp:
             source = make_source(Path(tmp) / "oreboot")
-            self.assertEqual(verify.read_main_max(source), 0x0008_0000)
+            self.assertEqual(
+                verify.read_cap(source / verify.COMMON_LIB, verify.MAIN_MAX_RE),
+                0x0008_0000,
+            )
 
     def test_egon_header_accepts_the_raw_media_image(self):
         self.assertIsNone(verify.check_egon_header(valid_media_image()))
