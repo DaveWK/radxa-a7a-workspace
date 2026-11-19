@@ -311,6 +311,7 @@ class Selector:
             pass_fds=(lease_fd,),
             start_new_session=True,
         )
+        last_slice = None
         try:
             while True:
                 seconds = deadline - time.monotonic()
@@ -322,7 +323,8 @@ class Selector:
                     out, err = child.communicate(
                         timeout=min(seconds, 0.05) if watch else seconds
                     )
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as exc:
+                    last_slice = exc
                     continue
                 if watch is not None:
                     watch()
@@ -330,7 +332,39 @@ class Selector:
                 # still rejects late replies; they are not evidence of a hang.
                 break
         except subprocess.TimeoutExpired:
-            out, err = self.cancel(child)
+            # A watcher slice may expire before a clean exit, then the guardian
+            # may not run again until the outer deadline. Prove both the direct
+            # exit and group disappearance before treating this as a late reply.
+            try:
+                returncode = child.poll()
+            except OSError:
+                returncode = None
+            if returncode is not None and returncode >= 0:
+                try:
+                    os.killpg(child.pid, 0)
+                except ProcessLookupError:
+                    # Do not wait on pipes after the deadline. The caller
+                    # discards late replies; retain already captured diagnostics.
+                    def captured(data):
+                        if isinstance(data, bytes):
+                            return data.decode(child.encoding, errors=child.errors)
+                        return data or ""
+
+                    return (
+                        returncode,
+                        captured(last_slice.output if last_slice else None),
+                        captured(last_slice.stderr if last_slice else None),
+                        False,
+                    )
+                except OSError:
+                    pass  # Not proof of group disappearance.
+            try:
+                out, err = self.cancel(child)
+            except OSError as exc:
+                raise SessionError(
+                    Exit.LIVE_TIMEOUT,
+                    f"selector timeout cleanup could not be verified: {exc}",
+                ) from exc
             return child.returncode, out, err, True
         except BaseException as problem:
             try:
@@ -469,13 +503,16 @@ class Session:
                 **options,
             )
         except SessionError as exc:
+            prelaunch_expired = isinstance(exc, PollingWindowExpired)
             event.update(
                 exit=None,
                 error=str(exc),
                 ended_ns=time.time_ns(),
-                timed_out=exc.code == Exit.LIVE_TIMEOUT,
+                timed_out=exc.code == Exit.LIVE_TIMEOUT and not prelaunch_expired,
                 client_disconnected=exc.code == Exit.CLIENT_GONE,
             )
+            if prelaunch_expired:
+                event["prelaunch_expired"] = True
             raise
         except OSError as exc:
             event.update(exit=None, error=str(exc), ended_ns=time.time_ns())

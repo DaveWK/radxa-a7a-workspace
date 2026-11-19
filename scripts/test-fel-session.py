@@ -5,6 +5,7 @@
 import os
 from pathlib import Path
 import runpy
+import subprocess
 import tempfile
 from threading import Thread
 import time
@@ -254,6 +255,100 @@ class SessionTests(Fixture):
         ):
             self.assert_exit(EXIT.LIVE_TIMEOUT, runner.reconnect)
         self.assertTrue(self.record["calls"][-1]["timed_out"])
+
+    def test_watcher_slice_expiry_with_clean_late_exit_preserves_prior_loss(self):
+        runner = self.make_session()
+        runner.start()
+        runner.submit(M["WDT"][-1], returns=True)
+        runner.selector = M["Selector"]()
+        runner.watch = lambda: None
+        clock = [100.0]
+        launches = []
+        signals = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def popen(argv, **options):
+            launches.append(clock[0])
+            final = len(launches) == 2
+            child = SimpleNamespace(
+                pid=1000 + len(launches),
+                returncode=None,
+                stdout=SimpleNamespace(close=lambda: None),
+                stderr=SimpleNamespace(close=lambda: None),
+                encoding="utf-8",
+                errors="replace",
+            )
+            sliced = False
+
+            def poll():
+                child.returncode = 66
+                return child.returncode
+
+            def communicate(timeout):
+                nonlocal sliced
+                if final and not sliced:
+                    sliced = True
+                    self.assertAlmostEqual(timeout, 0.05)
+                    clock[0] = 160.1
+                    raise subprocess.TimeoutExpired(
+                        argv, timeout, stderr=b"offline fixture\n"
+                    )
+                if not final:
+                    clock[0] = 158.7
+                poll()
+                return "", "offline fixture\n"
+
+            child.poll = poll
+            child.communicate = communicate
+            return child
+
+        def killpg(pid, sig):
+            signals.append(sig)
+            raise ProcessLookupError
+
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("time.sleep", side_effect=sleep),
+            patch("ctypes.CDLL", return_value=SimpleNamespace(prctl=lambda *_: 0)),
+            patch("subprocess.Popen", side_effect=popen),
+            patch("os.killpg", side_effect=killpg),
+            patch("os.waitpid", side_effect=ChildProcessError),
+        ):
+            self.assert_exit(EXIT.LOST_AFTER, runner.reconnect)
+        self.assertEqual(len(launches), 2)
+        self.assertAlmostEqual(160 - launches[-1], 1.2)
+        self.assertEqual(signals, [0, 0])
+        last_call = self.record["calls"][-1]
+        self.assertEqual(last_call["exit"], 66)
+        self.assertEqual(last_call["stderr"], "offline fixture\n")
+        self.assertFalse(last_call["timed_out"])
+
+    def test_prelaunch_poll_expiry_is_not_a_selector_timeout_in_receipt(self):
+        runner = self.make_session()
+        runner.selector = M["Selector"]()
+        clock = [100.0]
+        watches = 0
+
+        def watch():
+            nonlocal watches
+            watches += 1
+            if watches == 2:
+                clock[0] = 100.5
+
+        runner.watch = watch
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("ctypes.CDLL", return_value=SimpleNamespace(prctl=lambda *_: 0)),
+            patch("subprocess.Popen") as popen,
+        ):
+            self.assert_exit(EXIT.LIVE_TIMEOUT, runner.discover, poll_deadline=101.2)
+        popen.assert_not_called()
+        last_call = self.record["calls"][-1]
+        self.assertIsNone(last_call["exit"])
+        self.assertFalse(last_call["timed_out"])
+        self.assertTrue(last_call["prelaunch_expired"])
 
     def test_entry_two_mailbox_budget_does_not_accept_late_ready(self):
         clock, observed = [100], []
