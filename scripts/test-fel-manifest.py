@@ -23,7 +23,7 @@ FD = "CUBIEA7A_EFI.fd"
 PROFILE = Path("src/mainboard/radxa/cubie-a7a/dram/src/knobs/profile.rs")
 LIBTL = "MdePkg/Library/ArmTransferListLib/libtl"
 MAIN = b"main-fel from the fake compiler\n"
-DTB = b"test device tree\n"
+DTB = struct.pack(">10I", 0xD00DFEED, 40, 40, 40, 40, 17, 16, 0, 0, 0)
 BT0 = b"\0\0\0\0eGON.BT0" + bytes(256)
 PACKAGED = {
     "bt0-fel.bin": "bt0_fel_sha256",
@@ -33,6 +33,7 @@ PACKAGED = {
 
 FAKE_TOOLS = r"""
 import json
+import lzma
 import os
 import shutil
 import struct
@@ -98,7 +99,29 @@ elif tool == "build":
     struct.pack_into("<I", data, 4, 0x14000000 + ((0x40000 - 4) // 4))
     data[0x38:0x3c] = b"ARMd"
     struct.pack_into("<I", data, 0x40000, 0x14000001)
-    data[0x50000:] = Path(dtb).read_bytes().ljust(len(data) - 0x50000, b"\0")
+    fdf = args[args.index("-f") + 1] if "-f" in args else "Platform/Radxa/CubieA7APkg/CubieA7A.fdf"
+    (dest.parent / "BuildOptions").write_text("Flash Image Definition: " + fdf + "\n")
+    tree = Path(dtb).read_bytes()
+    case = env.get("FAKE_EMBED", "one")
+    if case == "mismatch":
+        tree = tree[:-1] + bytes([tree[-1] ^ 1])
+    elif case == "two":
+        tree += tree
+    elif case == "zero":
+        tree = bytes(40)
+    elif case == "oversize":
+        tree = tree[:4] + b"\xff" * 4 + tree[8:]
+    fv = bytes(40) + b"_FVH" + bytes(28) + tree
+    stream = (4+len(fv)).to_bytes(3, "little") + b"\x17" + fv
+    packed = lzma.compress(stream, format=lzma.FORMAT_ALONE)
+    if case == "corrupt":
+        packed = packed[:-5]
+    section = ((24+len(packed)).to_bytes(3,"little") + b"\x02"
+               + bytes.fromhex("98584eee143959429d6edc7bd79403cf")
+               + struct.pack("<HH",24,1) + packed)
+    if case == "two-sections":
+        section += section
+    data[0x50000:0x50000+len(section)] = section
     (dest / "CUBIEA7A_EFI.fd").write_bytes(data)
 elif tool == "cp":
     subprocess.run([env["REAL_CP"], *args], check=True)
@@ -269,8 +292,9 @@ class GateTests(unittest.TestCase):
         self.file("fedora/fedora/mkdevcard.sh", "")
         self.file(
             "fedora/fedora/dts/Makefile",
-            'all:\n\tmkdir -p "$(dir $(OUT))"\n\tprintf "test device tree\\n" >"$(OUT)"\n',
+            'all:\n\tmkdir -p "$(dir $(OUT))"\n\tcp fixture.dtb "$(OUT)"\n',
         )
+        (self.fedora / "fedora/dts/fixture.dtb").write_bytes(DTB)
         self.file("firmware/edk2/edksetup.sh", "# build is on the fixture PATH\n")
         self.file("firmware/edk2/.gitignore", "/Build/\n")
         self.file("firmware/edk2/MdePkg/Library/BaseFdtLib/libfdt/libfdt/fdt.h", "")
@@ -612,7 +636,7 @@ class GateTests(unittest.TestCase):
 
     def test_records_checked_roots_and_effective_edk2_inputs(self):
         dtb = self.root / "alternative device tree.dtb"
-        dtb.write_bytes(b"external device tree\n")
+        dtb.write_bytes(DTB[:-1] + b"\x01")
         for args, expected in (
             ((), DTB),
             ((f"FEL_DTB_INPUT={dtb}",), dtb.read_bytes()),
@@ -648,7 +672,7 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(
                     record["intermediates"]["dtb_sha256"], record["dtb_sha256"]
                 )
-                self.assertIn(expected, (slot / "firmware.bin").read_bytes())
+                self.assertEqual(record["embedded_dtb"]["sha256"], record["dtb_sha256"])
                 for name, path, top in (
                     ("oreboot", self.oreboot, self.oreboot),
                     ("board", self.workspace / BOARD, self.oreboot),
@@ -811,6 +835,63 @@ class GateTests(unittest.TestCase):
         child.rename(self.root / "detached-child")
         child.mkdir()
         self.refused_before_compile("not initialized")
+
+    def test_overridden_dtb_roots(self):
+        for key, src in (("FEDORA", self.fedora), ("DTS", self.fedora / "fedora/dts")):
+            with self.subTest(key=key):
+                other = self.root / key
+                shutil.copytree(src, other)
+                self.refusal(
+                    self.make("fel-image", f"{key}={other}"), f"refuses {key} override"
+                )
+                self.assertEqual(self.cargo_log.read_text(), "")
+
+    def test_fedora_gitlink(self):
+        git(self.workspace, "update-index", "--assume-unchanged", "fedora")
+        git(self.fedora, "commit", "-qm", "other Fedora HEAD", "--allow-empty")
+        self.refused_before_compile("workspace gitlink")
+
+    def test_external_dtb_digest_before_usb(self):
+        dtb = self.root / "external.dtb"
+        dtb.write_bytes(DTB)
+        bundle = self.build("blobfree-1200", f"FEL_DTB_INPUT={dtb}")
+        self.refusal(self.boots(), "EXPECT_DTB_SHA256")
+        self.refusal(self.boots(EXPECT_DTB_SHA256="a" * 64), "EXPECT_DTB_SHA256")
+        self.assert_bundle_writes(self.boots(EXPECT_DTB_SHA256=sha(dtb)), bundle)
+
+    def test_packaged_dtb_refusals(self):
+        for case, msg in (
+            ("zero", "found 0"),
+            ("two", "multiple FDT"),
+            ("mismatch", "digest differs"),
+            ("two-sections", "found 2"),
+            ("oversize", "totalsize"),
+            ("corrupt", "LZMA"),
+        ):
+            with self.subTest(case=case):
+                self.refusal(self.make("fel-image", FAKE_EMBED=case), msg)
+                root = self.workspace / "out/fel"
+                self.assertFalse((root / ".records").exists())
+                self.assertFalse((root / "blobfree-1200/firmware.bin").exists())
+
+    def test_packaged_dtb_identity(self):
+        slot = self.build("blobfree-1200", "EDK2_ARGS=-f Local.fdf")
+        record = read_json(self.record(sha(slot / "bt0-fel.bin")))
+        self.assertEqual(record.get("edk2_fdf"), "Local.fdf")
+        head = git(self.fedora, "rev-parse", "HEAD")
+        self.assertEqual(record["dtb_source"], "fedora@" + head)
+        self.assertEqual(record["dts_dir"], str(self.fedora / "fedora/dts"))
+        evidence = record["embedded_dtb"]
+        section = (slot / "firmware.bin").read_bytes()[evidence["section_offset"] :][
+            : evidence["section_length"]
+        ]
+        import lzma
+
+        stream = lzma.decompress(section[24:], format=lzma.FORMAT_ALONE)
+        self.assertEqual(
+            stream[evidence["decoded_dtb_offset"] :][: evidence["dtb_size"]], DTB
+        )
+        self.assertEqual(evidence["sha256"], record["dtb_sha256"])
 
     def test_source_edit_during_compile_refused_without_publication(self):
         proc = self.make(

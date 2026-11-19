@@ -246,3 +246,11 @@ At the pinned `439613accf` oreboot has no gitlinks. EDK2's
 submodule; `build-edk2.sh` requires BaseFdtLib's `libfdt`. The board DSC
 maps BaseFdtLib and ArmTransferListLib, whose INFs use `libfdt` and `libtl`,
 respectively. These three nested EDK2 checkouts must be initialized.
+
+The default DTB is built from the workspace's Fedora gitlink. Use
+`FEL_DTB_INPUT` for an external tree; booting such a blobfree bundle requires
+`EXPECT_DTB_SHA256` to match the input. Before publication the gate decodes
+the LZMA-guided FV from `firmware.bin` itself, checks the embedded FDT's
+size and digest, and records both offsets: the section in the package and
+the FDT in the decoded stream. The FDF name comes from the current EDK2
+build's `BuildOptions`, including when `EDK2_ARGS` overrides the DSC default.

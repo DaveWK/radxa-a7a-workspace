@@ -244,7 +244,7 @@ firmware: bt0 main edk2
 # handles -n without acquiring locks, creating directories or compiling.
 fel-image:
 	$(fel-profile-check)
-	$(foreach var,TOP OREBOOT BOARD CARGO,$(if $(filter file,$(origin $(var))),,$(error fel-image refuses $(var) override (origin: $(origin $(var))))))
+	$(foreach var,TOP OREBOOT BOARD CARGO FEDORA DTS,$(if $(filter file,$(origin $(var))),,$(error fel-image refuses $(var) override (origin: $(origin $(var))))))
 	$(if $(findstring t,$(filter-out -%,$(firstword $(MAKEFLAGS)))),:,python3 -I scripts/fel-manifest.py build \
 		--make "$(MAKE)" $(if $(findstring n,$(filter-out -%,$(firstword $(MAKEFLAGS)))),--dry-run) \
 		--out-dir "$(FEL_OUT)" --mode $(FEL_TAG_MODE) --profile $(PROFILE) \

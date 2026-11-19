@@ -12,9 +12,11 @@ import argparse
 import fcntl
 import hashlib
 import json
+import lzma
 import os
 import shlex
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -252,6 +254,91 @@ def check_mode_profile_features(mode, profile, features):
         die(f"features {features!r} do not match {mode} (expected {expected})")
 
 
+def embedded_dtb(package, digest):
+    """Verify PI GUID-defined LZMA sections in the *published layout*."""
+    guid = bytes.fromhex("98584eee143959429d6edc7bd79403cf")
+    magic = bytes.fromhex("d00dfeed")
+    data = package.read_bytes()
+    found = []
+    pos = 0
+    while (pos := data.find(guid, pos)) >= 0:
+        guid_offset = pos
+        pos += len(guid)
+        # The decoder executable also contains this GUID as a constant;
+        # require an EFI_COMMON_SECTION_HEADER of type GUID_DEFINED.
+        start = guid_offset - 4
+        if start >= 0 and data[start + 3] == 2:
+            length = int.from_bytes(data[start : start + 3], "little")
+        elif start >= 4 and data[start - 4 : start] == b"\xff\xff\xff\x02":
+            length = struct.unpack_from("<I", data, start)[0]
+            start -= 4
+        else:
+            continue
+        if pos + 4 > len(data):
+            die("truncated LZMA guided section")
+        offset, flags = struct.unpack_from("<HH", data, pos)
+        if not flags & 1 or not pos + 4 - start <= offset < length <= len(data) - start:
+            die("invalid LZMA guided section bounds")
+        decoder = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE, memlimit=128 << 20)
+        try:
+            stream = decoder.decompress(
+                data[start + offset : start + length], max_length=64 << 20
+            )
+        except lzma.LZMAError as exc:
+            die(f"cannot decode packaged LZMA section: {exc}")
+        if not decoder.eof or decoder.unused_data:
+            die("incomplete or oversized packaged LZMA section")
+        if magic not in stream:
+            continue
+        if stream.count(magic) != 1:
+            die("multiple FDT magic matches in decoded stream")
+        dtb = stream.index(magic)
+        if len(stream) - dtb < 40:
+            die("truncated embedded FDT header")
+        size = struct.unpack_from(">I", stream, dtb + 4)[0]
+        if not 40 <= size <= len(stream) - dtb:
+            die("embedded FDT totalsize outside decoded stream")
+        # FV_IMAGE sections contain an EFI_FIRMWARE_VOLUME_HEADER; don't
+        # mistake a copy of the tree in an unrelated compressed file for it.
+        cursor = 0
+        while cursor + 4 <= len(stream):
+            n = int.from_bytes(stream[cursor : cursor + 3], "little")
+            kind = stream[cursor + 3]
+            header = 4
+            if n == 0xFFFFFF and cursor + 8 <= len(stream):
+                n = struct.unpack_from("<I", stream, cursor + 4)[0]
+                header = 8
+            fv = cursor + header
+            if n < header or n > len(stream) - cursor:
+                die("invalid section length in decoded FV stream")
+            if (
+                kind == 0x17
+                and stream[fv + 40 : fv + 44] == b"_FVH"
+                and fv <= dtb
+                and dtb + size <= cursor + n
+            ):
+                break
+            cursor += (n + 3) & ~3
+        else:
+            die("embedded FDT is not inside a decoded FV_IMAGE")
+        actual = hashlib.sha256(stream[dtb : dtb + size]).hexdigest()
+        if actual != digest:
+            die("embedded FDT digest differs from supplied DTB")
+        found.append(
+            dict(
+                section_offset=start,
+                section_length=length,
+                compression="LZMA",
+                decoded_dtb_offset=dtb,
+                dtb_size=size,
+                sha256=actual,
+            )
+        )
+    if len(found) != 1:
+        die(f"expected exactly one compressed FV containing an FDT, found {len(found)}")
+    return found[0]
+
+
 def knob(name):
     return name.startswith(("A7A_", "A733_"))
 
@@ -466,8 +553,23 @@ def build(args):
             fel_dtb_input=str(dtb_input) if dtb_input is not None else None,
             dtb_path=str(dtb_path),
             dtb_sha256=dtb_sha,
+            dts_dir=str(ROOT / "fedora/fedora/dts"),
+            dtb_source=(
+                "external"
+                if dtb_input is not None
+                else "fedora@" + before["source_roots"]["fedora"]["head"]
+            ),
+            embedded_dtb=embedded_dtb(private / "firmware.bin", dtb_sha),
             **{key: sha256(private / name) for name, key in PACKAGED},
         )
+        fdfs = [
+            line.removeprefix("Flash Image Definition: ").strip()
+            for line in (compiled / "edk2/BuildOptions").read_text().splitlines()
+            if line.startswith("Flash Image Definition: ")
+        ]
+        if len(fdfs) != 1 or not fdfs[0]:
+            die("missing or ambiguous EDK2 BuildOptions FDF selection")
+        manifest["edk2_fdf"] = fdfs[0]
         record = dict(
             **manifest,
             profile_source=(
@@ -540,6 +642,12 @@ def check_manifest(
             die(f"record {field} {value!r} does not match expected HEAD {expected}")
     if mode != expect_mode:
         die(f"record mode {mode} does not match requested mode {expect_mode}")
+    if mode == "blobfree" and record.get("dtb_source") == "external":
+        if (
+            not is_hex(record.get("dtb_sha256"), 64)
+            or os.environ.get("EXPECT_DTB_SHA256") != record["dtb_sha256"]
+        ):
+            die("external DTB requires matching EXPECT_DTB_SHA256")
     if profile != expect_profile:
         die(
             f"record profile {profile} does not match requested profile {expect_profile}"
@@ -562,6 +670,10 @@ def check_manifest(
         "fel_dtb_input",
         "dtb_path",
         "dtb_sha256",
+        "dts_dir",
+        "dtb_source",
+        "embedded_dtb",
+        "edk2_fdf",
         *(key for _, key in PACKAGED),
     ):
         if key not in manifest or manifest[key] != record.get(key):

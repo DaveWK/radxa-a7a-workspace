@@ -80,7 +80,8 @@ FW_VERSION=$(git -C "$PLAT" describe --always --dirty 2>/dev/null || true)
 FW_VERSION="oreboot-edk2 ${FW_VERSION:-dev} $TARGET"
 
 FD=$EDK2/Build/CubieA7A$TAG/${TARGET}_GCC/FV/CUBIEA7A_EFI.fd
-rm -f "$FD"
+OPTIONS=$(dirname "$(dirname "$FD")")/BuildOptions
+rm -f "$FD" "$OPTIONS"
 
 # edksetup.sh trips over 'set -u', and sourcing it in this shell would let a
 # failing 'build' slip past 'set -e'. Run it in a subshell and check the
@@ -139,4 +140,5 @@ python3 -I "$TOP/scripts/check-nvstore.py" "$FD" "$(dirname "$FD")/FVMAIN.Fv" >/
 
 mkdir -p "$OUT"
 cp "$FD" "$OUT/CUBIEA7A_EFI.fd"
+cp "$OPTIONS" "$OUT/BuildOptions"
 echo "build-edk2: $OUT/CUBIEA7A_EFI.fd ($FW_VERSION)"
