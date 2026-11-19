@@ -19,7 +19,9 @@
 #   make test          host tests (oreboot board crates, scripts)
 #   make vendor        fetch the vendor DRAM library object (measurement builds
 #                      only: VENDOR_DRAM=yes|phyfw, FEL_DRAM=dramlib)
-#   make clean
+#   make clean         remove out/
+#   make mrproper      clean + vendor/ + the host cargo test targets (never the
+#                      submodule sources)
 #
 # DRAM: by default bt0 (and the FEL bt0) brings DRAM up with this project's
 #   own driver and nothing from a vendor: no DRAM library, no PHY training
@@ -147,7 +149,7 @@ define main_build
 endef
 
 .PHONY: help check-sources vendor dtb bt0 bt0-fel main main-fel edk2 firmware fel-image xfel fel-boot \
-	rpms fedora-image serial test clean FORCE
+	rpms fedora-image serial test clean mrproper FORCE
 
 help:
 	@sed -n '/^$$/q;s/^# \{0,1\}//p' Makefile
@@ -267,3 +269,9 @@ test: check-sources
 
 clean:
 	rm -rf $(OUT)
+
+# Everything clean removes, plus the fetched vendor input and the host cargo
+# test targets. Never the submodule sources.
+mrproper: clean
+	rm -rf $(TOP)/vendor
+	rm -rf $(TGT)/host
