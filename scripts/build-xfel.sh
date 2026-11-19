@@ -7,9 +7,8 @@
 # about 7 s, longer with DRAM tracing. Needs cc, make, pkgconf and
 # libusb1-devel. No xfel binary is part of this repository.
 #
-# On the host that runs scripts/fel-boot.sh, either run xfel as root (the
-# default SUDO=sudo there) or install xfel's udev rule (out/tools/xfel-src/99-xfel.rules)
-# into /etc/udev/rules.d and use SUDO= .
+# The selector runs directly, without a privilege-changing prefix. The
+# runner needs USB permissions, e.g. via the host's reviewed udev rule.
 set -euo pipefail
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,7 +30,7 @@ git clone -q --no-local --no-checkout "$SRC" "$BUILD"
 SRC=$BUILD
 git -C "$SRC" checkout -q --detach "$XFEL_COMMIT"
 git -C "$SRC" apply --unidiff-zero "$TOP/scripts/xfel-port-select.patch"
-grep -c '&bytes, 10000);' "$SRC/fel.c" | grep -qx 3 || {
+grep -c '&bytes, 10000);' "$SRC/fel.c" | grep -qx 1 || {
     echo "build-xfel: fel.c does not have the expected 10 s bulk transfers" >&2
     exit 1
 }

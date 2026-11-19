@@ -47,15 +47,10 @@ def verify_xfel_sources(record):
 
 
 def stage_xfel(args):
-    if args.override:
-        want = os.environ.get("EXPECT_XFEL_SHA256")
-        if not want:
-            raise ValueError("overridden XFEL requires EXPECT_XFEL_SHA256")
-    else:
-        record = json.loads(XFEL_RECORD.read_bytes())
-        verify_xfel_sources(record)
-        want = record["binary_sha256"]
-    actual = copy_tool(args.source, args.dest)
+    record = json.loads(XFEL_RECORD.read_bytes())
+    verify_xfel_sources(record)
+    want = record["binary_sha256"]
+    actual = copy_tool(XFEL, args.dest)
     if actual != want:
         raise ValueError(f"xfel sha256 mismatch: {actual}")
     args.dest.chmod(0o700)
@@ -141,8 +136,6 @@ def main():
     record.add_argument("make", type=Path)
     record.add_argument("pkg_config", type=Path)
     stage = sub.add_parser("stage-xfel")
-    stage.add_argument("--override", action="store_true")
-    stage.add_argument("source", type=Path)
     stage.add_argument("dest", type=Path)
     base = sub.add_parser("basetools")
     base.add_argument("edk2", type=Path)

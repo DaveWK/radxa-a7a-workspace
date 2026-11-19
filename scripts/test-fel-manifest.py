@@ -207,8 +207,6 @@ elif tool == "aarch64-linux-gnu-gcc":
 elif tool == "xfel":
     if args == ["--help"]:
         print("xfel --port PATH --devnum N COMMAND ...")
-        if "FAKE_XFEL_SWAP" in env:
-            Path(env["FAKE_XFEL_SWAP"]).write_text("#!/bin/sh\nexit 97\n")
     else:
         assert args == ["--port", env["FEL_PORT"], "--devnum", "12", "version"]
         with open(env["FAKE_USB_LOG"], "a") as log:
@@ -319,7 +317,6 @@ class GateTests(unittest.TestCase):
             PATH=f"{self.tools}:{os.environ['PATH']}",
             CARGO_HOME=str(self.root / "caller-cargo"),
             CARGO_NET_OFFLINE="true",
-            SUDO="",
             FEL_PORT="3-3.4",
             FEL_SYSFS_ROOT=str(self.root / "sysfs"),
             FAKE_CARGO_LOG=str(self.cargo_log),
@@ -352,7 +349,6 @@ class GateTests(unittest.TestCase):
             path = self.tools / name
             path.write_text(f"#!{sys.executable}\n{FAKE_TOOLS}")
             path.chmod(0o755)
-        self.env["EXPECT_XFEL_SHA256"] = sha(self.tools / "xfel")
         self.workspace.mkdir()
         shutil.copy2(SOURCE / "Makefile", self.workspace)
         scripts = self.workspace / "scripts"
@@ -540,12 +536,11 @@ class GateTests(unittest.TestCase):
             timeout=30,
         )
 
-    def probe(self, *, override=True, **env):
+    def probe(self, **env):
         self.usb_log.write_text("")
         child_env = dict(self.env, **env)
-        child_env.pop("XFEL", None)
-        if override:
-            child_env["XFEL"] = str(self.tools / "xfel")
+        for variable in ("XFEL", "SUDO", "EXPECT_XFEL_SHA256"):
+            child_env.pop(variable, None)
         return subprocess.run(
             [
                 self.workspace / "scripts/xfel-port",
@@ -1133,29 +1128,51 @@ class GateTests(unittest.TestCase):
         self.refusal(self.make("fel-image"), "disagreement")
         self.assertFalse((self.workspace / "out/fel/.records").exists())
 
-    def test_xfel_override_needs_digest(self):
-        self.build()
-        with (self.tools / "xfel").open("a") as f:
-            f.write("\n# different xfel\n")
-        for expectation in ("", self.env["EXPECT_XFEL_SHA256"]):
-            with self.subTest(expectation=expectation):
-                self.refusal(self.probe(EXPECT_XFEL_SHA256=expectation))
+    def stage_xfel(self, *args):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                self.workspace / "scripts/fel-tools.py",
+                "stage-xfel",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_xfel_stage_rejects_override_option(self):
+        self.refusal(
+            self.stage_xfel("--override", self.tools / "xfel", self.root / "stage")
+        )
 
     def test_boot_waits_for_session_owner(self):
         self.refusal(
             self.make("fel-boot"), "FEL boots go through scripts/fel_session.py"
         )
 
-    def test_xfel_runs_only_staged_copy(self):
-        proc = self.probe(FAKE_XFEL_SWAP=str(self.tools / "xfel"))
+    def test_xfel_staging_copies_approved_bytes(self):
+        default = self.workspace / "out/tools/xfel"
+        default.parent.mkdir(parents=True)
+        shutil.copy2(self.tools / "xfel", default)
+        expected = sha(default)
+        pins = read_json(self.workspace / "scripts/xfel-source.json")
+        write_json(
+            default.with_suffix(".record.json"), dict(pins, binary_sha256=expected)
+        )
+        staged = self.root / "staged-xfel"
+        proc = self.stage_xfel(staged)
         self.assertEqual(proc.returncode, 0, self.process_result(proc))
-        self.assertEqual(self.usb_log.read_text(), "version\n")
+        default.write_text("replaced after staging")
+        self.assertEqual(sha(staged), expected)
+        self.assertEqual(staged.stat().st_mode & 0o777, 0o700)
 
     def test_default_xfel_needs_build_record(self):
         default = self.workspace / "out/tools/xfel"
         default.parent.mkdir()
         shutil.copy2(self.tools / "xfel", default)
-        self.refusal(self.probe(override=False))
+        self.refusal(self.probe())
         commit = "445e8aefe6914c85817cc9bd1d201629364b0ec6"
         patched = self.tools / "fel.c"
         patched.write_text("// patched fixture source\n")
@@ -1213,18 +1230,18 @@ class GateTests(unittest.TestCase):
                 ).strip(),
             },
         )
-        proc = self.probe(override=False)
+        proc = self.probe()
         self.assertEqual(proc.returncode, 0, self.process_result(proc))
         receipt_path = default.with_suffix(".record.json")
         receipt = read_json(receipt_path)
         write_json(receipt_path, dict(receipt, patched_main_c_sha256="wrong"))
         self.usb_log.write_text("")
-        self.refusal(self.probe(override=False), "source/selector seal mismatch")
+        self.refusal(self.probe(), "source/selector seal mismatch")
         write_json(receipt_path, receipt)
         with default.open("a") as f:
             f.write("\n# other binary\n")
         self.usb_log.write_text("")
-        self.refusal(self.probe(override=False))
+        self.refusal(self.probe())
 
     def test_basetools_changed_binary(self):
         self.build()

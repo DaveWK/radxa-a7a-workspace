@@ -20,8 +20,8 @@ or reset a board. `make fel-boot`, `scripts/fel-boot.sh` and
   `libusb_bulk_transfer` raised from 10000 to 60000 ms in `fel.c`, into
   `out/tools/xfel` and its build receipt. It needs `cc`, `make`, `pkgconf` and `libusb1-devel`.
   No xfel binary is part of this repository.
-- Root for xfel, or xfel's udev rule
-  (`out/tools/xfel-src/99-xfel.rules` in `/etc/udev/rules.d`) and `SUDO=`.
+- USB device permissions for the runner account, e.g. through the host's
+  reviewed udev rule. The selector does not elevate privileges.
 - Optional: a 3.3 V USB-UART adapter on UART0 (115200 8N1), with
   `make serial`.
 
@@ -39,7 +39,7 @@ The selector is stateless. The runner first discovers a devnum on the
 assigned physical connector, then carries **both** values on each call:
 
 ```sh
-scripts/xfel-port --discover --port "$FEL_PORT"
+devnum=$(scripts/xfel-port --discover --port "$FEL_PORT") || exit
 scripts/xfel-port --port "$FEL_PORT" --devnum "$devnum" -- version
 ```
 
@@ -55,9 +55,16 @@ the address, topology and VID:PID on a single open usbfs fd, then wraps
 that **same fd** without libusb rediscovery. It supports `version`, `read`,
 `write`, `read32`, `write32` and `exec`. It rejects other commands before
 USB access. The `version` probe checks the A733 ID, including before each
-non-version command. `XFEL` overrides require `EXPECT_XFEL_SHA256`; the
-default uses `out/tools/xfel.record.json`. Set `SUDO=` for direct access
-or use the default `sudo` prefix.
+non-version command. The wrapper executes a verified private copy of
+`out/tools/xfel` directly. It refuses `SUDO`, `XFEL` and
+`EXPECT_XFEL_SHA256` overrides. A successful prefix or a help-compatible
+replacement cannot stand in for a protocol result.
+
+Fixed frames must complete at their exact length, and the entire A733
+response must be `AWUS` followed by nine zero bytes, as checked by
+[`rfel/src/fel/mod.rs`](https://github.com/rustsbi/allwinner-hal/blob/d90687bdf2012b251062db77a779350f801c3753/rfel/src/fel/mod.rs#L127-L149).
+`write` buffers and checks the complete regular-file input before opening
+USB; a local file or output error is not an ACK.
 
 | Exit | Meaning |
 |---|---|
@@ -224,7 +231,7 @@ talks to it:
   `fetch` also reads (only reads) the USB disk, the SD card and the SPI NOR;
 - `fastboot boot` with a firmware bundle (oreboot main + EDK2, the same
   layout table as entry 2): bt0 checks the images' CRCs and hands over as
-  in [Boot](#boot) step 5;
+  in [Boot protocol reference](#boot-protocol-reference-for-the-session-runner) step 5;
 - `fastboot reboot-bootloader` or `oem fel`: back to the mask ROM's FEL
   with DRAM still up; `fastboot reboot`: watchdog reset, back in FEL after
   about 1.8 s;
@@ -287,7 +294,7 @@ or binary-set/digest mismatch; investigate it before intentionally starting
 a new stamp. Each build records the stamp digest and the three effective
 `Conf` file digests, checked on both sides of the build under that lock.
 
-Run `scripts/build-xfel.sh` to produce the default tool and its
-`out/tools/xfel.record.json`. For an explicit `XFEL` override, supply the
-known full `EXPECT_XFEL_SHA256`. Before any USB access the boot gate copies
-and hashes the tool in one pass, then runs only the verified private copy.
+Run `make xfel` to produce the tool and its `out/tools/xfel.record.json`.
+Before any USB access, the selector verifies the receipt against the
+tracked source seals, copies and hashes the tool in one pass, then runs only
+the verified private copy. Caller-provided digests are not accepted.

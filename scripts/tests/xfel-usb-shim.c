@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Replacement library inside the fixture mount namespace. No USB backend. */
+#define _GNU_SOURCE
 #include <assert.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libusb.h>
@@ -16,6 +18,7 @@
 
 static int verified_fd = -1;
 static int ack_count;
+static int partial_fd = -1, partial_calls, awus_count, header_count;
 static int fixture(const char *name)
 {
 	const char *test = getenv("USB_CASE");
@@ -24,13 +27,56 @@ static int fixture(const char *name)
 
 int open(const char *path, int flags, ...)
 {
-	assert(!strncmp(path, "/dev/bus/usb/", 13) && !(flags & O_CREAT));
-	if(fixture("open-gone"))
+	assert(!(flags & O_CREAT));
+	if(!strncmp(path, "/dev/bus/usb/", 13) && fixture("open-gone"))
 	{
 		errno = ENODEV;
 		return -1;
 	}
-	return syscall(SYS_openat, AT_FDCWD, path, flags, 0);
+	int fd = syscall(SYS_openat, AT_FDCWD, path, flags, 0);
+	if(!strcmp(path, "/fixture/partial-input"))
+		partial_fd = fd;
+	return fd;
+}
+
+static ssize_t partial_input(char *buf)
+{
+	if(partial_calls++ == 0)
+	{
+		memcpy(buf, "prefix", 6);
+		fprintf(stderr, "mock input prefix\n");
+		return 6;
+	}
+	fprintf(stderr, "mock input EIO\n");
+	errno = EIO;
+	return -1;
+}
+
+ssize_t read(int fd, void *buf, size_t size)
+{
+	if(fd >= 0 && fd == partial_fd)
+	{
+		assert(size >= 6);
+		return partial_input(buf);
+	}
+	return syscall(SYS_read, fd, buf, size);
+}
+
+static ssize_t cookie_read(void *cookie, char *buf, size_t size)
+{
+	(void)cookie;
+	assert(size >= 6);
+	return partial_input(buf);
+}
+
+FILE *fopen(const char *path, const char *mode)
+{
+	/* Exercise the baseline's stdio reader with the same prefix and EIO. */
+	if(!strcmp(path, "/fixture/partial-input"))
+		return fopencookie(NULL, "r", (cookie_io_functions_t){.read = cookie_read});
+	FILE *(*real_fopen)(const char *, const char *) = dlsym(RTLD_NEXT, "fopen");
+	assert(real_fopen);
+	return real_fopen(path, mode);
 }
 
 ssize_t pread(int fd, void *buf, size_t size, off_t offset)
@@ -137,7 +183,15 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
 		if(fixture("read-timeout") && len == 28)
 			return LIBUSB_ERROR_TIMEOUT;
 		memset(buf, 0, len);
-		if(len == 13) memcpy(buf, "AWUS", 4);
+		if(len == 13) {
+			memcpy(buf, "AWUS", 4);
+			if(++awus_count == 1) {
+				if(fixture("awus-short")) *actual = 12;
+				if(fixture("awus-long")) *actual = 14;
+				if(fixture("awus-overflow")) return LIBUSB_ERROR_OVERFLOW;
+				if(fixture("awus-bad-tail")) buf[12] = 1;
+			}
+		}
 		else if(len == 32) {
 			memcpy(buf, "AWUSBFEX", 8);
 			buf[9] = 3; buf[10] = 0x19;
@@ -146,15 +200,23 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
 			buf[0] = buf[1] = 0xff;
 			if((ack_count == 1 && fixture("version-malformed")) ||
 			   (ack_count == 2 && fixture("entry2-malformed")) ||
-			   (ack_count == 4 && fixture("wdt-malformed")))
+			   (ack_count == 4 && fixture("wdt-malformed")) ||
+			   (ack_count == 2 && (fixture("read-malformed") || fixture("write-malformed"))))
 				buf[0] = 0x55;
 			if((ack_count == 1 && fixture("version-rejected")) ||
 			   (ack_count == 2 && fixture("entry2-rejected")) ||
-			   (ack_count == 4 && fixture("wdt-rejected")))
+			   (ack_count == 4 && fixture("wdt-rejected")) ||
+			   (ack_count == 2 && (fixture("read-rejected") || fixture("write-rejected"))))
 				buf[4] = 1;
 			if(ack_count == 1 && fixture("version-short"))
 				*actual = 7;
-		} else assert(len == 28);
-	} else assert(ep == 2);
+		} else assert(len == 28 || len == 4 || (len == 1 && fixture("awus-short")));
+	} else {
+		assert(ep == 2);
+		if(len == 32 && !memcmp(buf, "AWUC", 4) && ++header_count == 1 && fixture("header-short"))
+			*actual = 31;
+		if(len == 16 && buf[0] == 1 && buf[1] == 1)
+			fprintf(stderr, "mock FEL write request\n");
+	}
 	return 0;
 }

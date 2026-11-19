@@ -4,13 +4,14 @@
 
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 
 
-def main(binary, red=False):
+def main(binary, red=False, round4_base=False):
     scripts = Path(__file__).resolve().parent
     (scripts.parent / "out").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=scripts.parent / "out") as tmp:
@@ -34,6 +35,8 @@ def main(binary, red=False):
             check=True,
         )
         shutil.copy2(binary, root / "xfel")
+        for name in ("write-input", "partial-input"):
+            (root / name).write_bytes(b"complete fixture input\n")
         nodes = root / "usb/003"
         nodes.mkdir(parents=True)
         devices = root / "devices"
@@ -90,29 +93,52 @@ def main(binary, red=False):
         assert "libusb-1.0.so.0 => /fixture/libusb-1.0.so.0" in links
         selected = ["--port", "3-6", "--devnum", "12", "version"]
 
-        def run(name, args, rc, opened=None, claim=False, shell=None, version=False):
-            proc = subprocess.run(
-                [
-                    *jail,
-                    "--setenv",
-                    "PATH",
-                    "/fixture:/usr/bin",
-                    "--setenv",
-                    "FEL_TOOL",
-                    "xfel",
-                    "--setenv",
-                    "XFEL",
-                    "xfel",
-                    *(
-                        ["/fixture/xfel", *args]
-                        if shell is None
-                        else ["/usr/bin/bash", "-c", shell]
-                    ),
-                ],
-                capture_output=True,
-                text=True,
-                env=os.environ | dict(USB_CASE=name),
-            )
+        def run(
+            name,
+            args,
+            rc,
+            opened=None,
+            claim=False,
+            shell=None,
+            version=False,
+            output_error=False,
+            closed_pipe=False,
+            writes=None,
+            partial=False,
+        ):
+            if output_error:
+                shell = shlex.join(["/fixture/xfel", *args]) + " >/dev/full"
+            argv = [
+                *jail,
+                "--setenv",
+                "PATH",
+                "/fixture:/usr/bin",
+                "--setenv",
+                "FEL_TOOL",
+                "xfel",
+                "--setenv",
+                "XFEL",
+                "xfel",
+                *(
+                    ["/fixture/xfel", *args]
+                    if shell is None
+                    else ["/usr/bin/bash", "-c", shell]
+                ),
+            ]
+            reader, writer = os.pipe() if closed_pipe else (None, None)
+            if reader is not None:
+                os.close(reader)
+            try:
+                proc = subprocess.run(
+                    argv,
+                    stdout=writer if closed_pipe else subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=os.environ | dict(USB_CASE=name),
+                )
+            finally:
+                if writer is not None:
+                    os.close(writer)
             assert proc.returncode == rc, (
                 name,
                 proc.returncode,
@@ -125,6 +151,10 @@ def main(binary, red=False):
             ), (name, lines)
             assert ("mock wrap" in lines) == claim and ("mock claim" in lines) == claim
             assert ("mock init" in lines) == claim
+            if writes is not None:
+                assert lines.count("mock FEL write request") == writes, (name, lines)
+            if partial:
+                assert "mock input prefix" in lines and "mock input EIO" in lines
             if version:
                 assert (
                     "ID=0x00190300" in proc.stdout and f"devnum={opened}" in proc.stderr
@@ -143,6 +173,71 @@ def main(binary, red=False):
                 for kind in ("malformed", "rejected"):
                     run(f"{name}-{kind}", [*prefix, *command], 0, 12, True)
             run("sole-without-selector", ["version"], 0, 12, True)
+            return
+
+        def framing_and_io(base):
+            read = [*prefix, "read", "0xdf000", "28", "/dev/null"]
+            write = [*prefix, "write", "0xdf000", "/fixture/write-input"]
+            for name, old in (
+                ("awus-short", 0),
+                ("awus-bad-tail", 0),
+                ("awus-long", 65),
+                ("awus-overflow", 74),
+                ("header-short", 0),
+            ):
+                run(name, selected, old if base else 65, 12, True)
+            for command, args in (("read", read), ("write", write)):
+                for kind, rc in (("malformed", 65), ("rejected", 76)):
+                    run(f"{command}-{kind}", args, rc, 12, True)
+            input_fd, claimed = (12, True) if base else (None, False)
+            run(
+                "missing-input",
+                [*write[:-1], "/fixture/missing"],
+                255 if base else 74,
+                input_fd,
+                claimed,
+                writes=0,
+            )
+            run(
+                "partial-input",
+                [*write[:-1], "/fixture/partial-input"],
+                0 if base else 74,
+                input_fd,
+                claimed,
+                writes=int(base),
+                partial=True,
+            )
+            run(
+                "version-output-failure",
+                selected,
+                0 if base else 74,
+                12,
+                True,
+                output_error=True,
+            )
+            run(
+                "read32-output-failure",
+                [*prefix, "read32", "0xdf000"],
+                0 if base else 74,
+                12,
+                True,
+                output_error=True,
+            )
+            run(
+                "version-broken-pipe",
+                selected,
+                141 if base else 74,
+                12,
+                True,
+                closed_pipe=True,
+            )
+            if not base:
+                run("read-ack", read, 0, 12, True)
+                run("write-ack", write, 0, 12, True, writes=1)
+
+        if round4_base:
+            add("3-6", 12)
+            framing_and_io(True)
             return
         run("help", ["--help"], 0)
         run("no-args", [], 2)
@@ -164,6 +259,7 @@ def main(binary, red=False):
         run("missing-port", ["--devnum", "12", "version"], 2)
         run("unknown-command", [*prefix, "bogus"], 2)
         run("selected-6", selected, 0, 12, True, version=True)
+        framing_and_io(False)
         run(
             "selected-4",
             ["--port", "3-3.4", "--devnum", "14", "version"],
@@ -211,4 +307,8 @@ def main(binary, red=False):
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]).resolve(strict=True), red=sys.argv[2:] == ["--red"])
+    main(
+        Path(sys.argv[1]).resolve(strict=True),
+        red=sys.argv[2:] == ["--red"],
+        round4_base=sys.argv[2:] == ["--round4-base"],
+    )

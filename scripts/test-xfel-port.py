@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -24,7 +25,17 @@ class SelectorTests(unittest.TestCase):
         self.sysfs = self.root / "devices"
         self.sysfs.mkdir()
         self.log = self.root / "commands"
-        self.tool = self.root / "fake-transport"
+        self.scripts = self.root / "scripts"
+        self.scripts.mkdir()
+        for name in (
+            "xfel-port",
+            "fel-tools.py",
+            "xfel-source.json",
+            "xfel-port-select.patch",
+        ):
+            shutil.copy2(SCRIPTS / name, self.scripts)
+        self.tool = self.root / "out/tools/xfel"
+        self.tool.parent.mkdir(parents=True)
         self.tool.write_text(
             "#!/usr/bin/python3 -I\n"
             "import json, os, signal, sys\n"
@@ -38,12 +49,22 @@ class SelectorTests(unittest.TestCase):
             "sys.exit(rc)\n"
         )
         self.tool.chmod(0o755)
+        pins = json.loads((self.scripts / "xfel-source.json").read_text())
+        self.tool.with_suffix(".record.json").write_text(
+            json.dumps(
+                dict(
+                    pins,
+                    binary_sha256=hashlib.sha256(self.tool.read_bytes()).hexdigest(),
+                )
+            )
+        )
         self.env = dict(
-            os.environ,
-            XFEL=str(self.tool),
-            EXPECT_XFEL_SHA256=hashlib.sha256(self.tool.read_bytes()).hexdigest(),
+            {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("XFEL", "EXPECT_XFEL_SHA256", "SUDO")
+            },
             FEL_SYSFS_ROOT=str(self.sysfs),
-            SUDO="",
             COMMANDS=str(self.log),
         )
         self.add("3-3.4", 14)
@@ -63,7 +84,7 @@ class SelectorTests(unittest.TestCase):
 
     def run_selector(self, *args, rc=0, **overrides):
         proc = subprocess.run(
-            [SCRIPTS / "xfel-port", *args],
+            [self.scripts / "xfel-port", *args],
             env=dict(self.env, **overrides),
             text=True,
             capture_output=True,
@@ -134,10 +155,31 @@ class SelectorTests(unittest.TestCase):
                     rc=status if status >= 0 else 128 - status, STATUS=str(status)
                 )
 
-    def test_legacy_binary_refused_after_help_only(self):
-        self.tool.write_text("#!/bin/sh\nprintf 'upstream usage\\n'\n")
-        new_hash = hashlib.sha256(self.tool.read_bytes()).hexdigest()
-        self.dispatch(rc=125, EXPECT_XFEL_SHA256=new_hash)
+    def test_noop_prefix_refused(self):
+        self.dispatch(rc=125, SUDO="/usr/bin/true")
+        self.assertFalse(self.log.exists())
+
+    def test_help_compatible_unapproved_binary_never_runs(self):
+        impostor = self.root / "impostor"
+        impostor.write_text(
+            "#!/bin/sh\n"
+            'echo launched >>"$COMMANDS"\n'
+            "echo 'xfel --port PATH --devnum N COMMAND ...'\n"
+        )
+        impostor.chmod(0o755)
+        self.dispatch(
+            rc=125,
+            XFEL=str(impostor),
+            EXPECT_XFEL_SHA256=hashlib.sha256(impostor.read_bytes()).hexdigest(),
+        )
+        shutil.copy2(impostor, self.tool)
+        self.dispatch(rc=125)
+        self.assertFalse(self.log.exists())
+
+    def test_unsupported_command_and_bad_port_before_lookup(self):
+        self.run_selector("--port", "3-7", "--devnum", "12", "--", "typo", rc=2)
+        for port in ("3-256", "256-1", "3-1.1.1.1.1.1.1.1", "3-01"):
+            self.run_selector("--discover", "--port", port, rc=2)
         self.assertFalse(self.log.exists())
 
 

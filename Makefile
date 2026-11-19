@@ -11,9 +11,6 @@
 #                      directories, and a build record under out/fel/.records/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
 #   make fel-boot      refuses until the task-000141 FEL session runner lands
-#                      (board in FEL on the host's USB). Only a blobfree
-#                      bundle; a dramlib or phyfw measurement build needs
-#                      FEL_MEASUREMENT_AUTH=<file>
 #   make rpms          the cubie-a7a-* SRPMs and RPMs -> out/fedora/rpmbuild/
 #   make fedora-image  Fedora 45 image with the firmware at LBA 256 -> out/image/
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
