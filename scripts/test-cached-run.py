@@ -14,7 +14,9 @@ import struct
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parent
 cached = runpy.run_path(str(SCRIPTS / "lib/cached_set.py"))
@@ -665,6 +667,100 @@ class RunnerTests(unittest.TestCase):
                     self.assertIn(
                         "closed handover slice digest mismatch", replay.stderr
                     )
+
+    def test_6g_cached_memtest_stays_away_until_reconnect_deadline(self):
+        port = "3-6"
+        for first_poll, expected_polls in ((58, 2), (59.5, 1)):
+            with self.subTest(first_poll=first_poll):
+                self.setUp()
+                self.setup_runner()
+                entry = runpy.run_path(str(self.runner))
+                reconnect = entry["Session"].reconnect
+                namespace = reconnect.__globals__
+
+                def fake_reconnect(runner, seconds=60, *, observe=None):
+                    self.assertEqual(seconds, 60)
+                    now = 100.0
+                    polls = 0
+
+                    def advance(seconds):
+                        nonlocal now
+                        now += seconds
+
+                    def offline(argv, timeout, lease_fd, *, watch=None):
+                        nonlocal polls
+                        assert argv == ("--discover", "--port", port)
+                        assert not (self.sysfs / port).exists()
+                        polls += 1
+                        if polls == 1:
+                            with self.logs[port].open("ab") as stream:
+                                stream.write(
+                                    b"[bt0] RVBAR 00000000:40000000, fixture\nmain>"
+                                )
+                            advance(first_poll)
+                        else:
+                            advance(timeout + 0.01)
+                        return 66, "", "fixture board offline", False
+
+                    clock = SimpleNamespace(
+                        monotonic=lambda: now, sleep=advance, time_ns=time.time_ns
+                    )
+                    with patch.dict(namespace, time=clock):
+                        with patch.object(
+                            runner.selector, "invoke", side_effect=offline
+                        ):
+                            return reconnect(runner, seconds, observe=observe)
+
+                receipt, state = self.paths(port)
+                args = SimpleNamespace(
+                    port=port,
+                    receipt=receipt,
+                    state=state,
+                    set=self.source,
+                    expect_set_sha256=self.digest,
+                    serial_log=self.logs[port],
+                )
+                with (
+                    patch.dict(os.environ, self.env, clear=True),
+                    patch(
+                        "pwd.getpwuid",
+                        return_value=SimpleNamespace(pw_dir=str(self.home)),
+                    ),
+                    patch.object(entry["Session"], "reconnect", fake_reconnect),
+                ):
+                    self.assertEqual(entry["start_guardian"](args), (0, ""))
+                with self.resume(port) as proc:
+                    out, err = proc.communicate(timeout=15)
+                result = self.receipt(port)
+                verified = subprocess.run(
+                    [
+                        self.python,
+                        "-I",
+                        self.runner,
+                        "verify-handover",
+                        "--receipt",
+                        receipt,
+                    ],
+                    env=self.env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    (
+                        proc.returncode,
+                        result["reconnect"],
+                        "handover_sha256" in result,
+                        verified.returncode,
+                    ),
+                    (5, {"outcome": "lost", "exit": 5}, True, 0),
+                    out + err + verified.stdout + verified.stderr,
+                )
+                self.assertTrue((self.sysfs / (port + ".offline")).is_dir())
+                self.assertEqual(
+                    sum(call["argv"][0] == "--discover" for call in result["calls"]),
+                    1 + expected_polls,  # plus preflight discovery
+                )
 
     def test_actual_client_death_cancels_inflight_transfer_and_keeps_fence(self):
         port = "3-3.4"

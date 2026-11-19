@@ -72,7 +72,7 @@ slice from Entry 2 to that moment in the receipt (`handover_end`,
 | Resume exit | Receipt `reconnect` | Meaning |
 |---:|---|---|
 | 3 | `{"exit": 0, "outcome": "verified"}` | The board is already back in FEL (a short run) |
-| 5 | `{"exit": 5, "outcome": "lost"}` | The board left FEL and had not returned within 60 seconds; `main` may still be running |
+| 5 | `{"exit": 5, "outcome": "lost"}` | The board left FEL and stayed away for the 60-second reconnect window. The slice is sealed; this is normal for a long memtest, when `main` may still be running. |
 
 Only these two outcomes permit `verify-handover`; its exit 0 is the
 confirmed handover. Any other resume exit, or any other `reconnect`

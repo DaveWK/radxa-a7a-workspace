@@ -572,20 +572,34 @@ class Session:
             raise SessionError(Exit.IDENTITY, "no acknowledged reset is pending")
         deadline = time.monotonic() + seconds
         self.event("reconnect-attempt", devnum=self.state["devnum"])
-        last_loss = None
+        last_observation = None
         while True:
-            if time.monotonic() >= deadline and last_loss is not None:
-                raise last_loss
+            if last_observation is not None and time.monotonic() >= deadline:
+                raise last_observation
             if observe is not None:
                 observe()
             try:
-                number = self.discover(timeout=command_budget(deadline, "reconnect"))
+                budget = command_budget(deadline, "reconnect")
+                if (
+                    budget < 1
+                    and last_observation is not None
+                    and last_observation.code == Exit.LOST_AFTER
+                ):
+                    # Don't start a discovery with a subsecond budget after loss.
+                    break
+                number = self.discover(timeout=budget)
+                command_budget(deadline, "reconnect")
             except SessionError as exc:
+                if (
+                    exc.code == Exit.LIVE_TIMEOUT
+                    and last_observation is not None
+                    and time.monotonic() >= deadline
+                ):
+                    raise last_observation from exc
                 if exc.code != Exit.LOST_AFTER or time.monotonic() >= deadline:
                     raise
-                last_loss = exc
+                last_observation = exc
             else:
-                last_loss = None
                 if number != self.state["devnum"]:
                     self.probe(number, deadline=deadline)
                     self.commit(
@@ -593,11 +607,13 @@ class Session:
                     )
                     self.event("reconnect-verified", devnum=number)
                     return
-                if time.monotonic() >= deadline:
-                    raise SessionError(
-                        Exit.IDENTITY, "no fresh enumeration after submission"
-                    )
+                last_observation = SessionError(
+                    Exit.IDENTITY, "no fresh enumeration after submission"
+                )
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        if self.watch is not None:
+            self.watch()
+        raise last_observation
 
     def watchdog(self):
         for command in WDT[:-1]:
@@ -1104,32 +1120,37 @@ def wait_for_handover(serial, cursor, record, seconds=10):
 
 def wait_for_handover_target(mailbox, record, seconds=10):
     deadline = time.monotonic() + seconds
-    while True:
-        # Only a classified disconnect can proceed without an ACKed mailbox
-        # read; a generic failure is never treated as offline handover.
-        try:
-            current = mailbox(command_budget(deadline, "Entry 2 mailbox"))
-        except SessionError as exc:
-            if exc.code != Exit.LOST_AFTER:
-                raise
+    stuck = False
+    try:
+        while True:
+            # Only a classified disconnect can proceed without an ACKed mailbox
+            # read; a generic failure is never treated as offline handover.
+            try:
+                current = mailbox(command_budget(deadline, "Entry 2 mailbox"))
+            except SessionError as exc:
+                if exc.code != Exit.LOST_AFTER:
+                    raise
+                command_budget(deadline, "Entry 2 mailbox")
+                record["device_loss"] = int(exc.code)
+                return
             command_budget(deadline, "Entry 2 mailbox")
-            record["device_loss"] = int(exc.code)
-            return
-        command_budget(deadline, "Entry 2 mailbox")
-        record["entry_two_mailbox"] = current
-        magic, state, *_ = current
-        if magic != 0x46413741 or state not in (0x11, 0x21):
-            raise SessionError(
-                Exit.SERIAL_UNCONFIRMED,
-                f"Entry 2 mailbox did not allow handover (state {state:#x})",
-            )
-        if state == 0x21:
-            return
-        if time.monotonic() >= deadline:
+            record["entry_two_mailbox"] = current
+            magic, state, *_ = current
+            if magic != 0x46413741 or state not in (0x11, 0x21):
+                raise SessionError(
+                    Exit.SERIAL_UNCONFIRMED,
+                    f"Entry 2 mailbox did not allow handover (state {state:#x})",
+                )
+            if state == 0x21:
+                return
+            stuck = True
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    except SessionError as exc:
+        if stuck and exc.code == Exit.LIVE_TIMEOUT and time.monotonic() >= deadline:
             raise SessionError(
                 Exit.SERIAL_UNCONFIRMED, "Entry 2 mailbox remained at 0x11"
-            )
-        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            ) from exc
+        raise
 
 
 def workspace_boot(args, fd, record):

@@ -123,6 +123,57 @@ class SessionTests(Fixture):
         self.assertEqual(self.state.read_bytes(), old)
         self.assertEqual(self.record["devnums"], [12])
 
+    def test_unchanged_devnum_at_reconnect_deadline(self):
+        runner = self.make_session()
+        runner.start()
+        runner.submit(M["WDT"][-1], returns=True)
+        old = self.state.read_bytes()
+        for expiry in ("between polls", "before discovery", "late discovery"):
+            with self.subTest(expiry=expiry):
+                self.selector.devnum = 12
+                now = 100.0
+                polls = 0
+                observations = 0
+                invoke = self.selector.invoke
+
+                def sleep(seconds):
+                    nonlocal now
+                    now += 60 if expiry == "between polls" else seconds
+
+                def observe():
+                    nonlocal now, observations
+                    observations += 1
+                    if observations == 2 and expiry == "before discovery":
+                        now = 160
+
+                def discover(args, timeout, *options, **kwargs):
+                    nonlocal now, polls
+                    polls += 1
+                    if polls == 2:
+                        now = 161
+                        # A fresh devnum is not usable after the deadline.
+                        self.selector.devnum = 24
+                    return invoke(args, timeout, *options, **kwargs)
+
+                with (
+                    patch("time.monotonic", side_effect=lambda: now),
+                    patch("time.sleep", side_effect=sleep),
+                    patch.object(self.selector, "invoke", side_effect=discover),
+                ):
+                    self.assert_exit(EXIT.IDENTITY, runner.reconnect, observe=observe)
+                self.assertEqual(polls, 2 if expiry == "late discovery" else 1)
+                self.assertEqual(self.state.read_bytes(), old)
+
+    def test_first_discovery_hang_has_no_prior_reconnect_observation(self):
+        runner = self.make_session()
+        runner.start()
+        runner.submit(M["WDT"][-1], returns=True)
+        with patch.object(
+            self.selector, "invoke", return_value=(-9, "", "fixture hung", True)
+        ):
+            self.assert_exit(EXIT.LIVE_TIMEOUT, runner.reconnect)
+        self.assertTrue(self.record["calls"][-1]["timed_out"])
+
     def test_entry_two_mailbox_budget_does_not_accept_late_ready(self):
         clock, observed = [100], []
 
@@ -136,6 +187,38 @@ class SessionTests(Fixture):
                 EXIT.LIVE_TIMEOUT, M["wait_for_handover_target"], mailbox, {}
             )
         self.assertEqual(observed, [10])
+
+    def test_stuck_entry_two_mailbox_keeps_last_completed_state_at_deadline(self):
+        for expiry in ("between polls", "late read", "selector timeout"):
+            with self.subTest(expiry=expiry):
+                clock, observed = [100], []
+                record = {}
+                stuck = (0x46413741, 0x11, 4096, 1200)
+
+                def mailbox(timeout):
+                    observed.append(timeout)
+                    if len(observed) == 1:
+                        return stuck
+                    clock[0] = 111
+                    if expiry == "selector timeout":
+                        raise M["SessionError"](EXIT.LIVE_TIMEOUT, "fixture timed out")
+                    return (0x46413741, 0x21, 4096, 1200)
+
+                def sleep(seconds):
+                    clock[0] += 10 if expiry == "between polls" else seconds
+
+                with (
+                    patch("time.monotonic", side_effect=lambda: clock[0]),
+                    patch("time.sleep", side_effect=sleep),
+                ):
+                    self.assert_exit(
+                        EXIT.SERIAL_UNCONFIRMED,
+                        M["wait_for_handover_target"],
+                        mailbox,
+                        record,
+                    )
+                self.assertEqual(record["entry_two_mailbox"], stuck)
+                self.assertEqual(len(observed), 1 if expiry == "between polls" else 2)
 
     def test_loss_before_and_after_without_submission_ack(self):
         session = self.make_session()
