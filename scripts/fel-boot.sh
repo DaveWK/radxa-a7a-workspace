@@ -30,6 +30,12 @@
 #   SUDO   prefix for xfel (default: sudo; empty if the udev rule grants
 #          access).
 #
+# The image dir must carry build-manifest.json, written by `make fel-image`
+# next to the images. fel-boot checks it before any USB access: the manifest
+# mode must be blobfree, and the recorded sha256 of bt0-fel.bin, firmware.bin
+# and firmware.seek must match the files. A dramlib or phyfw image is a
+# measurement build: set FEL_MEASUREMENT_ONLY=yes to boot one deliberately.
+#
 # No board access beyond FEL: nothing here touches an SD card or SPI NOR.
 set -euo pipefail
 
@@ -55,11 +61,64 @@ x() { $SUDO "$XFEL" "$@" </dev/null; }
 
 [ $# -eq 1 ] || die "usage: $0 <image dir with bt0-fel.bin, firmware.bin, firmware.seek>"
 IMAGE=$(cd "$1" && pwd)
-for f in bt0-fel.bin firmware.bin firmware.seek; do
+for f in bt0-fel.bin firmware.bin firmware.seek build-manifest.json; do
     [ -f "$IMAGE/$f" ] || die "$IMAGE/$f missing (make fel-image)"
 done
 command -v python3 >/dev/null || die "python3 not found"
 command -v "$XFEL" >/dev/null || die "xfel not found (XFEL=$XFEL)"
+
+# Refuse a legacy or non-blobfree image before any USB access.
+MEASUREMENT=${FEL_MEASUREMENT_ONLY:-no}
+python3 -I - "$IMAGE/build-manifest.json" "$IMAGE" "$MEASUREMENT" <<'PY'
+import hashlib, json, sys
+
+manifest_path, image, measurement = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+except OSError as e:
+    sys.exit(f"fel-boot: cannot read {manifest_path}: {e}")
+except ValueError as e:
+    sys.exit(f"fel-boot: {manifest_path} is not valid JSON: {e}")
+mode = manifest.get("mode")
+if mode not in ("blobfree", "dramlib", "phyfw"):
+    sys.exit(f"fel-boot: manifest mode {mode!r} is not blobfree, dramlib or phyfw")
+if mode != "blobfree":
+    if measurement != "yes":
+        sys.exit(
+            f"fel-boot: {manifest_path} is a {mode} measurement build, not blobfree;"
+            " refusing before USB access (set FEL_MEASUREMENT_ONLY=yes to boot it)"
+        )
+    print(f"fel-boot: FEL_MEASUREMENT_ONLY=yes: booting a {mode} measurement build")
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+for key, name in (
+    ("bt0_fel_sha256", "bt0-fel.bin"),
+    ("firmware_sha256", "firmware.bin"),
+    ("firmware_seek_sha256", "firmware.seek"),
+):
+    want = manifest.get(key)
+    if not want:
+        sys.exit(f"fel-boot: {manifest_path} has no {key}")
+    got = sha256(f"{image}/{name}")
+    if want != got:
+        sys.exit(
+            f"fel-boot: {name} sha256 {got} does not match the manifest ({want});"
+            " the image is stale or mixed"
+        )
+print(
+    f"build mode {mode}; features {manifest.get('features')};"
+    f" source {manifest.get('source_sha')}"
+)
+PY
 
 WORK=$(mktemp -d "$IMAGE/.fel-boot.XXXXXX")
 cleanup() {

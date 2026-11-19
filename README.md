@@ -27,7 +27,8 @@ vendor input.
 - **Boots to a Fedora 45 login over USB FEL:** bt0 → main → EDK2 → GRUB →
   Fedora 7.3.3 (stock kernel) on all 8 cores, with the root on a USB disk in
   the blue port. DRAM is 4096 MiB at 2400 MHz; these boots used the vendor
-  DRAM library path (`VENDOR_DRAM=yes` now, see "DRAM" below).
+  DRAM library path (`VENDOR_DRAM=yes`, a measurement build; see "DRAM"
+  below).
 - **DRAM without vendor code is the default build:** no Allwinner DRAM
   library, no Synopsys PHY training firmware. It runs DRAM at 1200 MHz and
   boots Fedora: 4096 MiB, a 2.6 GB memtester loop and a 5-minute
@@ -83,14 +84,14 @@ Fedora 45 host with the packages in `Containerfile`; there
 |---|---|
 | `make dtb` | `out/dtb/sun60i-a733-cubie-a7a.dtb` |
 | `make firmware` | `out/firmware/firmware.bin` + `firmware.seek`: bt0, layout table, main, EDK2 (with the DTB), for the SD card or the eMMC at sector 256 |
-| `make fel-image` | `out/fel/`: `bt0-fel.bin` (bt0 linked at 0x90000) and a `firmware.bin` whose main runs USB in high-speed mode |
+| `make fel-image` | `out/fel/<mode>/` (`<mode>`: `blobfree`, `dramlib` or `phyfw`): `bt0-fel.bin` (bt0 linked at 0x90000), a `firmware.bin` whose main runs USB in high-speed mode, and a `build-manifest.json` with the mode, features, source SHA and image SHA256 |
 | `make xfel` | `out/tools/xfel`: xfel v1.4.0 built from source with a 60 s USB timeout |
-| `make fel-boot` | boots the board over USB FEL with `out/fel/` (run on the host, see below) |
+| `make fel-boot` | boots the board over USB FEL with `out/fel/<mode>/` (run on the host, see below). Refuses any mode but `blobfree` unless `FEL_MEASUREMENT_ONLY=yes` |
 | `make rpms` | `out/fedora/rpmbuild/`: the `cubie-a7a-*` SRPMs and RPMs |
 | `make fedora-image` | `out/image/a7a-fedora45.img`: GPT, `firmware.bin` at sector 256, ESP, Fedora 45 root (grows to the card on first boot) |
 | `make serial` | UART0 logger: picocom in a detached screen session, logs in `serial-logs/` |
 | `make test` | host tests of the board crates and script checks |
-| `make vendor` | only for `VENDOR_DRAM=yes` or `phyfw`: `vendor/dramlib/libdram`, the vendor DRAM library object, downloaded from its public source and checked by SHA-256 (see "Vendor inputs") |
+| `make vendor` | measurement builds only (`VENDOR_DRAM=yes`, `phyfw`, `FEL_DRAM=dramlib`): `vendor/dramlib/libdram`, the vendor DRAM library object, downloaded with `aria2c` from its public source and checked by SHA-256 (see "Vendor inputs") |
 
 Options: `DRAM_MHZ=1200|2400`, `VENDOR_DRAM=yes` (see "DRAM"),
 `BRINGUP=`/`FEL_BRINGUP=` (features of oreboot main), `EDK2_TARGET=DEBUG|RELEASE`,
@@ -110,6 +111,9 @@ instructions are in [docs/usb-fel-boot.md](docs/usb-fel-boot.md):
     dd if=out/image/a7a-fedora45.img of=/dev/sdX bs=4M conv=fsync   # USB disk, blue port
     make xfel                       # once
     make fel-boot                   # board in FEL on this host's USB (its USB-C port)
+
+`make fel-boot` boots the blob-free image (`out/fel/blobfree/`). Set
+`FEL_MEASUREMENT_ONLY=yes` to boot a `dramlib` or `phyfw` measurement build.
 
 **SD card**: write `out/image/a7a-fedora45.img` to a microSD card, or write
 only `out/firmware/firmware.bin` at sector 256 of an existing card. See
@@ -138,18 +142,21 @@ built in, so `make firmware` and `make fel-image` need no `make vendor`.
 - `DRAM_MHZ=1200|2400` picks the DRAM clock of those settings. Unset, it is
   the firmware's default, 1200, the clock Fedora boots at. 2400 is there
   for the work on it: it does not boot Linux yet (see the status above).
-- `VENDOR_DRAM=yes`: the comparison build. DRAM init through Allwinner's
-  DRAM library, linked into bt0 from `vendor/` (run `make vendor` first),
-  at 2400 MHz. It is also what the 8 and 12 GB boards need for now: their
+- `VENDOR_DRAM=yes`: measurement build. DRAM init through Allwinner's DRAM
+  library, linked into bt0 from `vendor/` (run `make vendor` first), at
+  2400 MHz. It is also what the 8 and 12 GB boards need for now: their
   parameter sets run another DRAM clock, which our driver's stages refuse.
-- `VENDOR_DRAM=phyfw`: our driver with the PHY's own training firmware,
-  read from the library object as data (`make vendor` as well).
+  A plain `make fel-boot` refuses it.
+- `VENDOR_DRAM=phyfw`: measurement build. Our driver with the PHY's own
+  training firmware, read from the library object as data (`make vendor` as
+  well). A plain `make fel-boot` refuses it.
 
 One setting of our driver can be changed for a build by its `A7A_*`
 variable in the environment; the board README in `firmware/oreboot`
 (`src/mainboard/radxa/cubie-a7a/`) lists how. Earlier spellings:
 `BLOBLESS=yes` and `FEL_DRAM=open` are the default now, and
-`FEL_DRAM=dramlib` still builds only the FEL `bt0` with the library.
+`FEL_DRAM=dramlib` still builds only the FEL `bt0` with the library, a
+measurement build a plain `make fel-boot` refuses.
 
 When our driver's training does not end clean, `bt0` halts instead of
 booting: over USB FEL the board stays in FEL and `make fel-boot` reports
@@ -157,14 +164,14 @@ the mailbox state; from a card the next start enters FEL.
 
 ## Vendor inputs
 
-The default firmware build reads no closed input. `VENDOR_DRAM=yes` and
-`VENDOR_DRAM=phyfw` read one, Allwinner's A733 DRAM library object from the
-Tina SDK
+The default firmware build reads no closed input. The measurement builds
+(`VENDOR_DRAM=yes`, `VENDOR_DRAM=phyfw` and `FEL_DRAM=dramlib`) read one,
+Allwinner's A733 DRAM library object from the Tina SDK
 (`gitlab.com/tina5.0_aiot/lichee/dramlib`, commit `35e84c83`,
 `sun60iw2p1/spl_libdram/libdram`). `make vendor` downloads it to `vendor/`
-(gitignored) and checks its SHA-256. It is never committed here or in any
-submodule. Firmware built with it contains vendor code or data: keep it for
-your own use.
+(gitignored) with `aria2c` and checks its SHA-256. It is never committed here
+or in any submodule. Firmware built with it contains vendor code or data:
+keep it for your own use.
 
 No other closed binaries are involved: EDK2, oreboot and the board RPMs are
 built from source, and the Fedora image takes its firmware files from
