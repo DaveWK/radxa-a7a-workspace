@@ -195,6 +195,13 @@ class BenchTools(verify.SubprocessRunner):
                 )
                 if b.stderr_noise:
                     kwargs["stderr"] = summary(0, 1)
+        elif cmd == "llvm-objdump":
+            arch = (
+                "elf64-littleaarch64"
+                if self.row.startswith("main-")
+                else "elf32-littlearm"
+            )
+            kwargs["stdout"] = f"test: file format {arch}\n0010 <start>:\n  10: nop\n"
         elif cmd == "llvm-readelf":
             sections = []
             if (
@@ -324,6 +331,11 @@ class CliTest(unittest.TestCase):
             self.home / ".rustup" / "toolchains" / f"{channel}-{HOST}" / "bin"
         )
         self.pinned_bin.mkdir(parents=True, exist_ok=True)
+        objdump = (
+            self.pinned_bin.parent / "lib" / "rustlib" / HOST / "bin" / "llvm-objdump"
+        )
+        objdump.parent.mkdir(parents=True, exist_ok=True)
+        objdump.touch()
         for tool in ("cargo", "rustc", "rustdoc"):
             (self.pinned_bin / tool).write_bytes(b"mock tool")
 

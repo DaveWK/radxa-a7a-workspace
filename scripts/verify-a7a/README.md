@@ -50,9 +50,9 @@ signing or daemon.
 - **Matrix**: the 38 OLD feature sets built with `--no-default-features`, the
   17 NEW default-feature sets (12 with a retained baseline, plus the new
   `default+full-speed` and the `default`/`fel` 800 and 400 MHz profile rows,
-  which have no historical baseline and are labelled as such), and the two `lab`
-  entries (`lab-drift`, `lab-full-speed`) built with `--no-default-features`
-  (57 positive `bt0` builds), plus the 11 `main` sets. OLD and NEW are compared
+  which have no historical baseline and are labelled as such), and three `lab`
+  entries (`lab-dram`, `lab-drift`, `lab-full-speed`) built with `--no-default-features`
+  (58 positive `bt0` builds), plus the 11 `main` sets. OLD and NEW are compared
   with the baseline; the lab and new no-baseline rows are labelled new. The
   historical OLD/NEW differences stay visible in the report. Every `main` image
   must be byte-identical to the baseline. The manifest is read once: the parsed
@@ -61,10 +61,14 @@ signing or daemon.
   row. Both the baseline comparison and emitted `SHA256SUMS` use the digests of
   the validated bytes, not reopened paths.
 - **Negative contract**: each negative row must fail with its own exact
-  `compile_error` diagnostic, not for an arbitrary reason. The rows are the
+  diagnostic, not for an arbitrary reason. The rows are the
   default feature plus `dram-lab`, `dramlib` or `blobless` (the `blobfree`
   conflict), the original `fel dram-lab drift-log` invalid positive, and
-  `fel` plus `spinor`.
+  `fel` plus `spinor`, and `dram-lab phyfw` (`phyfw` is a command, not a feature).
+- **Instructions**: the pinned toolchain's `llvm-objdump` disassembles each ELF
+  before the next build replaces it. ARM exclusives fail the `bt0` row. For
+  `main`, AArch64 exclusives and LSE atomics are reported but do not fail the
+  row; this is not a claim that the MMU is enabled along every path.
 - **Images by content**: every produced image is checked, not trusted from
   `objcopy`'s exit status. The primary must be nonempty and within its class
   limit (padded eGON media `bt0` from `EGON_MAX` and `EGON_PAD` in
@@ -73,8 +77,12 @@ signing or daemon.
   must carry the raw eGON.BT0 header (magic, header size, media run address and
   the unfilled length/checksum placeholders). The row's features declare which
   `.dram` and `.phyfw` payload sections must be present or absent. Each expected
-  section is stripped from the primary and exported separately, with its
-  nonzero size checked against the ELF. At the verified source, `lab-drift`
+  section is stripped from the primary. File-backed extensions are exported
+  separately, with nonzero size checked against the ELF. In `lab-dram`,
+  `.phyfw` must instead reserve writable, allocated NOBITS space at the start
+  of FELSRAM, aligned to at least 4, fitting the SRAM window and matching
+  the six lengths in this build's generated `phy-fw-lab.rs`. It has no
+  corresponding exported file. At the verified source, `lab-drift`
   and `lab-full-speed` each carry a **4-byte `.dram` marker** (`A7AX`), not a
   `.phyfw` extension: `dram-lab` enables fastboot and `bl-mission` selects the
   blobless backend.

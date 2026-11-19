@@ -485,18 +485,27 @@ def valid_media_image(
 
 
 class ImageRunner(verify.SubprocessRunner):
-    def __init__(self, readelf="", primary=b"", ext=b"", cargo_rc=0):
+    def __init__(self, readelf="", primary=b"", ext=b"", cargo_rc=0, asm="mov r0, r0"):
         self.readelf = readelf
         self.primary = primary
         self.ext = ext
         self.cargo_rc = cargo_rc
+        self.asm = asm
 
     def run(self, argv, cwd, env, log=None):
         command = argv[0]
         if command == "cargo":
             return verify.CommandResult(tuple(argv), str(cwd), self.cargo_rc, "")
+        if command == "llvm-objdump":
+            return verify.CommandResult(
+                tuple(argv),
+                str(cwd),
+                0,
+                "test: file format elf32-littlearm\n00000004 <lab_fw::load>:\n  4: "
+                + self.asm,
+            )
         if command == "llvm-readelf":
-            table = "There are 1 section headers, starting at offset 0x0:\n"
+            table = f"There are {len(self.readelf.splitlines())} section headers, starting at offset 0x0:\n"
             return verify.CommandResult(tuple(argv), str(cwd), 0, table + self.readelf)
         if command == "llvm-objcopy":
             output = Path(argv[-1])
@@ -549,9 +558,84 @@ class ImageValidationTest(unittest.TestCase):
         elf.parent.mkdir(parents=True, exist_ok=True)
         elf.write_bytes(b"")
         harness = verify.Harness(self.args, runner=runner)
+        harness.toolchain["objdump"] = "llvm-objdump"
         harness.read_limits()
         return harness.build_bt0(
             tag, None, list(features), no_default, "new", baseline_required
+        )
+
+    def test_exclusive_audit(self):
+        for ins in ("ldrexd", "strexbne", "ldaexh", "stlex"):
+            with self.subTest(ins=ins):
+                res = self.build(
+                    ImageRunner(
+                        " [ 1] .text PROGBITS\n", primary=b"ok", asm=ins + " r0, [r1]"
+                    ),
+                    ["fel"],
+                )
+                self.assertFalse(res.ok)
+                self.assertIn(f"lab_fw::load 0x4 {ins}", res.detail)
+        self.assertTrue(
+            self.build(ImageRunner(" [ 1] .text PROGBITS\n", primary=b"ok"), ["fel"]).ok
+        )
+
+    def test_reserved_payload_contract(self):
+        index = self.out / "build/bt0-t/build/a/out/phy-fw-lab.rs"
+        index.parent.mkdir(parents=True)
+        index.write_text("pub const LEN: [usize; 6] = [1, 1, 1, 1, 1, 1];\n")
+        for kind, addr, size, align, dram_kind, ext, features, ok in [
+            ("NOBITS", "47000", "6", 4, "PROGBITS", b"A7AX", ["dram-lab"], True),
+            ("NOBITS", "47000", "7", 4, "PROGBITS", b"A7AX", ["dram-lab"], False),
+            ("NOBITS", "47004", "6", 4, "PROGBITS", b"A7AX", ["dram-lab"], False),
+            ("NOBITS", "47000", "6", 2, "PROGBITS", b"A7AX", ["dram-lab"], False),
+            (
+                "NOBITS",
+                "47000",
+                "6",
+                4,
+                "PROGBITS",
+                b"A7AX",
+                ["dram-lab", "bl-mission"],
+                False,
+            ),
+            ("PROGBITS", "47000", "4", 4, "PROGBITS", b"A7AX", ["dram-lab"], False),
+            ("NOBITS", "47000", "6", 4, "NOBITS", b"A7AX", ["dram-lab"], False),
+            ("NOBITS", "47000", "6", 4, "PROGBITS", b"", ["dram-lab"], False),
+        ]:
+            with self.subTest(
+                kind=kind,
+                addr=addr,
+                size=size,
+                align=align,
+                dram=dram_kind,
+                ext=ext,
+                features=features,
+            ):
+                table = f" [ 1] .dram {dram_kind} 59000000 10000 4 00 AR 0 0 64\n [ 2] .phyfw {kind} {addr} 20000 {size} 00 WA 0 0 {align}\n"
+                res = self.build(
+                    ImageRunner(table, primary=b"code", ext=ext),
+                    features,
+                    no_default=True,
+                )
+                self.assertEqual(res.ok, ok, res.detail)
+
+    def test_aarch64_atomic_report_excludes_plain_load_and_store(self):
+        mnemonics = (
+            "ldxr",
+            "stxp",
+            "ldaxrb",
+            "stlxrh",
+            "caspal",
+            "swplb",
+            "ldaddal",
+            "steorlh",
+        )
+        text = "test: file format elf64-littleaarch64\n0 <cached_test>:\n"
+        for i, op in enumerate((*mnemonics, "ldar", "stlr", "ldr", "str")):
+            text += f"  {i * 4:x}: {op} x0, [x1]\n"
+        self.assertEqual(
+            verify.audit_disassembly(text, True),
+            [f"cached_test 0x{i * 4:x} {op}" for i, op in enumerate(mnemonics)],
         )
 
     def test_empty_primary_fails(self):

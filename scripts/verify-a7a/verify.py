@@ -171,10 +171,10 @@ NEW_ENTRIES = (
     ("default-fel@400", "400", ("fel",), False),
 )
 
-# LAB: lab entries with no historical baseline image, labelled as new. The lab
-# backend needs bl-mission: with --no-default-features and no lab backend
-# selected the build is not equivalent.
+# LAB: entries with no historical baseline. Without bl-mission the lab uses
+# the open backend and the runtime-staged PHY firmware.
 LAB_ENTRIES = (
+    ("lab-dram", ("dram-lab",)),
     ("lab-drift", ("fel", "bl-mission", "dram-lab", "drift-log")),
     ("lab-full-speed", ("fel", "bl-mission", "dram-lab", "full-speed")),
 )
@@ -225,6 +225,12 @@ NEGATIVE_ENTRIES = (
     ("default+dramlib", ("dramlib",), False, CONFLICT_DIAGNOSTIC),
     ("default+blobless", ("blobless",), False, CONFLICT_DIAGNOSTIC),
     ("fel+spinor", ("fel", "spinor"), True, FEL_SPINOR_CONFLICT),
+    (
+        "dram-lab+phyfw",
+        ("dram-lab", "phyfw"),
+        True,
+        "the package 'oreboot-cubie-a7a-bt0' does not contain this feature: phyfw",
+    ),
 )
 
 BASELINE_SAME = "= base"
@@ -235,8 +241,8 @@ TEST_RESULT_RE = re.compile(
     r"0 measured; 0 filtered out; finished in [0-9.]+s"
 )
 SECTION_RE = re.compile(
-    r"^\s*\[\s*\d+\]\s+(\.dram|\.phyfw)\s+\S+\s+[0-9a-fA-F]+\s+"
-    r"[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s",
+    r"^\s*\[\s*\d+\]\s+(\.dram|\.phyfw)\s+(\S+)\s+([0-9a-fA-F]+)\s+"
+    r"[0-9a-fA-F]+\s+([0-9a-fA-F]+)[^\S\n]+([^\n]*)$",
     re.M,
 )
 SECTION_COUNT_RE = re.compile(r"^There are (\d+) section headers,", re.M)
@@ -461,6 +467,62 @@ def image_names(stem: str, sections: tuple[str, ...]) -> list[str]:
     # Keep the historical filename when a row has a single extension.
     suffixes = ["-ext"] if len(sections) == 1 else ["-" + s[1:] for s in sections]
     return [f"{stem}{suffix}.bin" for suffix in ("", *suffixes)]
+
+
+def phyfw_reservation(address: int, size: int, columns: str, build: Path) -> None:
+    """Check the FELSRAM NOLOAD reservation against this row's generated index."""
+    # llvm-readelf -SW: ES, flags, link, info, alignment.
+    fields = columns.split()
+    if (
+        len(fields) != 5
+        or not {"W", "A"}.issubset(fields[1])
+        or not fields[-1].isdecimal()
+        or int(fields[-1]) < 4
+        or address != 0x47000
+        or not 0 < size <= 0x5B000 - address
+    ):
+        raise ValueError("invalid .phyfw FELSRAM reservation")
+    # bt0/build.rs::lab_firmware emits LEN from the six extracted images.
+    # This intermediate directory is private to this one feature row.
+    indices = list(build.rglob("out/phy-fw-lab.rs"))
+    if len(indices) != 1:
+        raise ValueError("expected one generated PHY firmware index")
+    lens = re.search(
+        r"^pub const LEN: \[usize; 6\] = \[([0-9]+(?:, [0-9]+){5})\];$",
+        indices[0].read_text(encoding="utf-8"),
+        re.M,
+    )
+    lengths = [] if not lens else list(map(int, lens[1].split(", ")))
+    if not lengths or min(lengths) <= 0 or size != sum(lengths):
+        raise ValueError(".phyfw size differs from the generated PHY firmware index")
+
+
+ARM_EXCLUSIVE = re.compile(r"(?:ldrex|strex|ldaex|stlex)\w*(?:\.w)?")
+A64_ATOMIC = re.compile(
+    r"(?:lda?x[rp]|stl?x[rp])[bh]?"
+    r"|(?:cas[p]?|swp|(?:ld|st)(?:add|clr|eor|set|smax|smin|umax|umin))[al]*[bh]?"
+    r"|(?:ld64b|st64b|st64bv|st64bv0|rcw(?:cas|swp|clr|set)\w*)"
+)
+
+
+def audit_disassembly(text: str, main: bool) -> list[str]:
+    """Read llvm-objdump -d -C --no-show-raw-insn, not operands or comments."""
+    arch = "elf64-littleaarch64" if main else "elf32-littlearm"
+    if not re.search(r"file format " + arch + r"$", text, re.M):
+        raise ValueError(f"expected objdump format {arch}")
+    symbol = None
+    instructions = 0
+    hits = []
+    for line in text.splitlines():
+        if label := re.fullmatch(r"\s*[0-9a-f]+ <(.+)>:", line):
+            symbol = label[1]
+        elif ins := re.match(r"^\s*([0-9a-f]+):\s+([a-z][\w.]*)\b", line):
+            instructions += 1
+            if (A64_ATOMIC if main else ARM_EXCLUSIVE).fullmatch(ins[2]):
+                hits.append(f"{symbol or '<unnamed>'} 0x{ins[1]} {ins[2]}")
+    if not instructions:
+        raise ValueError("objdump decoded no instructions")
+    return hits
 
 
 def required_baseline_names() -> list[str]:
@@ -1029,6 +1091,17 @@ class Harness:
         ):
             return [f"resolved rustc and cargo versions do not match {channel}"]
         self._host = host[1]
+        objdump = (
+            Path(self.toolchain["rustc"]).parent.parent
+            / "lib"
+            / "rustlib"
+            / self._host
+            / "bin"
+            / "llvm-objdump"
+        )
+        if not objdump.is_file():
+            return [f"missing pinned llvm-tools component: {objdump}"]
+        self.toolchain["objdump"] = str(objdump)
         self.cargo = self.toolchain["cargo"]
         self.env.update(
             RUSTC=self.toolchain["rustc"], RUSTDOC=self.toolchain["rustdoc"]
@@ -1155,6 +1228,9 @@ class Harness:
         baseline_required: bool,
     ) -> BuildResult:
         env = self.cargo_env("bt0")
+        expected = expected_sections(features, no_default)
+        if ".phyfw" in expected:
+            env["CARGO_BUILD_BUILD_DIR"] = str(self.args.out / "build" / f"bt0-{tag}")
         if profile:
             env["A7A_PROFILE"] = profile
         log = self.args.out / "matrix" / "logs" / f"bt0-{tag}.log"
@@ -1181,7 +1257,6 @@ class Harness:
             return BuildResult(
                 tag, section, False, "build failed", detail=f"missing ELF {elf}"
             )
-        expected = expected_sections(features, no_default)
         medium = not {
             "fel",
             "fastboot",
@@ -1270,6 +1345,29 @@ class Harness:
         media: bool = False,
     ) -> BuildResult:
         logs = self.args.out / "matrix" / "logs"
+        main = row == "main"
+        disasm = self.runner.run(
+            [
+                self.toolchain["objdump"],
+                "-d",
+                "-C",
+                "--no-show-raw-insn",
+                "--mattr=+lse" if main else "--mattr=+v8",
+                str(elf),
+            ],
+            cwd,
+            env,
+        )
+        try:
+            if disasm.returncode or disasm.stderr.strip():
+                raise ValueError(f"objdump exit {disasm.returncode}: {disasm.stderr}")
+            hits = audit_disassembly(disasm.stdout, main)
+        except ValueError as exc:
+            return BuildResult(tag, row, False, "invalid disassembly", detail=str(exc))
+        # main/src/memtest_cached.rs enables the MMU only during the test;
+        # AArch64 hits are informational, not proof that the path is MMU-on.
+        for hit in hits:
+            print(f"{stem}: {'AArch64 atomic' if main else 'ARM exclusive'}: {hit}")
         readelf = self.runner.run(
             ["llvm-readelf", "-S", "-W", str(elf)],
             cwd,
@@ -1291,19 +1389,39 @@ class Harness:
                 warnings=warnings,
                 detail="incomplete llvm-readelf section table",
             )
-        if sorted(name for name, _ in found) != sorted(expected):
+        found_names = tuple(record[0] for record in found)
+        if sorted(found_names) != sorted(expected):
             return BuildResult(
                 tag,
                 row,
                 False,
                 "invalid ELF",
                 warnings=warnings,
-                detail=f"expected payload sections {expected}, found {tuple(n for n, _ in found)}",
+                detail=f"expected payload sections {expected}, found {found_names}",
             )
-        sections = {name: int(size, 16) for name, size in found}
-        names = image_names(stem, expected)
+        sections = {}
+        exported = []
+        for name, kind, address, size_hex, columns in found:
+            size = sections[name] = int(size_hex, 16)
+            if name == ".phyfw" and kind == "NOBITS":
+                try:
+                    phyfw_reservation(
+                        int(address, 16),
+                        size,
+                        columns,
+                        Path(env["CARGO_BUILD_BUILD_DIR"]),
+                    )
+                except ValueError as exc:
+                    return BuildResult(tag, row, False, "invalid ELF", detail=str(exc))
+            elif kind == "PROGBITS":
+                exported.append(name)
+            else:
+                return BuildResult(
+                    tag, row, False, "invalid ELF", detail=f"{name}: unexpected {kind}"
+                )
+        names = image_names(stem, tuple(exported))
         images = {}
-        for name, section in zip(names, (None, *expected), strict=True):
+        for name, section in zip(names, (None, *exported), strict=True):
             staged = self.args.out / "tmp" / "images" / name
             options = (
                 [f"--only-section={section}"]
@@ -1343,6 +1461,16 @@ class Harness:
                     tag, row, False, "invalid image", warnings=warnings, detail=error
                 )
             images[name] = data
+        # File-backed sections must still pass the individual export checks.
+        # For this runtime-staged payload file backing is itself a defect.
+        if ".phyfw" in exported:
+            return BuildResult(
+                tag, row, False, "invalid ELF", detail=".phyfw must be NOBITS"
+            )
+        if hits and not main:
+            return BuildResult(
+                tag, row, False, "ARM exclusive instructions", detail="; ".join(hits)
+            )
         for name, data in images.items():
             self.image_digests[name] = sha256(data)
             # Publish the exact in-memory snapshot, not the staging file.
