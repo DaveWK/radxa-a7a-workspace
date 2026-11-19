@@ -128,8 +128,12 @@ class SelectorTests(unittest.TestCase):
         self.assertFalse(self.log.exists())
 
     def test_help_is_only_standalone(self):
-        self.run_selector("--help")
-        self.run_selector("-h")
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                usage = self.run_selector(flag).stdout
+                self.assertIn("usage:", usage)
+                self.assertIn("-h/--help must be used on its own.", usage)
+                self.run_selector(flag, rc=74, closed_stdout=True)
         for args in (
             ("--port", "3-6", "--devnum", "12", "--help", "--", "version"),
             ("--port", "3-6", "--devnum", "12", "-hh", "--", "version"),

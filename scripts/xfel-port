@@ -78,9 +78,25 @@ def discover(root, port):
     return number(devnum, 127)
 
 
+def write_stdout(text):
+    if sys.stdout is None:
+        return 74
+    try:
+        if sys.stdout.write(text) != len(text):
+            os._exit(74)
+        sys.stdout.flush()
+    except OSError:
+        # Do not retry the failed flush during Python interpreter shutdown.
+        os._exit(74)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description=__doc__, allow_abbrev=False, add_help=False
+        description=__doc__,
+        allow_abbrev=False,
+        add_help=False,
+        epilog="-h/--help must be used on its own.",
     )
     parser.add_argument("--discover", action="store_true")
     parser.add_argument("--port", required=True)
@@ -88,8 +104,7 @@ def main():
     parser.add_argument("command", nargs=argparse.REMAINDER)
     argv = sys.argv[1:]
     if argv in (["-h"], ["--help"]):
-        parser.print_help()
-        return 0
+        return write_stdout(parser.format_help())
     if any(arg in ("-h", "--help") for arg in argv):
         parser.error("help must be requested on its own")
     args = parser.parse_args()
@@ -138,14 +153,7 @@ def main():
             return 66
         raise
     if args.discover:
-        if sys.stdout is None:
-            return 74
-        try:
-            print(current, flush=True)
-        except OSError:
-            # Do not retry the failed flush during Python interpreter shutdown.
-            os._exit(74)
-        return 0
+        return write_stdout(f"{current}\n")
     if current != expected:
         raise ValueError(
             f"devnum changed at {args.port}: expected {expected}, found {current}"
