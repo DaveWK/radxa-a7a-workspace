@@ -11,8 +11,11 @@ the previous harness lived in a private scratch tree and masked a failing build.
         --baseline <matrix-baseline-dir> \
         --baseline-sums-sha256 <sha256-of-baseline-SHA256SUMS> \
         --dram-lib <libdram-a733.a> \
+        --dram-lib-sha256 <sha256> \
         --phyfw-obj <libdram-object> \
+        --phyfw-obj-sha256 <sha256> \
         --gate <gate.py> \
+        --gate-sha256 <sha256> \
         --out <job-output-dir> \
         --expect-digest default=<sha256> \
         --expect-digest default-fel=<sha256> \
@@ -24,6 +27,11 @@ must equal `--source-sha`; the gate base must be an ancestor of that HEAD. The
 baseline directory is the retained matrix output at the gate base, and its
 `SHA256SUMS` manifest must hash to `--baseline-sums-sha256`. The gate and the
 two build inputs are external private artifacts and are never vendored here.
+Each requires a full 64-hex SHA256. Before creating the job directory, the
+harness opens each input once, hashing while copying to private staging, then
+rehashes the copy. Only those verified files move into the job; the linker,
+PHY extractor and gate use the copies, not the original paths. The report
+lists their SHA256 values and snapshot paths.
 
 ## Threat model
 
@@ -110,7 +118,7 @@ Exit status is `0` only when every stage passes; `1` for a verification failure;
 ## Job output
 
 `<job-output-dir>` receives `matrix/logs/`, `matrix/out/` (with `SHA256SUMS`),
-`target/`, `build/`, `cargo-home/`, `tests/`, `tmp/` and `gate.log`. The source
+`target/`, `build/`, `cargo-home/`, `inputs/`, `tests/`, `tmp/` and `gate.log`. The source
 checkout is never written to.
 
 The job output is private: it contains vendor-library variants and PHY

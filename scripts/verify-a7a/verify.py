@@ -21,8 +21,9 @@ Usage:
         --source <oreboot-checkout> --source-sha <full-head-sha> \
         --base <gate-base> --baseline <matrix-baseline-dir> \
         --baseline-sums-sha256 <sha256-of-baseline-SHA256SUMS> \
-        --dram-lib <libdram-a733.a> --phyfw-obj <libdram-object> \
-        --gate <gate.py> --out <job-output-dir> \
+        --dram-lib <libdram-a733.a> --dram-lib-sha256 <sha256> \
+        --phyfw-obj <libdram-object> --phyfw-obj-sha256 <sha256> \
+        --gate <gate.py> --gate-sha256 <sha256> --out <job-output-dir> \
         --expect-digest default=<sha256> \
         --expect-digest default-fel=<sha256> \
         --expect-digest default@2400=<sha256> \
@@ -52,6 +53,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -379,8 +381,11 @@ class Config:
     baseline: Path
     baseline_sums_sha256: str
     dram_lib: Path
+    dram_lib_sha256: str
     phyfw_obj: Path
+    phyfw_obj_sha256: str
     gate: Path
+    gate_sha256: str
     out: Path
     expected_digests: dict[str, str]
 
@@ -567,10 +572,22 @@ class Harness:
             "CARGO_NET_OFFLINE": "true",
             "CARGO_TERM_COLOR": "never",
             "RUSTUP_AUTO_INSTALL": "0",
-            "A733_DRAM_LIB": str(args.dram_lib),
-            "A733_PHY_FW_OBJ": str(args.phyfw_obj),
             "TMPDIR": str(args.out / "tmp"),
         }
+        self.input_paths = {
+            label: args.out / "inputs" / filename
+            for label, filename in (
+                ("dram-lib", "libdram-a733.a"),
+                ("phyfw-obj", "phyfw.o"),
+                ("gate", "gate.py"),
+            )
+        }
+        self.input_digests: dict[str, str] = {}
+        self.env.update(
+            A733_DRAM_LIB=str(self.input_paths["dram-lib"]),
+            A733_PHY_FW_OBJ=str(self.input_paths["phyfw-obj"]),
+        )
+        self.protected = self.protected_inputs()
         self.source_head: str | None = None
         self.workspace = MKIMAGE.parents[1]
         self.workspace_head: str | None = None
@@ -597,7 +614,7 @@ class Harness:
             ("dram-lib", a.dram_lib),
             ("phyfw-obj", a.phyfw_obj),
             ("gate", a.gate),
-            ("host Cargo cache", Path.home() / ".cargo"),
+            ("host Cargo cache", (Path.home() / ".cargo").resolve()),
         )
 
     def check_paths(self) -> list[str]:
@@ -605,8 +622,8 @@ class Harness:
         errors: list[str] = []
         # Overlap first: nothing is created when the job would write into a
         # protected input.
-        for label, path in self.protected_inputs():
-            if paths_overlap(a.out.resolve(), path.resolve()):
+        for label, path in self.protected:
+            if paths_overlap(a.out.resolve(), path):
                 errors.append(f"output directory overlaps the {label}: {path}")
         if errors:
             return errors
@@ -632,16 +649,37 @@ class Harness:
             errors.append(f"baseline directory not found: {a.baseline}")
         else:
             errors.extend(self._check_baseline_sums())
-        for label, path in (
-            ("dram-lib", a.dram_lib),
-            ("phyfw-obj", a.phyfw_obj),
-            ("gate", a.gate),
-        ):
-            if not path.is_file() or not path.stat().st_size:
-                errors.append(f"{label} missing or empty: {path}")
         if not errors:
             errors.extend(self.check_tooling())
         return errors
+
+    def snapshot_inputs(self, destination: Path) -> None:
+        a = self.args
+        destination.mkdir(mode=0o700)
+        for label, original, expected in (
+            ("dram-lib", a.dram_lib, a.dram_lib_sha256),
+            ("phyfw-obj", a.phyfw_obj, a.phyfw_obj_sha256),
+            ("gate", a.gate, a.gate_sha256),
+        ):
+            snapshot = destination / self.input_paths[label].name
+            digest = hashlib.sha256()
+            # Don't hang on a FIFO accidentally passed as an input. Check the
+            # descriptor that supplies the bytes, not a prior stat of the path.
+            fd = os.open(original, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as src:
+                if not stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+                    raise ValueError(f"{label} is not a regular file: {original}")
+                with snapshot.open("xb") as dst:
+                    while chunk := src.read(1024 * 1024):
+                        digest.update(chunk)
+                        dst.write(chunk)
+            actual = digest.hexdigest()
+            if actual != expected:
+                raise ValueError(f"{label} SHA256 {actual} does not match {expected}")
+            with snapshot.open("rb") as src:
+                if hashlib.file_digest(src, "sha256").hexdigest() != actual:
+                    raise ValueError(f"{label} snapshot SHA256 changed: {snapshot}")
+            self.input_digests[label] = actual
 
     def read_limits(self) -> None:
         # Read integer constants as syntax, not by importing the image builder.
@@ -687,9 +725,10 @@ class Harness:
                     )
         return errors
 
-    def prepare_output(self) -> None:
+    def prepare_output(self, staged: Path) -> None:
         out = self.args.out
         out.mkdir(mode=0o700)
+        (staged / "inputs").rename(out / "inputs")
         for sub in ("matrix/out", "matrix/logs", "tests", "tmp/images", "cargo-home"):
             (out / sub).mkdir(parents=True)
         # Cargo's offline cache can still be written to while building. Use
@@ -710,8 +749,7 @@ class Harness:
         ):
             path = (self.args.out / directory / group).resolve()
             if not path.is_relative_to(self.args.out) or any(
-                paths_overlap(path, protected.resolve())
-                for _label, protected in self.protected_inputs()
+                paths_overlap(path, protected) for _label, protected in self.protected
             ):
                 raise ValueError(f"{key} is not private to the job: {path}")
             env[key] = str(path)
@@ -1528,7 +1566,7 @@ class Harness:
         argv = [
             sys.executable,
             "-I",
-            str(self.args.gate),
+            str(self.input_paths["gate"]),
             str(self.args.source),
             self.gate_base or "",
             self.gate_head or "",
@@ -1584,6 +1622,8 @@ class Harness:
         print(f"source HEAD: {self.source_head} (expected {a.source_sha})")
         print(f"workspace HEAD: {self.workspace_head}")
         print(f"gate base: {self.gate_base}  head: {self.gate_head}")
+        for label, path in self.input_paths.items():
+            print(f"{label}: SHA256 {self.input_digests[label]} ({path})")
         print(f"toolchain: {self.toolchain.get('channel')}")
         for key in ("rustc_version", "cargo_version"):
             print(self.toolchain.get(key, "").rstrip())
@@ -1677,7 +1717,14 @@ class Harness:
                 print(f"  - {error}")
             print("VERDICT: FAIL")
             return 1
-        self.prepare_output()
+        # Check the bytes in private sibling staging first, then move those
+        # same files into the exclusively created job tree without recopying.
+        with tempfile.TemporaryDirectory(
+            prefix=".verify-a7a-", dir=self.args.out.parent
+        ) as temp:
+            staged = Path(temp)
+            self.snapshot_inputs(staged / "inputs")
+            self.prepare_output(staged)
         matrix = self.run_matrix()
         negative = self.run_negative()
         suites = self.run_suites()
@@ -1749,12 +1796,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help="SHA256 of the retained baseline SHA256SUMS manifest",
     )
     parser.add_argument("--dram-lib", required=True, help="libdram-a733.a build input")
+    parser.add_argument("--dram-lib-sha256", required=True, type=_sha256_arg)
     parser.add_argument(
         "--phyfw-obj", required=True, help="PHY firmware object build input"
     )
+    parser.add_argument("--phyfw-obj-sha256", required=True, type=_sha256_arg)
     parser.add_argument(
         "--gate", required=True, help="external publication gate script"
     )
+    parser.add_argument("--gate-sha256", required=True, type=_sha256_arg)
     parser.add_argument("--out", required=True, help="fresh job output directory")
     parser.add_argument(
         "--expect-digest",
@@ -1772,8 +1822,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         baseline=Path(ns.baseline).resolve(),
         baseline_sums_sha256=ns.baseline_sums_sha256,
         dram_lib=Path(ns.dram_lib).resolve(),
+        dram_lib_sha256=ns.dram_lib_sha256,
         phyfw_obj=Path(ns.phyfw_obj).resolve(),
+        phyfw_obj_sha256=ns.phyfw_obj_sha256,
         gate=Path(ns.gate).resolve(),
+        gate_sha256=ns.gate_sha256,
         out=Path(ns.out).parent.resolve() / Path(ns.out).name,
         expected_digests=dict(ns.expect_digest),
     )

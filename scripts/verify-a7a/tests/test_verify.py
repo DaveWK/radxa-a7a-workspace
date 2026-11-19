@@ -149,8 +149,11 @@ def make_args(
         baseline=baseline,
         baseline_sums_sha256=baseline_sums_sha256 or sha256_of(baseline / "SHA256SUMS"),
         dram_lib=tmp / "libdram-a733.a",
+        dram_lib_sha256=sha256_of(tmp / "libdram-a733.a"),
         phyfw_obj=tmp / "libdram",
+        phyfw_obj_sha256=sha256_of(tmp / "libdram"),
         gate=gate,
+        gate_sha256=sha256_of(gate) if gate.is_file() else ZERO,
         out=out,
         expected_digests={name: ZERO for name in verify.DIGEST_NAMES},
     )
@@ -254,8 +257,9 @@ class FakeHarness(verify.Harness):
         # Neither the fake build stages nor the external Python gate need Cargo.
         return []
 
-    def prepare_output(self):
+    def prepare_output(self, staged):
         self.args.out.mkdir(mode=0o700)
+        (staged / "inputs").rename(self.args.out / "inputs")
 
 
 class DirtyHarness(FakeHarness):
@@ -396,10 +400,16 @@ class HarnessRegressionTest(unittest.TestCase):
             ZERO,
             "--dram-lib",
             "rel-lib",
+            "--dram-lib-sha256",
+            ZERO,
             "--phyfw-obj",
             "rel-phy",
+            "--phyfw-obj-sha256",
+            ZERO,
             "--gate",
             "rel-gate",
+            "--gate-sha256",
+            ZERO,
             "--out",
             "rel-out",
             "--expect-digest",
@@ -423,7 +433,10 @@ class HarnessRegressionTest(unittest.TestCase):
         )
         harness = FakeHarness(self.args(gate=gate), real_gate=True)
         self.assertEqual(harness.check_paths(), [])
-        harness.prepare_output()
+        staged = self.tmp / "staged"
+        staged.mkdir()
+        harness.snapshot_inputs(staged / "inputs")
+        harness.prepare_output(staged)
         result = harness.run_gate()
         self.assertFalse(result.ok)
         self.assertEqual(result.returncode, 1)
@@ -438,7 +451,7 @@ class HarnessRegressionTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual(FakeHarness(self.args(gate=gate), real_gate=True).run(), 0)
-        recorded = ast.literal_eval((self.tmp / "recording-gate.py.argv").read_text())
+        recorded = ast.literal_eval((self.out / "inputs" / "gate.py.argv").read_text())
         self.assertEqual(recorded[1], str(self.source))
         self.assertEqual(recorded[2], git_head(self.source))
         self.assertEqual(recorded[3], git_head(self.source))

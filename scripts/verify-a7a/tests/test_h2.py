@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Drive the real CLI entry point with small, controlled tool outputs."""
 
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import hashlib
 import importlib.util
 import io
@@ -73,6 +73,9 @@ class BenchTools(verify.SubprocessRunner):
         self.objcopies = []
         self.paths = []
         self.test_launches = []
+        self.gate_launches = []
+        self.build_inputs = []
+        self.linked_marker = None
 
     @staticmethod
     def response(argv, cwd, rc=0, stdout="", stderr=""):
@@ -89,6 +92,8 @@ class BenchTools(verify.SubprocessRunner):
             self.git_envs.append(dict(env))
         if cmd.startswith("suite-"):
             self.test_launches.append(Path(argv[0]))
+        if cmd.startswith("python"):
+            self.gate_launches.append(Path(argv[2]))
         if cmd == "git" or cmd.startswith("python") or cmd.startswith("suite-"):
             return super().run(argv, cwd, env, log)
         kwargs = {}
@@ -119,6 +124,16 @@ class BenchTools(verify.SubprocessRunner):
                 build.mkdir(parents=True, exist_ok=True)
                 (build / "intermediate").write_bytes(b"cargo intermediate")
             if argv[1] == "build":
+                if b.capture_build_inputs:
+                    archive = Path(env["A733_DRAM_LIB"])
+                    phy = Path(env["A733_PHY_FW_OBJ"])
+                    self.build_inputs.append(
+                        (archive, archive.read_bytes(), phy, phy.read_bytes())
+                    )
+                    if self.linked_marker is None:
+                        linked = b.root / "linked-fixture"
+                        b.host_command("cc", b.root / "link.c", archive, "-o", linked)
+                        self.linked_marker = b.host_command(linked).strip()
                 self.row = log.stem
                 if self.row.startswith("negative-"):
                     kwargs.update(
@@ -264,6 +279,14 @@ class CliTest(unittest.TestCase):
             (self.gate, b"print('fixture gate')\n"),
         ):
             path.write_bytes(content)
+        self.input_digests = {
+            name: digest(path.read_bytes())
+            for name, path in (
+                ("dram-lib", self.dram_lib),
+                ("phyfw-obj", self.phyfw),
+                ("gate", self.gate),
+            )
+        }
         self.images = {
             f"bt0-{name}.bin": (
                 media() + name.encode() if "-fel" not in name else name.encode()
@@ -286,6 +309,7 @@ class CliTest(unittest.TestCase):
         self.wrong_toolchain = False
         self.diagnostic_suffix = ""
         self.before_first_build = None
+        self.capture_build_inputs = False
 
     def pin_fixture_tools(self):
         spec = tomllib.loads((self.source / "rust-toolchain.toml").read_text())[
@@ -327,6 +351,17 @@ class CliTest(unittest.TestCase):
             ["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True
         ).stdout.strip()
 
+    def host_command(self, *argv, source=None):
+        return subprocess.run(
+            argv,
+            cwd=self.root,
+            env={**os.environ, "TMPDIR": str(self.root)},
+            input=source,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
     def commit(self, root):
         self.git(root, "init", "-q")
         self.git(root, "add", ".")
@@ -348,7 +383,7 @@ class CliTest(unittest.TestCase):
             lines.append(f"{digest(content)}  {name}\n")
         self.manifest.write_text("".join(lines), encoding="ascii")
 
-    def invoke(self, env=None):
+    def invoke(self, env=None, *, omit_digest=None):
         sha = self.git(self.source, "rev-parse", "HEAD")
         argv = [
             "--source",
@@ -374,6 +409,12 @@ class CliTest(unittest.TestCase):
             argv.extend(
                 ["--expect-digest", f"{name}={digest(self.images[f'bt0-{name}.bin'])}"]
             )
+        # The same fixture drives the old real entry point, whose parser did
+        # not accept these options, when collecting red-at-base evidence.
+        if "gate_sha256" in verify.Config.__annotations__:
+            for name, value in self.input_digests.items():
+                if name != omit_digest:
+                    argv.extend([f"--{name}-sha256", value])
         self.tools = BenchTools(self)
         with ExitStack() as stack:
             stack.enter_context(
@@ -601,6 +642,110 @@ class CliTest(unittest.TestCase):
         self.assert_clean_git_refused_without_build(
             "source tracked path has the wrong type"
         )
+
+    def assert_identity_refused_without_build(self, name):
+        self.check(1, f"{name} SHA256")
+        self.assertEqual(self.tools.cargo_envs, [])
+        self.assertEqual(self.tools.gate_launches, [])
+        self.assertFalse(self.out.exists())
+
+    def test_gate_with_different_sha256_refused(self):
+        self.gate.write_bytes(b"print('stale gate still exits zero')\n")
+        self.assert_identity_refused_without_build("gate")
+
+    def make_archive(self, name, marker):
+        obj = self.root / f"{name}.o"
+        archive = self.root / f"{name}.a"
+        self.host_command(
+            "cc",
+            "-x",
+            "c",
+            "-c",
+            "-o",
+            obj,
+            "-",
+            source=f'const char *marker(void) {{ return "{marker}"; }}\n',
+        )
+        self.host_command("ar", "rcs", archive, obj)
+        return archive.read_bytes()
+
+    def test_byte_flipped_dram_archive_refused(self):
+        data = bytearray(self.make_archive("original", "verified archive"))
+        self.input_digests["dram-lib"] = digest(data)
+        data[-1] ^= 1
+        self.dram_lib.write_bytes(data)
+        self.assert_identity_refused_without_build("dram-lib")
+
+    def test_phy_object_with_different_sha256_refused(self):
+        self.phyfw.write_bytes(b"stale PHY object")
+        self.assert_identity_refused_without_build("phyfw-obj")
+
+    def test_snapshot_changed_before_readback_refused(self):
+        file_digest = hashlib.file_digest
+
+        def corrupt_snapshot(stream, algorithm):
+            Path(stream.name).write_bytes(b"corrupt snapshot")
+            return file_digest(stream, algorithm)
+
+        with patch.object(hashlib, "file_digest", corrupt_snapshot):
+            self.check(1, "dram-lib snapshot SHA256 changed")
+        self.assertEqual(self.tools.cargo_envs, [])
+        self.assertFalse(self.out.exists())
+
+    def test_input_replacements_do_not_reach_build_or_gate(self):
+        self.dram_lib.write_bytes(self.make_archive("original", "verified archive"))
+        self.input_digests["dram-lib"] = digest(self.dram_lib.read_bytes())
+        (self.root / "link.c").write_text(
+            "#include <stdio.h>\nconst char *marker(void);\n"
+            "int main(void) { puts(marker()); return 0; }\n"
+        )
+        archive, phy, gate = (
+            path.read_bytes() for path in (self.dram_lib, self.phyfw, self.gate)
+        )
+        originals = (
+            (self.dram_lib, self.make_archive("replacement", "stale archive")),
+            (self.phyfw, b"replacement PHY"),
+            (self.gate, b"print('replacement gate')\n"),
+        )
+
+        def replace_inputs():
+            for original, replacement in originals:
+                tmp = original.with_suffix(".new")
+                tmp.write_bytes(replacement)
+                tmp.replace(original)
+
+        self.capture_build_inputs = True
+        self.before_first_build = replace_inputs
+        self.check(0, "VERDICT: PASS")
+        archive_path = self.out / "inputs" / "libdram-a733.a"
+        phy_path = self.out / "inputs" / "phyfw.o"
+        gate_path = self.out / "inputs" / "gate.py"
+        with self.subTest(consumer="Cargo linker and PHY extractor"):
+            self.assertEqual(self.tools.linked_marker, "verified archive")
+            self.assertTrue(self.tools.build_inputs)
+            self.assertEqual(
+                set(self.tools.build_inputs), {(archive_path, archive, phy_path, phy)}
+            )
+        with self.subTest(consumer="Python gate"):
+            gate_log = (self.out / "gate.log").read_text()
+            self.assertIn("fixture gate", gate_log)
+            self.assertNotIn("replacement gate", gate_log)
+            self.assertEqual(self.tools.gate_launches, [gate_path])
+            self.assertEqual(gate_path.read_bytes(), gate)
+        for original, replacement in originals:
+            self.assertEqual(original.read_bytes(), replacement)
+
+    def test_missing_external_input_sha256_arguments_refused(self):
+        for name in self.input_digests:
+            with self.subTest(option=name):
+                self.out = self.root / f"out-missing-{name}"
+                errors = io.StringIO()
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+                    self.invoke(omit_digest=name)
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn(f"--{name}-sha256", errors.getvalue())
+                self.assertEqual(self.tools.cargo_invocations, [])
+                self.assertFalse(self.out.exists())
 
     def test_inherited_build_dir_cannot_put_intermediates_in_source(self):
         spill = self.source / "intermediates"
