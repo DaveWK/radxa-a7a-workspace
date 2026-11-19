@@ -566,6 +566,31 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.tools.cargo_invocations, [])
         self.assertFalse(self.out.exists())
 
+    def test_source_gitlink_refused_before_cargo(self):
+        self.copy_oreboot()
+        rel = f"{SUITE}/linked-dependency"
+        (self.source / rel).mkdir()
+        oid = self.git(self.source, "rev-parse", "HEAD")
+        self.git(
+            self.source, "update-index", "--add", "--cacheinfo", f"160000,{oid},{rel}"
+        )
+        self.git(
+            self.source,
+            "-c",
+            "user.name=DaveWK",
+            "-c",
+            "user.email=13626476+DaveWK@users.noreply.github.com",
+            "commit",
+            "-qm",
+            "fixture gitlink",
+        )
+        self.assertEqual(
+            self.git(self.source, "ls-files", "-s", "--", rel), f"160000 {oid} 0\t{rel}"
+        )
+        self.assert_clean_git_refused_without_build(
+            f"source contains a Git submodule (gitlink): {rel!r}"
+        )
+
     def test_sparse_checkout_omitting_real_suite_test_refused(self):
         path = self.copy_oreboot()
         self.assertTrue(path.is_file())

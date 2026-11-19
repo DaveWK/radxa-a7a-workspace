@@ -99,7 +99,9 @@ required baseline image, suite directory, build input or gate is a failure.
 `--source-sha`, with the base as an ancestor. Both that tree and the workspace
 that runs the harness must be clean, full Git worktrees. Sparse checkout,
 skip-worktree and assume-unchanged entries, and missing or wrong-type tracked
-paths are refused. Both checkouts are rechecked before PASS. Input checks
+paths are refused. The source checkout must not contain any Git submodule
+entries (gitlinks); the harness does not recurse into submodules. Both
+checkouts are rechecked before PASS. Input checks
 finish before creating the output directory exclusively (0700); even an
 existing empty output is refused. Before creating staging or running Cargo,
 the harness rejects `--out` if it resolves to a path overlapping the workspace,

@@ -792,7 +792,9 @@ class Harness:
         root = self.tree_git(tree, "rev-parse", "--show-toplevel")
         return root.returncode == 0 and root.stdout.rstrip("\n") == str(tree)
 
-    def worktree_error(self, tree: Path, label: str) -> str | None:
+    def worktree_error(
+        self, tree: Path, label: str, *, allow_gitlinks: bool = False
+    ) -> str | None:
         for key in ("core.sparseCheckout", "core.sparseCheckoutCone"):
             setting = self.tree_git(tree, "config", "--type=bool", "--get-all", key)
             if setting.returncode not in (0, 1):
@@ -828,6 +830,8 @@ class Harness:
                 return f"{label} has an assume-unchanged entry: {name!r}"
             if stage != "0" or mode not in TRACKED_PATH_TYPES:
                 return f"{label} has an unexpected index entry: {name!r}"
+            if mode == "160000" and not allow_gitlinks:
+                return f"{label} contains a Git submodule (gitlink): {name!r}"
             try:
                 actual_type = stat.S_IFMT((tree / name).lstat().st_mode)
             except FileNotFoundError:
@@ -860,7 +864,7 @@ class Harness:
                 f"workspace HEAD changed during the run: {actual} (was {self.workspace_head})"
             ]
         self.workspace_head = actual
-        error = self.worktree_error(self.workspace, "workspace")
+        error = self.worktree_error(self.workspace, "workspace", allow_gitlinks=True)
         return [error] if error else []
 
     def _check_source(self, errors: list[str]) -> None:
