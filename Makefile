@@ -14,7 +14,8 @@
 #   make rpms          the cubie-a7a-* SRPMs and RPMs -> fresh run in out/fedora/rpmbuild/
 #                      sealed run path noted in out/fedora/run (for operators)
 #   make fedora-image  Fedora 45 image with firmware at LBA 256 and verification
-#                      sidecars -> out/image/; self-check using the build receipt
+#                      sidecars -> out/image/; uses a private firmware build
+#                      and self-checks against the build receipt
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
 #   make test          host tests (oreboot board crates, scripts)
 #   make vendor        fetch the vendor DRAM library object (measurement builds
@@ -123,6 +124,8 @@ ifneq ($(origin DRAM_FIRMWARE_IDENTITY),undefined)
 $(error DRAM_FIRMWARE_IDENTITY is derived from VENDOR_DRAM and DRAM_MHZ; do not set it directly)
 endif
 override DRAM_FIRMWARE_IDENTITY := $(call dram-tag,$(BT0_DRAM))-$(BT0_PROFILE)
+sd-bt0-env = -u A7A_PROFILE -u RUSTUP_TOOLCHAIN -u RUSTFLAGS \
+	$(if $(filter no,$(BT0_DRAM)),A7A_PROFILE=$(BT0_PROFILE),$(call dram-env,$(BT0_DRAM)))
 # Each DRAM mode and profile gets its own FEL build and output directory, so
 # two builds never share or overwrite the same intermediate or bundle.
 override FEL_TAG_MODE := $(call dram-tag,$(FEL_BT0_DRAM))
@@ -157,9 +160,10 @@ define check-bt0-size
 endef
 
 # bt0_build <features> <target dir> <output .bin> <DRAM path> <env assignments>
+#           [<Cargo command>]
 define bt0_build
 	cd $(BOARD)/bt0 && env $(5) CARGO_TARGET_DIR=$(2) \
-		$(CARGO) build --release --locked $(call dram-cargo,$(4)) $(if $(1),--features "$(1)")
+		$(or $(6),$(CARGO)) build --release --locked $(call dram-cargo,$(4)) $(if $(1),--features "$(1)")
 	$(OBJCOPY) -O binary $(2)/armv7a-none-eabi/release/oreboot-cubie-a7a-bt0 $(3)
 	$(call check-bt0-size,$(3))
 endef
@@ -205,7 +209,7 @@ dtb: check-sources
 	$(MAKE) -C $(DTS) OUT=$(DTB) DTB_ORIGIN=firmware
 
 bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(OUT)/oreboot
-	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM),$(strip -u A7A_PROFILE $(if $(filter no,$(BT0_DRAM)),A7A_PROFILE=$(BT0_PROFILE),$(call dram-env,$(BT0_DRAM)))))
+	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM),$(strip $(sd-bt0-env)),python3 -I "$(TOP)/scripts/sd-bt0-cargo.py" "$(OUT)/oreboot")
 
 $(FEL_BUILD):
 	mkdir -p $@
@@ -294,17 +298,23 @@ endif
 # SD card, and the same image on a USB disk is the root for the FEL boot).
 # mkdevcard.sh only writes to fresh paths under fedora/build/ (gitignored
 # there); keep the final basename there so the checksum rows survive the move.
-STAMP := $(shell date +%Y%m%d-%H%M%S)
+override STAMP := $(shell date +%Y%m%d-%H%M%S-%N)
 IMG_BUILD = $(FEDORA)/build/image-$(STAMP)
 STAGED_IMAGE = $(IMG_BUILD)/package/$(notdir $(IMAGE))
-fedora-image: firmware fel-image
+# Claim a fresh output directory before building any firmware intermediates.
+# The standalone 'firmware' target can never replace the bytes used here.
+override DEVCARD_FW_BUILD := $(abspath $(OUT))/.devcard-firmware-$(STAMP)
+fedora-image: fel-image
+	$(foreach var,FW_OUT TGT DTB LIBDRAM_A BT0_BIN MAIN_BIN EDK2_FD,$(if $(filter file,$(origin $(var))),,$(error fedora-image refuses $(var) override (origin: $(origin $(var))))))
 	mkdir -p "$(dir $(IMAGE))" "$(FEDORA)/build" "$(DEVCARD_SCRATCH)"
+	mkdir -- "$(DEVCARD_FW_BUILD)"
+	$(MAKE) OUT="$(DEVCARD_FW_BUILD)" firmware
 	scripts/binfmt-aarch64.sh
 	set -eu; \
 		$(build-rpm-run); \
 		WORK="$(IMG_BUILD)" OUT="$(STAGED_IMAGE)" FEDORA_RELEASE="$(FEDORA_RELEASE)" \
 			FIRMWARE_DTB_VERSION="$(DTB_VERSION)" DRAM_FIRMWARE_IDENTITY="$(DRAM_FIRMWARE_IDENTITY)" \
-			"$(FEDORA)/fedora/mkdevcard.sh" "$(FW_OUT)/firmware.bin" "$$run"; \
+			"$(FEDORA)/fedora/mkdevcard.sh" "$(DEVCARD_FW_BUILD)/firmware/firmware.bin" "$$run"; \
 		for suffix in '' .devcard-manifest.json .build-receipt.json .sha256; do \
 			mv -fT -- "$(STAGED_IMAGE)$$suffix" "$(IMAGE)$$suffix"; \
 		done; \
