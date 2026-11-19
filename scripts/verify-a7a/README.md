@@ -27,16 +27,28 @@ two build inputs are external private artifacts and are never vendored here.
 
 ## What it checks
 
-- **Matrix**: the 38 OLD feature sets built with `--no-default-features`, the 12
-  valid NEW default-feature sets, and the one `lab-drift` lab entry built with
-  `--no-default-features --features 'fel bl-mission dram-lab drift-log'`
-  (51 positive `bt0` builds), plus the 11 `main` sets. OLD and NEW are compared
-  with the baseline; `lab-drift` is labelled new with no historical baseline.
-  The historical OLD/NEW differences stay visible in the report.
-- **Negative contract**: `cargo build --offline --release --features
-  'fel dram-lab drift-log'` (default features plus a lab feature) must fail
-  with the `blobfree` feature-conflict `compile_error`, not for an arbitrary
-  reason.
+- **Matrix**: the 38 OLD feature sets built with `--no-default-features`, the
+  17 NEW default-feature sets (12 with a retained baseline, plus the new
+  `default+full-speed` and the `default`/`fel` 800 and 400 MHz profile rows,
+  which have no historical baseline and are labelled as such), and the two `lab`
+  entries (`lab-drift`, `lab-full-speed`) built with `--no-default-features`
+  (57 positive `bt0` builds), plus the 11 `main` sets. OLD and NEW are compared
+  with the baseline; the lab and new no-baseline rows are labelled new. The
+  historical OLD/NEW differences stay visible in the report. Every `main` image
+  must be byte-identical to the baseline.
+- **Negative contract**: each negative row must fail with its own exact
+  `compile_error` diagnostic, not for an arbitrary reason. The rows are the
+  default feature plus `dram-lab`, `dramlib` or `blobless` (the `blobfree`
+  conflict), the original `fel dram-lab drift-log` invalid positive, and
+  `fel` plus `spinor`.
+- **Images by content**: every produced image is checked, not trusted from
+  `objcopy`'s exit status. The primary must be nonempty and within its class
+  limit (eGON media `bt0` 0x4A000 per `scripts/mkimage.py`; FEL `bt0` 0x4F000
+  per `bt0/build.rs`; `main` `MAIN_MAX_SIZE` read from the source). Media rows
+  must carry the raw eGON.BT0 header (magic, header size, media run address and
+  the unfilled length/checksum placeholders). Every `.dram`/`.phyfw` extension
+  is extracted, validated nonempty (including lab rows with no baseline) and
+  compared with the baseline when one exists.
 - **Host suites**: `dram`, `fastboot`, `common`, `src/lib/bootlog` and
   `src/lib/dram-train`. The expected test binaries are taken from
   `cargo test --no-run --message-format=json` and reconciled with the binaries

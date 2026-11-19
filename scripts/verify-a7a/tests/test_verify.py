@@ -162,7 +162,12 @@ def green_matrix() -> verify.MatrixResult:
         new_total=len(verify.NEW_ENTRIES),
         new_ok=len(verify.NEW_ENTRIES),
         new_identical=0,
-        new_differ=len(verify.NEW_ENTRIES),
+        new_differ=12,
+        new_nobaseline=sum(
+            1
+            for _tag, _profile, _features, required in verify.NEW_ENTRIES
+            if not required
+        ),
         lab_total=len(verify.LAB_ENTRIES),
         lab_ok=len(verify.LAB_ENTRIES),
         main_total=len(verify.MAIN_SETS),
@@ -172,9 +177,13 @@ def green_matrix() -> verify.MatrixResult:
     )
 
 
-def green_negative() -> verify.NegativeResult:
-    return verify.NegativeResult(
-        ok=True, returncode=1, diagnostic_found=True, detail="expected diagnostic"
+def green_negative() -> verify.NegativesResult:
+    return verify.NegativesResult(
+        ok=True,
+        results=[
+            verify.NegativeResult(tag, True, 1, expected, True, "expected diagnostic")
+            for tag, _features, _no_default, expected in verify.NEGATIVE_ENTRIES
+        ],
     )
 
 
@@ -826,17 +835,36 @@ class ImageValidationTest(unittest.TestCase):
 
 
 class PureLogicTest(unittest.TestCase):
-    def test_negative_contract_requires_the_expected_diagnostic(self):
-        ok, _ = verify.negative_contract_ok(1, "error: " + verify.CONFLICT_DIAGNOSTIC)
+    def test_negative_contract_requires_the_exact_diagnostic(self):
+        ok, _ = verify.negative_contract_ok(
+            1, "error: " + verify.CONFLICT_DIAGNOSTIC, verify.CONFLICT_DIAGNOSTIC
+        )
         self.assertTrue(ok)
 
-    def test_negative_contract_rejects_success(self):
-        ok, _ = verify.negative_contract_ok(0, "")
+    def test_negative_contract_rejects_a_partial_diagnostic(self):
+        partial = (
+            "another DRAM backend or a lab feature together with the default "
+            "feature `blobfree`"
+        )
+        ok, _ = verify.negative_contract_ok(
+            1, "error: " + partial, verify.CONFLICT_DIAGNOSTIC
+        )
         self.assertFalse(ok)
 
-    def test_negative_contract_rejects_arbitrary_failure(self):
-        ok, _ = verify.negative_contract_ok(1, "error: unused manifest key")
+    def test_negative_contract_rejects_success(self):
+        ok, _ = verify.negative_contract_ok(0, "", verify.CONFLICT_DIAGNOSTIC)
         self.assertFalse(ok)
+
+    def test_negative_contract_rejects_an_arbitrary_failure(self):
+        ok, _ = verify.negative_contract_ok(
+            1, "error: unused manifest key", verify.CONFLICT_DIAGNOSTIC
+        )
+        self.assertFalse(ok)
+
+    def test_matrix_ok_requires_main_equality(self):
+        self.assertTrue(verify.matrix_ok([], 11, 11, 11))
+        self.assertFalse(verify.matrix_ok([], 11, 11, 10))
+        self.assertFalse(verify.matrix_ok(["main-gmac"], 11, 10, 10))
 
     def test_dram_section_detection_allows_readelf_indent(self):
         self.assertTrue(
@@ -887,7 +915,13 @@ class PureLogicTest(unittest.TestCase):
     def test_required_baseline_count(self):
         self.assertEqual(
             len(verify.required_baseline_names()),
-            len(verify.OLD_SETS) + len(verify.NEW_ENTRIES) + len(verify.MAIN_SETS),
+            len(verify.OLD_SETS)
+            + sum(
+                1
+                for _tag, _profile, _features, required in verify.NEW_ENTRIES
+                if required
+            )
+            + len(verify.MAIN_SETS),
         )
 
     def test_read_main_max(self):

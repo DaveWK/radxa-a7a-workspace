@@ -108,34 +108,46 @@ OLD_SETS = (
 )
 
 # NEW: the default feature set (the blob-free boot), per medium and profile.
-# (tag, A7A_PROFILE or None, features)
+# (tag, A7A_PROFILE or None, features, baseline required). The full-speed and
+# 800/400 profile rows are new at this source: they have no historical baseline
+# and are labelled as such.
 NEW_ENTRIES = (
-    ("default", None, ()),
-    ("default-fel", None, ("fel",)),
-    ("default@2400", "2400", ()),
-    ("default-fel@2400", "2400", ("fel",)),
-    ("default-emmc", None, ("emmc",)),
-    ("default-spinor", None, ("spinor",)),
-    ("default-otp", None, ("otp",)),
-    ("default-fel+fastboot", None, ("fel", "fastboot")),
+    ("default", None, (), True),
+    ("default-fel", None, ("fel",), True),
+    ("default@2400", "2400", (), True),
+    ("default-fel@2400", "2400", ("fel",), True),
+    ("default-emmc", None, ("emmc",), True),
+    ("default-spinor", None, ("spinor",), True),
+    ("default-otp", None, ("otp",), True),
+    ("default-fel+fastboot", None, ("fel", "fastboot"), True),
     (
         "default-fel+fastboot+fastboot-nor-write",
         None,
         ("fel", "fastboot", "fastboot-nor-write"),
+        True,
     ),
     (
         "default-fel+fastboot+fastboot-emmc-write",
         None,
         ("fel", "fastboot", "fastboot-emmc-write"),
+        True,
     ),
-    ("default-wr-r1", None, ("wr-r1",)),
-    ("default-fel+wr-r1", None, ("fel", "wr-r1")),
+    ("default-wr-r1", None, ("wr-r1",), True),
+    ("default-fel+wr-r1", None, ("fel", "wr-r1"), True),
+    ("default+full-speed", None, ("full-speed",), False),
+    ("default@800", "800", (), False),
+    ("default-fel@800", "800", ("fel",), False),
+    ("default@400", "400", (), False),
+    ("default-fel@400", "400", ("fel",), False),
 )
 
-# LAB: the lab entry that replaces the invalid positive. It has no historical
-# baseline image and is labelled as new. The lab backend needs bl-mission: with
-# --no-default-features and no lab backend selected the build is not equivalent.
-LAB_ENTRIES = (("lab-drift", ("fel", "bl-mission", "dram-lab", "drift-log")),)
+# LAB: lab entries with no historical baseline image, labelled as new. The lab
+# backend needs bl-mission: with --no-default-features and no lab backend
+# selected the build is not equivalent.
+LAB_ENTRIES = (
+    ("lab-drift", ("fel", "bl-mission", "dram-lab", "drift-log")),
+    ("lab-full-speed", ("fel", "bl-mission", "dram-lab", "full-speed")),
+)
 
 MAIN_SETS = (
     "gmac pcie usb",
@@ -255,6 +267,7 @@ class MatrixResult:
     new_ok: int
     new_identical: int
     new_differ: int
+    new_nobaseline: int
     lab_total: int
     lab_ok: int
     main_total: int
@@ -266,10 +279,18 @@ class MatrixResult:
 
 @dataclass
 class NegativeResult:
+    tag: str
     ok: bool
     returncode: int
+    expected: str
     diagnostic_found: bool
     detail: str
+
+
+@dataclass
+class NegativesResult:
+    ok: bool
+    results: list[NegativeResult]
 
 
 @dataclass
@@ -377,8 +398,9 @@ def required_baseline_names() -> list[str]:
     for set_name in OLD_SETS:
         tag = "old-" + (set_name.replace(" ", "+") or "default")
         names.append(f"bt0-{tag}.bin")
-    for tag, _profile, _features in NEW_ENTRIES:
-        names.append(f"bt0-{tag}.bin")
+    for tag, _profile, _features, baseline_required in NEW_ENTRIES:
+        if baseline_required:
+            names.append(f"bt0-{tag}.bin")
     for set_name in MAIN_SETS:
         tag = set_name.replace(" ", "+") or "none"
         names.append(f"main-{tag}.bin")
@@ -720,9 +742,9 @@ class Harness:
                 list(features),
                 no_default=False,
                 section="new",
-                baseline_required=True,
+                baseline_required=baseline_required,
             )
-            for tag, profile, features in NEW_ENTRIES
+            for tag, profile, features, baseline_required in NEW_ENTRIES
         ]
         lab = [
             self.build_bt0(
@@ -763,6 +785,9 @@ class Harness:
             ),
             new_differ=sum(
                 build.ok and build.baseline.startswith("DIFFERS") for build in new
+            ),
+            new_nobaseline=sum(
+                1 for tag, _profile, _features, required in NEW_ENTRIES if not required
             ),
             lab_total=len(lab),
             lab_ok=sum(build.ok for build in lab),
@@ -895,7 +920,7 @@ class Harness:
                 warnings=warnings,
             )
         baseline, detail = self._compare_baseline(
-            f"bt0-{tag}", bin_path, ext_path if has_dram else None, baseline_required
+            f"bt0-{tag}", bin_path, ext_path, baseline_required
         )
         if baseline == "missing baseline":
             return BuildResult(
@@ -1082,32 +1107,24 @@ class Harness:
 
     # -- negative contract -------------------------------------------------
 
-    def run_negative(self) -> NegativeResult:
-        env = dict(self.env)
-        env["CARGO_TARGET_DIR"] = str(self.args.out / "target" / "negative")
-        log = (
-            self.args.out
-            / "matrix"
-            / "logs"
-            / "negative-default-fel+dram-lab+drift-log.log"
-        )
-        res = self.runner.run(
-            [
-                "cargo",
-                "build",
-                "--offline",
-                "--release",
-                "--features",
-                "fel dram-lab drift-log",
-            ],
-            self.args.source / BT0_DIR,
-            env,
-            log,
-        )
-        ok, detail = negative_contract_ok(res.returncode, res.output)
-        return NegativeResult(
-            ok, res.returncode, CONFLICT_DIAGNOSTIC in res.output, detail
-        )
+    def run_negative(self) -> NegativesResult:
+        results: list[NegativeResult] = []
+        for tag, features, no_default, expected in NEGATIVE_ENTRIES:
+            env = dict(self.env)
+            env["CARGO_TARGET_DIR"] = str(self.args.out / "target" / "negative")
+            argv = ["cargo", "build", "--offline", "--locked", "--release"]
+            if no_default:
+                argv.append("--no-default-features")
+            argv += ["--features", " ".join(features)]
+            log = self.args.out / "matrix" / "logs" / f"negative-{tag}.log"
+            res = self.runner.run(argv, self.args.source / BT0_DIR, env, log)
+            ok, detail = negative_contract_ok(res.returncode, res.output, expected)
+            results.append(
+                NegativeResult(
+                    tag, ok, res.returncode, expected, expected in res.output, detail
+                )
+            )
+        return NegativesResult(all(result.ok for result in results), results)
 
     # -- host suites -------------------------------------------------------
 
@@ -1294,7 +1311,7 @@ class Harness:
     def print_report(
         self,
         matrix: MatrixResult,
-        negative: NegativeResult,
+        negative: NegativesResult,
         suites: SuitesResult,
         gate: GateResult,
         digests: DigestsResult,
@@ -1312,7 +1329,8 @@ class Harness:
         )
         print(
             f"NEW: {matrix.new_ok}/{matrix.new_total} built; "
-            f"identical to base {matrix.new_identical}, differ {matrix.new_differ}"
+            f"identical to base {matrix.new_identical}, differ {matrix.new_differ}, "
+            f"no baseline {matrix.new_nobaseline}"
         )
         print(f"LAB: {matrix.lab_ok}/{matrix.lab_total} built; no historical baseline")
         positive = matrix.old_ok + matrix.new_ok + matrix.lab_ok
@@ -1335,10 +1353,14 @@ class Harness:
         else:
             print("none")
         print()
-        print("=== negative feature-contract check ===")
-        print(f"exit: {negative.returncode} (expected nonzero)")
-        print("diagnostic: " + ("found" if negative.diagnostic_found else "NOT FOUND"))
-        print(negative.detail)
+        print("=== negative feature-contract checks ===")
+        for result in negative.results:
+            print(
+                f"{result.tag}: exit {result.returncode} (expected nonzero); "
+                f"diagnostic "
+                f"{'found' if result.diagnostic_found else 'NOT FOUND'}; "
+                f"{result.detail}"
+            )
         print()
         print("=== host suites ===")
         for result in suites.results:
