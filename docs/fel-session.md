@@ -64,6 +64,21 @@ window offline, without another FEL command:
 python3 -I scripts/fel_session.py verify-handover --receipt "$run/receipt.json"
 ```
 
+On the cached path, resume never exits 0. After the Entry 2 ACK it waits
+up to 60 seconds for the board to re-enumerate in FEL, seals the serial
+slice from Entry 2 to that moment in the receipt (`handover_end`,
+`handover_sha256`), and exits with one of these normal outcomes:
+
+| Resume exit | Receipt `reconnect` | Meaning |
+|---:|---|---|
+| 3 | `{"exit": 0, "outcome": "verified"}` | The board is already back in FEL (a short run) |
+| 5 | `{"exit": 5, "outcome": "lost"}` | The board left FEL and had not returned within 60 seconds; `main` may still be running |
+
+Only these two outcomes permit `verify-handover`; its exit 0 is the
+confirmed handover. Any other resume exit, or any other `reconnect`
+value, cannot be confirmed. Each preflight needs a new `--state` path
+(and a new receipt): the session refuses an existing state file.
+
 Keep the preflight caller open until it returns ready, and keep the resume
 caller open for the rest of the transaction. If either disconnects at its
 stage, the guardian cancels and reaps its active selector group before
