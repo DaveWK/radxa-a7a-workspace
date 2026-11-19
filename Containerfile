@@ -13,8 +13,8 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu binutils llvm \
         acpica-tools dtc cpp curl aria2 xz zstd tar cpio openssl file which \
         findutils diffutils util-linux e2fsprogs dosfstools mtools \
-        rpm-build redhat-rpm-config systemd-rpm-macros dnf5 \
-        python3-libselinux qemu-user-static-aarch64 systemd \
+        rpm-build redhat-rpm-config systemd-rpm-macros createrepo_c dnf5 \
+        python3-libselinux python3-rpm qemu-user-static-aarch64 systemd \
         libusb1-devel pkgconf-pkg-config \
     && dnf clean all
 

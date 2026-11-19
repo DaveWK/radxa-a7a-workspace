@@ -12,7 +12,7 @@
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
 #   make fel-boot      workspace maintenance boot; requires FEL_PORT, FEL_SERIAL_LOG
 #   make rpms          the cubie-a7a-* SRPMs and RPMs -> fresh run in out/fedora/rpmbuild/
-#                      sealed run path recorded in out/fedora/run
+#                      sealed run path noted in out/fedora/run (for operators)
 #   make fedora-image  Fedora 45 image with firmware at LBA 256 and verification
 #                      sidecars -> out/image/; self-check using the build receipt
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
@@ -118,7 +118,11 @@ dram-env = $(if $(filter yes,$(1)),A733_DRAM_LIB=$(LIBDRAM_A)) $(if $(filter phy
 dram-dep = $(if $(filter yes,$(1)),$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),$(DRAM_LIB))
 dram-tag = $(if $(filter no,$(1)),blobfree,$(if $(filter yes,$(1)),dramlib,phyfw))
 # firmware.bin uses bt0 (BT0_DRAM), not the separate FEL build's profile.
-DRAM_FIRMWARE_IDENTITY ?= $(call dram-tag,$(BT0_DRAM))-$(if $(filter no,$(BT0_DRAM)),$(or $(DRAM_MHZ),1200),2400)
+override BT0_PROFILE := $(if $(filter no,$(BT0_DRAM)),$(or $(DRAM_MHZ),1200),2400)
+ifneq ($(origin DRAM_FIRMWARE_IDENTITY),undefined)
+$(error DRAM_FIRMWARE_IDENTITY is derived from VENDOR_DRAM and DRAM_MHZ; do not set it directly)
+endif
+override DRAM_FIRMWARE_IDENTITY := $(call dram-tag,$(BT0_DRAM))-$(BT0_PROFILE)
 # Each DRAM mode and profile gets its own FEL build and output directory, so
 # two builds never share or overwrite the same intermediate or bundle.
 override FEL_TAG_MODE := $(call dram-tag,$(FEL_BT0_DRAM))
@@ -201,7 +205,7 @@ dtb: check-sources
 	$(MAKE) -C $(DTS) OUT=$(DTB) DTB_ORIGIN=firmware
 
 bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(OUT)/oreboot
-	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM),$(strip $(call dram-env,$(BT0_DRAM))))
+	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM),$(strip -u A7A_PROFILE $(if $(filter no,$(BT0_DRAM)),A7A_PROFILE=$(BT0_PROFILE),$(call dram-env,$(BT0_DRAM)))))
 
 $(FEL_BUILD):
 	mkdir -p $@
@@ -261,8 +265,9 @@ fel-boot:
 	$(fel-profile-check)
 	EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh "$(FEL_OUT)"
 
-rpms: check-sources
-	set -eu; \
+# Keep the sealed run in the caller's shell. The shared file is only a note
+# for operators; another Make invocation is free to replace it at any time.
+define build-rpm-run
 		run=$$(FWREPO="$(FWREPO)" FEDORA_RELEASE="$(FEDORA_RELEASE)" \
 			$(if $(AIC8800_SRC),AIC8800_SRC="$(abspath $(AIC8800_SRC))") \
 			"$(FEDORA)/fedora/build-rpms.sh" "$(OUT)/fedora/rpmbuild"); \
@@ -273,7 +278,17 @@ rpms: check-sources
 		tmp=$$(mktemp "$(RPM_RUN_FILE).XXXXXXXX"); \
 		trap 'rm -f -- "$$tmp"' EXIT; \
 		printf '%s\n' "$$run" > "$$tmp"; \
-		mv -fT -- "$$tmp" "$(RPM_RUN_FILE)"
+		mv -fT -- "$$tmp" "$(RPM_RUN_FILE)"; \
+		trap - EXIT
+endef
+
+# When both are requested, the image's own run also satisfies the RPM goal.
+ifneq ($(filter fedora-image,$(MAKECMDGOALS)),)
+rpms: fedora-image
+else
+rpms: check-sources
+	set -eu; $(build-rpm-run)
+endif
 
 # The Fedora image with this build's firmware at LBA 256 (it boots from the
 # SD card, and the same image on a USB disk is the root for the FEL boot).
@@ -282,11 +297,11 @@ rpms: check-sources
 STAMP := $(shell date +%Y%m%d-%H%M%S)
 IMG_BUILD = $(FEDORA)/build/image-$(STAMP)
 STAGED_IMAGE = $(IMG_BUILD)/package/$(notdir $(IMAGE))
-fedora-image: firmware fel-image rpms
+fedora-image: firmware fel-image
 	mkdir -p "$(dir $(IMAGE))" "$(FEDORA)/build" "$(DEVCARD_SCRATCH)"
 	scripts/binfmt-aarch64.sh
 	set -eu; \
-		IFS= read -r run < "$(RPM_RUN_FILE)"; \
+		$(build-rpm-run); \
 		WORK="$(IMG_BUILD)" OUT="$(STAGED_IMAGE)" FEDORA_RELEASE="$(FEDORA_RELEASE)" \
 			FIRMWARE_DTB_VERSION="$(DTB_VERSION)" DRAM_FIRMWARE_IDENTITY="$(DRAM_FIRMWARE_IDENTITY)" \
 			"$(FEDORA)/fedora/mkdevcard.sh" "$(FW_OUT)/firmware.bin" "$$run"; \
