@@ -27,8 +27,8 @@ import time
 
 SCRIPTS = Path(__file__).resolve().parent
 LOGS = {
-    "3-3.4": "2026-11-18-1725-4g-luckfox.log",
-    "3-6": "2026-11-18-1725-6g-luckfox.log",
+    "3-3.4": "2026-11-19-1033-a7a-4g.log",
+    "3-6": "2026-11-19-1041-a7a-6g.log",
 }
 PORT = re.compile(r"[1-9][0-9]*-[1-9][0-9]*(?:\.[1-9][0-9]*)*")
 EXACT_ID = re.compile(r"\bID=(0x[0-9a-fA-F]+)(?=\s|\(|$)")

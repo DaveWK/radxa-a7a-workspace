@@ -88,9 +88,12 @@ the device. Do not retry an interrupted submission.
 
 ## Capture boundaries
 
-The registered log for `3-3.4` is `2026-11-18-1725-4g-luckfox.log`; for
-`3-6` it is `2026-11-18-1725-6g-luckfox.log`, both under
-`~/src/radxa-a7a/serial-logs/`. No tty or pty is opened. Each cursor records
+The registered log for `3-3.4` is `2026-11-19-1033-a7a-4g.log`; for
+`3-6` it is `2026-11-19-1041-a7a-6g.log`, both under
+`~/src/radxa-a7a/serial-logs/`. These are the USB serial adapter captures
+(4 GB: FTDI FT231X; 6 GB: CH340) that replaced the Luckfox bridge on
+2026-11-19; the per-boot identity gate is the guard against an adapter swap.
+No tty or pty is opened. Each cursor records
 device, inode, offset and SHA256 of the last 4 KiB before that offset (all
 available earlier bytes if shorter). Reads preserve the original anchor and
 advance a second anchor at each observed EOF. A changed inode, shrink below

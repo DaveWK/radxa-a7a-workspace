@@ -1216,7 +1216,7 @@ class GateTests(unittest.TestCase):
         selector = scripts / "xfel-port"
         selector.write_text(SESSION_SELECTOR)
         selector.chmod(0o700)
-        serial = self.root / "src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
+        serial = self.root / "src/radxa-a7a/serial-logs/2026-11-19-1033-a7a-4g.log"
         serial.parent.mkdir(parents=True)
         lease_home = runner / "lease-home"
         lease_home.mkdir()

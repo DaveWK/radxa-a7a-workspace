@@ -229,8 +229,12 @@ class RunnerTests(unittest.TestCase):
         logs = self.home / "src/radxa-a7a/serial-logs"
         logs.mkdir(parents=True)
         self.logs = {}
+        log_names = {
+            "4g": "2026-11-19-1033-a7a-4g.log",
+            "6g": "2026-11-19-1041-a7a-6g.log",
+        }
         for port, board, devnum in (("3-3.4", "4g", 12), ("3-6", "6g", 19)):
-            self.logs[port] = logs / f"2026-11-18-1725-{board}-luckfox.log"
+            self.logs[port] = logs / log_names[board]
             self.logs[port].write_bytes(b"stale serial bytes\n")
             path = self.sysfs / port
             path.mkdir()
