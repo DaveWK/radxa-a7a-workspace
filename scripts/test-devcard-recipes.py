@@ -13,6 +13,11 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 
+
+def stub_bt0(profile):
+    return bytes(4) + b"eGON.BT0" + bytes(8) + profile.encode()
+
+
 # Dispatch through the invoked filename so all four Fedora calls can be checked
 # against one synthetic build's inputs and outputs.
 STUB = """\
@@ -47,7 +52,7 @@ elif tool == "mkdevcard.sh":
     assert len(args) == 2 and args[1] == str(run), args
     assert Path(args[0]).name == "firmware.bin" and Path(args[0]).is_file(), args
     if os.environ.get("TEST_PRIVATE_FIRMWARE"):
-        assert Path(args[0]).read_text() == "invocation firmware", args
+        assert Path(args[0]).read_bytes().endswith(b"invocation firmware"), args
     assert (run / "rpm-snapshot.json").is_file()
     assert os.environ["DRAM_FIRMWARE_IDENTITY"] == "blobfree-1200"
     assert os.environ["FIRMWARE_DTB_VERSION"] == "42"
@@ -149,6 +154,7 @@ STUB_FIRMWARE_MAKE = """\
 #!/usr/bin/env python3
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 out, target = sys.argv[1:]
@@ -157,9 +163,19 @@ private = Path(out.removeprefix("OUT="))
 shared = Path(os.environ["TEST_OUT"])
 assert private.is_relative_to(shared) and private != shared, private
 (private / "firmware").mkdir()
-(private / "firmware/firmware.bin").write_text("invocation firmware")
 (private / "oreboot").mkdir()
-(private / "oreboot/bt0.bin").write_bytes(os.environ.get("TEST_BT0", "stub-1200").encode())
+raw = private / "oreboot/bt0.bin"
+profile = os.environ.get("TEST_BT0", "stub-1200")
+raw.write_bytes(bytes(4) + b"eGON.BT0" + bytes(8) + profile.encode())
+firmware = private / "firmware/firmware.bin"
+subprocess.run(
+    [sys.executable, "-I", "scripts/mkimage.py", "--bt0", str(raw), "--egon", str(firmware)],
+    check=True,
+)
+wrapped = bytearray(firmware.read_bytes())
+if os.environ.get("TEST_WRONG_PREFIX"):
+    wrapped[32] ^= 1
+firmware.write_bytes(wrapped + b"invocation firmware")
 (shared / "firmware/firmware.bin").write_text("competing firmware")
 """
 
@@ -215,10 +231,13 @@ def run_case(case):
         )
         helper = ROOT / "scripts/sd-bt0-cargo.py"
         shutil.copyfile(helper, root / "scripts" / helper.name)
+        (root / "scripts/lib").mkdir()
+        for tool in ("mkimage.py", "lib/bootlayout.py", "lib/mkcard.py"):
+            shutil.copyfile(ROOT / "scripts" / tool, root / "scripts" / tool)
         (root / "scripts/sd-bt0-fingerprints.json").write_text(
             json.dumps(
                 {
-                    sha256(f"stub-{mhz}".encode()).hexdigest(): f"blobfree-{mhz}"
+                    sha256(stub_bt0(f"stub-{mhz}")).hexdigest(): f"blobfree-{mhz}"
                     for mhz in (1200, 2400)
                 }
             )
@@ -335,6 +354,21 @@ def run_case(case):
             command.append("XZ=no")
         if case == "private-firmware":
             env["TEST_PRIVATE_FIRMWARE"] = "1"
+        if case == "wrong-packaged-prefix":
+            env["TEST_WRONG_PREFIX"] = "1"
+            result = subprocess.run(
+                [*command, "fedora-image"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 2, result
+            assert "packaged bt0 does not match the fingerprinted raw bt0" in (
+                result.stderr
+            ), result
+            assert not (root / "out/fedora/rpmbuild").exists()
+            return
         if case in ("wrong-binary-profile", "unknown-binary"):
             wrong_profile = case == "wrong-binary-profile"
             env["TEST_BT0"] = "stub-2400" if wrong_profile else "unknown bt0 bytes"
@@ -374,6 +408,7 @@ def main():
         *sorted(BT0_CASES),
         "wrong-binary-profile",
         "unknown-binary",
+        "wrong-packaged-prefix",
     )
     for case in sys.argv[1:] or cases:
         assert case in cases, case

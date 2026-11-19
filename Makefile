@@ -311,18 +311,20 @@ STAGED_IMAGE = $(IMG_BUILD)/package/$(notdir $(IMAGE))
 # Claim a fresh output directory before building any firmware intermediates.
 # The standalone 'firmware' target can never replace the bytes used here.
 override DEVCARD_FW_BUILD := $(abspath $(OUT))/.devcard-firmware-$(STAMP)
+override DEVCARD_FW_BIN := $(DEVCARD_FW_BUILD)/firmware/firmware.bin
 fedora-image: fel-image
 	$(foreach var,FW_OUT TGT DTB LIBDRAM_A BT0_BIN MAIN_BIN EDK2_FD,$(if $(filter file,$(origin $(var))),,$(error fedora-image refuses $(var) override (origin: $(origin $(var))))))
 	mkdir -p "$(dir $(IMAGE))" "$(FEDORA)/build" "$(DEVCARD_SCRATCH)"
 	mkdir -- "$(DEVCARD_FW_BUILD)"
 	$(MAKE) OUT="$(DEVCARD_FW_BUILD)" firmware
-	python3 -I scripts/sd-bt0-cargo.py verify "$(DRAM_FIRMWARE_IDENTITY)" "$(DEVCARD_FW_BUILD)/oreboot/bt0.bin"
+	python3 -I scripts/sd-bt0-cargo.py verify "$(DRAM_FIRMWARE_IDENTITY)" \
+		"$(DEVCARD_FW_BUILD)/oreboot/bt0.bin" "$(DEVCARD_FW_BIN)"
 	scripts/binfmt-aarch64.sh
 	set -eu; \
 		$(build-rpm-run); \
 		WORK="$(IMG_BUILD)" OUT="$(STAGED_IMAGE)" FEDORA_RELEASE="$(FEDORA_RELEASE)" \
 			FIRMWARE_DTB_VERSION="$(DTB_VERSION)" DRAM_FIRMWARE_IDENTITY="$(DRAM_FIRMWARE_IDENTITY)" \
-			"$(FEDORA)/fedora/mkdevcard.sh" "$(DEVCARD_FW_BUILD)/firmware/firmware.bin" "$$run"; \
+			"$(FEDORA)/fedora/mkdevcard.sh" "$(DEVCARD_FW_BIN)" "$$run"; \
 		for suffix in '' .devcard-manifest.json .build-receipt.json .sha256; do \
 			mv -fT -- "$(STAGED_IMAGE)$$suffix" "$(IMAGE)$$suffix"; \
 		done; \

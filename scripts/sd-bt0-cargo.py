@@ -7,6 +7,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import tempfile
 import tomllib
@@ -149,7 +150,8 @@ def verify(args):
     fingerprints = json.loads(
         Path(__file__).with_name("sd-bt0-fingerprints.json").read_text()
     )
-    digest = sha256(args.binary.read_bytes()).hexdigest()
+    raw = args.binary.read_bytes()
+    digest = sha256(raw).hexdigest()
     actual = fingerprints.get(digest)
     if actual is None:
         raise SystemExit(
@@ -159,7 +161,16 @@ def verify(args):
         raise SystemExit(
             f"sd-bt0: bt0 fingerprint is {actual}, expected {args.identity}"
         )
-    print(f"sd-bt0: built bytes match {actual} ({digest})")
+    # firmware.bin starts at the eGON offset, so bt0 is its prefix. Wrap
+    # the same in-memory bytes we fingerprinted with mkimage's own function.
+    egon = runpy.run_path(str(ROOT / "scripts/mkimage.py"))["egon"]
+    expected_prefix = egon(raw)
+    with args.firmware.open("rb") as package:
+        if package.read(len(expected_prefix)) != expected_prefix:
+            raise SystemExit(
+                "sd-bt0: packaged bt0 does not match the fingerprinted raw bt0"
+            )
+    print(f"sd-bt0: packaged bt0 matches {actual} ({digest})")
 
 
 def main():
@@ -175,6 +186,7 @@ def main():
     verify_parser = commands.add_parser("verify")
     verify_parser.add_argument("identity", choices=IDENTITIES)
     verify_parser.add_argument("binary", type=Path)
+    verify_parser.add_argument("firmware", type=Path)
     verify_parser.set_defaults(handler=verify)
     args = parser.parse_args()
     args.handler(args)

@@ -113,12 +113,15 @@ package). `make help` lists them.
 
 The SD/eMMC bt0 build ignores the caller's Cargo-home configuration and
 rejects unapproved Cargo config in the workspace and source ancestors. For
-`make fedora-image`, the built raw bt0 must match a reviewed fingerprint for
-the expected DRAM profile. The current fingerprints cover the pinned oreboot
-default at 1200 and 2400 MHz, and 1200 MHz with `OTP=yes`; unknown bytes,
-including unlisted measurement builds, are not put into an image. Refresh
-`scripts/sd-bt0-fingerprints.json` from independently reproduced SD/eMMC
-bt0 builds when updating that pin or supporting another build variant.
+`make fedora-image`, the raw bt0 must match a reviewed fingerprint for the
+expected DRAM profile, and the packaged firmware must begin with that bt0's
+exact eGON wrapping. The fingerprints cover the pinned oreboot default at
+1200 and 2400 MHz, and 1200 MHz with `OTP=yes`. Both 1200 MHz entries map to
+`blobfree-1200`: the check proves the DRAM profile, not which OTP variant was
+built. Unknown bytes, including unlisted measurement builds, are not put
+into an image. Changes to the oreboot pin or toolchain can invalidate the
+fingerprints. Refresh `scripts/sd-bt0-fingerprints.json` from independently
+reproduced SD/eMMC bt0 builds when changing either or adding a build variant.
 
 Image policy: root is the only login, the password is `Fedora123`, sshd and
 DHCP are on, and there are no SSH keys of anyone in the image (host keys
