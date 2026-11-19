@@ -313,6 +313,7 @@ serial:
 test: check-sources xfel
 	python3 -I scripts/test-xfel-binary.py $(TOP)/out/tools/xfel
 	python3 -I scripts/test-fel-callers.py
+	python3 -I scripts/test-devcard-recipes.py
 	cd $(BOARD)/dram && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	cd $(BOARD)/common && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/fel-fmmt.py scripts/fel-check.py scripts/fel-tools.py scripts/test-fel-manifest.py
