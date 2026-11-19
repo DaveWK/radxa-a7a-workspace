@@ -196,6 +196,10 @@ class BenchTools(verify.SubprocessRunner):
                 if b.stderr_noise:
                     kwargs["stderr"] = summary(0, 1)
         elif cmd == "llvm-objdump":
+            b.assertIn(
+                "--mattr=+lse" if self.row.startswith("main-") else "--mcpu=cortex-a55",
+                argv,
+            )
             arch = (
                 "elf64-littleaarch64"
                 if self.row.startswith("main-")

@@ -1352,7 +1352,9 @@ class Harness:
                 "-d",
                 "-C",
                 "--no-show-raw-insn",
-                "--mattr=+lse" if main else "--mattr=+v8",
+                # Select the boot CPU, not just +v8: the pinned LLVM needs
+                # the complete Thumb-2 feature set to decode DMB correctly.
+                "--mattr=+lse" if main else "--mcpu=cortex-a55",
                 str(elf),
             ],
             cwd,
