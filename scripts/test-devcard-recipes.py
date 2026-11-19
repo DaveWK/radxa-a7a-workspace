@@ -180,6 +180,8 @@ assert private.is_relative_to(shared) and private != shared, private
 (private / "oreboot").mkdir()
 raw = private / "oreboot/bt0.bin"
 profile = os.environ.get("TEST_BT0", "stub-1200")
+if "OTP=yes" in os.environ.get("MAKEFLAGS", "").split():
+    profile += "-otp"
 raw.write_bytes(bytes(4) + b"eGON.BT0" + bytes(8) + profile.encode())
 firmware = private / "firmware/firmware.bin"
 subprocess.run(
@@ -436,6 +438,19 @@ def run_case(case):
             assert reason in result.stderr, result
             assert not (root / "out/fedora/rpmbuild").exists()
             return
+        if case == "unknown-otp-fingerprint":
+            result = subprocess.run(
+                [*command, "OTP=yes", "fedora-image"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            digest = sha256(stub_bt0("stub-1200-otp")).hexdigest()
+            assert result.returncode == 2, result
+            assert f"unknown bt0 fingerprint {digest}" in result.stderr, result
+            assert not (root / "out/fedora/rpmbuild").exists()
+            return
         goals = (
             ["fedora-image"] if case == "competing-run" else ["rpms", "fedora-image"]
         )
@@ -456,6 +471,7 @@ def main():
         *sorted(BT0_CASES),
         "wrong-binary-profile",
         "unknown-binary",
+        "unknown-otp-fingerprint",
         "wrong-packaged-prefix",
         "firmware-replaced-during-rpms",
     )
