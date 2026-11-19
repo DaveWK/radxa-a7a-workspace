@@ -81,7 +81,11 @@ FILE *fopen(const char *path, const char *mode)
 		return fopencookie(NULL, "r", (cookie_io_functions_t){.read = cookie_read});
 	FILE *(*real_fopen)(const char *, const char *) = dlsym(RTLD_NEXT, "fopen");
 	assert(real_fopen);
-	return real_fopen(path, mode);
+	FILE *result = real_fopen(path, mode);
+	if(result && (fixture("read-destination-pipe") || fixture("read-destination-full")) &&
+	   !strcmp(mode, "wb"))
+		fprintf(stderr, "mock output opened\n");
+	return result;
 }
 
 ssize_t pread(int fd, void *buf, size_t size, off_t offset)
@@ -188,6 +192,13 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
 		if(fixture("read-timeout") && len == 28)
 			return LIBUSB_ERROR_TIMEOUT;
 		memset(buf, 0, len);
+		if(fixture("read-rejection-in-data") && len == 28)
+		{
+			buf[0] = buf[1] = 0xff;
+			buf[4] = 1;
+			*actual = 8;
+			return 0;
+		}
 		if(len == 13) {
 			memcpy(buf, "AWUS", 4);
 			if(++awus_count == 1) {

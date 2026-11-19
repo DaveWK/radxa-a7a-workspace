@@ -75,9 +75,13 @@ USB; a local file or output error is not an ACK.
 | 65 | Malformed FEL status or transport framing. |
 | 66 | Selected connector absent from sysfs, or an explicit device-loss error at open, verification or transfer. Not a submission ACK. |
 | 74 | Other transport or local I/O failure (including timeout). Do not infer device loss. |
-| 76 | Well-formed FEL status with a nonzero device status. |
+| 76 | A well-formed rejection in the expected 8-byte status frame. |
 | 125 | Identity, tool or setup refusal (including permission denied, changed devnum, wrong VID:PID/topology, unavailable verification, or an absent usbfs node whose matching sysfs identity remains). Never interpret as device loss. |
 | Other | Wrapper passes the child exit through, mapping a signal to `128 + signal`. An unrecognized status is a failure. |
+
+If an 8-byte rejection arrives instead of longer read data, the selector
+classifies the short data completion as `65`. It does not reassemble short
+transfers or interpret payload bytes as a status frame.
 
 `make test` includes the compiled selector suite; it requires bubblewrap.
 To run that suite alone without hardware:
@@ -233,7 +237,7 @@ talks to it:
   `fetch` also reads (only reads) the USB disk, the SD card and the SPI NOR;
 - `fastboot boot` with a firmware bundle (oreboot main + EDK2, the same
   layout table as entry 2): bt0 checks the images' CRCs and hands over as
-  in [Boot protocol reference](#boot-protocol-reference-for-the-session-runner) step 5;
+  in [Boot protocol reference](#boot-protocol-reference-for-the-session-runner) step 6;
 - `fastboot reboot-bootloader` or `oem fel`: back to the mask ROM's FEL
   with DRAM still up; `fastboot reboot`: watchdog reset, back in FEL after
   about 1.8 s;

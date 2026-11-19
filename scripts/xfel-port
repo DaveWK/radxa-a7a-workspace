@@ -14,13 +14,48 @@ import tempfile
 SCRIPTS = Path(__file__).resolve().parent
 PORT = re.compile(r"[1-9][0-9]*-[1-9][0-9]*(?:\.[1-9][0-9]*)*")
 DECIMAL = re.compile(r"[0-9]+")
-COMMANDS = {"version", "read", "write", "read32", "write32", "exec"}
+ARITY = {"version": 0, "read": 3, "write": 2, "read32": 1, "write32": 2, "exec": 1}
+WORD_LIMIT = 1 << 32
 
 
 def number(text, max_value):
     if not DECIMAL.fullmatch(text) or not 1 <= int(text) <= max_value:
         raise ValueError(f"invalid USB number: {text!r}")
     return int(text)
+
+
+def word(text):
+    # Keep in sync with the raw selector's word(): ASCII uint32, explicit
+    # binary/hex prefixes, leading-zero octal, otherwise decimal.
+    if text[:2].lower() in ("0b", "0x"):
+        base, digits = (
+            (2, r"[01]+") if text[1].lower() == "b" else (16, r"[0-9a-fA-F]+")
+        )
+        text = text[2:]
+    elif text.startswith("0"):
+        base, digits = 8, r"[0-7]+"
+    else:
+        base, digits = 10, r"[0-9]+"
+    if not re.fullmatch(digits, text) or len(text.lstrip("0")) > 32:
+        raise ValueError("expected an unsigned 32-bit number")
+    value = int(text, base)
+    if value >= WORD_LIMIT:
+        raise ValueError("expected an unsigned 32-bit number")
+    return value
+
+
+def validate_command(command, operands):
+    if command not in ARITY or len(operands) != ARITY[command]:
+        raise ValueError(f"unsupported command or wrong argument count: {command}")
+    if any(arg.split("=", 1)[0] in ("--port", "--devnum") for arg in operands):
+        raise ValueError("selector options must precede the command")
+    if command == "version":
+        return
+    address = word(operands[0])
+    if command in ("read", "write32"):
+        value = word(operands[1])
+        if command == "read" and (not value or address + value > WORD_LIMIT):
+            raise ValueError("read length must be nonzero and fit the address window")
 
 
 def discover(root, port):
@@ -49,6 +84,12 @@ def main():
     parser.add_argument("--port", required=True)
     parser.add_argument("--devnum")
     parser.add_argument("command", nargs=argparse.REMAINDER)
+    argv = sys.argv[1:]
+    if any(arg in ("-h", "--help") for arg in argv) and argv not in (
+        ["-h"],
+        ["--help"],
+    ):
+        parser.error("help must be requested on its own")
     args = parser.parse_args()
     opts = sys.argv[1 : sys.argv.index("--")] if "--" in sys.argv else sys.argv[1:]
     for key in ("--port", "--devnum", "--discover"):
@@ -75,8 +116,10 @@ def main():
             or args.command[1].startswith("-")
         ):
             parser.error("expected -- COMMAND [ARG ...]")
-        if args.command[1] not in COMMANDS:
-            parser.error(f"unsupported command: {args.command[1]}")
+        try:
+            validate_command(args.command[1], args.command[2:])
+        except ValueError as exc:
+            parser.error(str(exc))
         if {"SUDO", "XFEL", "EXPECT_XFEL_SHA256"} & os.environ.keys():
             raise ValueError(
                 "the built selector runs directly; overrides are forbidden"
@@ -93,7 +136,11 @@ def main():
             return 66
         raise
     if args.discover:
-        print(current)
+        try:
+            print(current, flush=True)
+        except OSError:
+            # Do not retry the failed flush during Python interpreter shutdown.
+            os._exit(74)
         return 0
     if current != expected:
         raise ValueError(

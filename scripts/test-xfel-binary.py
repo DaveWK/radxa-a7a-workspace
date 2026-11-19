@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 
-def main(binary, red=False, round4_base=False):
+def main(binary, red=False, round4_base=False, round5_base=False):
     scripts = Path(__file__).resolve().parent
     (scripts.parent / "out").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=scripts.parent / "out") as tmp:
@@ -106,6 +106,8 @@ def main(binary, red=False, round4_base=False):
             writes=None,
             partial=False,
             permission_hint=None,
+            quiet=None,
+            output_opened=None,
         ):
             if output_error:
                 shell = shlex.join(["/fixture/xfel", *args]) + " >/dev/full"
@@ -156,6 +158,10 @@ def main(binary, red=False, round4_base=False):
                 assert lines.count("mock FEL write request") == writes, (name, lines)
             if partial:
                 assert "mock input prefix" in lines and "mock input EIO" in lines
+            if quiet is not None:
+                assert (proc.stdout == "") == quiet, (name, proc.stdout)
+            if output_opened is not None:
+                assert ("mock output opened" in lines) == output_opened, (name, lines)
             if permission_hint is not None:
                 has_hint = all(
                     text in proc.stderr
@@ -248,6 +254,51 @@ def main(binary, red=False, round4_base=False):
                 run("read-ack", read, 0, 12, True)
                 run("write-ack", write, 0, 12, True, writes=1)
 
+        def quiet_bulk_and_output(base):
+            read = [*prefix, "read", "0xdf000", "28", "/dev/null"]
+            write = [*prefix, "write", "0xdf000", "/fixture/write-input"]
+            for name, args in (("read", read), ("write", write)):
+                run(f"{name}-progress", args, 0, 12, True, quiet=not base)
+                run(f"{name}-stdout-full", args, 0, 12, True, output_error=True)
+                run(
+                    f"{name}-stdout-pipe",
+                    args,
+                    141 if base else 0,
+                    12,
+                    True,
+                    closed_pipe=True,
+                )
+            run(
+                "read-destination-full",
+                [*read[:-1], "/dev/full"],
+                74,
+                12,
+                True,
+                output_opened=True,
+            )
+            run(
+                "read-destination-pipe",
+                [*read[:-1], "/proc/self/fd/1"],
+                141 if base else 74,
+                12,
+                True,
+                closed_pipe=True,
+                output_opened=not base,
+            )
+            run("read-rejection-in-data", read, 65, 12, True)
+            run(
+                "read32-stdout-pipe",
+                [*prefix, "read32", "010"],
+                74,
+                12,
+                True,
+                closed_pipe=True,
+            )
+
+        if round5_base:
+            add("3-6", 12)
+            quiet_bulk_and_output(True)
+            return
         if round4_base:
             add("3-6", 12)
             framing_and_io(True)
@@ -272,8 +323,20 @@ def main(binary, red=False, round4_base=False):
         run("missing-devnum", ["--port", "3-6", "version"], 2)
         run("missing-port", ["--devnum", "12", "version"], 2)
         run("unknown-command", [*prefix, "bogus"], 2)
+        for command in (
+            ["read32"],
+            ["exec", "not-an-address"],
+            ["version", "extra"],
+            ["write", "0", "--help"],
+            ["exec", "0b0b1"],
+            ["read", "0xffffffff", "2", "/dev/null"],
+        ):
+            run(f"invalid-argv:{' '.join(command)}", [*prefix, *command], 2)
+        for value in ("010", "0b101", "0X2a", "4294967295"):
+            run(f"valid-address:{value}", [*prefix, "exec", value], 0, 12, True)
         run("selected-6", selected, 0, 12, True, version=True)
         framing_and_io(False)
+        quiet_bulk_and_output(False)
         run(
             "selected-4",
             ["--port", "3-3.4", "--devnum", "14", "version"],
@@ -326,4 +389,5 @@ if __name__ == "__main__":
         Path(sys.argv[1]).resolve(strict=True),
         red=sys.argv[2:] == ["--red"],
         round4_base=sys.argv[2:] == ["--round4-base"],
+        round5_base=sys.argv[2:] == ["--round5-base"],
     )

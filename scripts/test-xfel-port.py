@@ -82,12 +82,13 @@ class SelectorTests(unittest.TestCase):
         ).items():
             (path / key).write_text(str(value) + "\n")
 
-    def run_selector(self, *args, rc=0, **overrides):
+    def run_selector(self, *args, rc=0, stdout=subprocess.PIPE, **overrides):
         proc = subprocess.run(
             [self.scripts / "xfel-port", *args],
             env=dict(self.env, **overrides),
             text=True,
-            capture_output=True,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
             timeout=10,
         )
         self.assertEqual(proc.returncode, rc, (proc.stdout, proc.stderr))
@@ -107,6 +108,62 @@ class SelectorTests(unittest.TestCase):
                 expected,
             )
         self.assertFalse(self.log.exists())
+
+    def test_discover_output_errors(self):
+        args = ("--discover", "--port", "3-6")
+        with open("/dev/full", "wb", buffering=0) as sink:
+            self.run_selector(*args, rc=74, stdout=sink)
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            self.run_selector(*args, rc=74, stdout=writer)
+        finally:
+            os.close(writer)
+        self.assertFalse(self.log.exists())
+
+    def test_help_is_only_standalone(self):
+        self.run_selector("--help")
+        for args in (
+            ("--port", "3-6", "--devnum", "12", "--help", "--", "version"),
+            ("--port", "3-6", "--devnum", "12", "--", "write", "0", "--help"),
+            ("--discover", "--port", "3-6", "-h"),
+        ):
+            with self.subTest(args=args):
+                self.run_selector(*args, rc=2)
+        self.assertFalse(self.log.exists())
+
+    def test_full_command_grammar_precedes_discovery(self):
+        for port in ("3-6", "3-7"):
+            for cmd in (
+                ("read32",),
+                ("exec", "not-an-address"),
+                ("version", "extra"),
+                ("read32", "+1"),
+                ("exec", "1 "),
+                ("exec", "0x"),
+                ("exec", "08"),
+                ("exec", "0b02"),
+                ("write32", "1", "0x100000000"),
+                ("read", "0", "0", "file"),
+                ("read", "0xffffffff", "2", "file"),
+                ("write", "0", "--devnum=12"),
+            ):
+                with self.subTest(port=port, cmd=cmd):
+                    self.run_selector(
+                        "--port", port, "--devnum", "12", "--", *cmd, rc=2
+                    )
+        self.assertFalse(self.log.exists())
+
+    def test_valid_numeric_forms(self):
+        args = ("--port", "3-6", "--devnum", "12", "--")
+        for command in (
+            ("write32", "0b101", "0X2A"),
+            ("exec", "010"),
+            ("read", "4294967295", "1", "file"),
+            ("write32", "0", "0"),
+        ):
+            self.run_selector(*args, *command)
+        self.assertEqual(len(self.log.read_text().splitlines()), 4)
 
     def test_pin_each_board(self):
         self.dispatch("3-6", "12")
