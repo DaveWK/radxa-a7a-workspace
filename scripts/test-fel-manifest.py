@@ -23,7 +23,12 @@ FD = "CUBIEA7A_EFI.fd"
 PROFILE = Path("src/mainboard/radxa/cubie-a7a/dram/src/knobs/profile.rs")
 LIBTL = "MdePkg/Library/ArmTransferListLib/libtl"
 MAIN = b"main-fel from the fake compiler\n"
-DTB = struct.pack(">10I", 0xD00DFEED, 40, 40, 40, 40, 17, 16, 0, 0, 0)
+# Empty root, terminating reserve-map entry and one spare padding word.
+DTB = (
+    struct.pack(">10I", 0xD00DFEED, 76, 56, 72, 40, 17, 16, 0, 0, 16)
+    + bytes(16)
+    + struct.pack(">5I", 1, 0, 2, 9, 0)
+)
 BT0 = b"\0\0\0\0eGON.BT0" + bytes(256)
 PACKAGED = {
     "bt0-fel.bin": "bt0_fel_sha256",
@@ -114,11 +119,16 @@ elif tool == "build":
     # Model CubieA7A.fdf:50-52,131-133,256-257 and PI file/section headers
     # (MdePkg/Include/Pi/PiFirmwareFile.h:61,71,108-133,208,220-224).
     def sec(kind, payload):
+        if kind == 0x19 and case in ("short-extended", "ffs2-extended"):
+            return b"\xff\xff\xff" + bytes([kind]) + struct.pack("<I",8+len(payload)) + payload
         return (4+len(payload)).to_bytes(3, "little") + bytes([kind]) + payload
 
     def file(name, kind, payload):
         hdr = bytearray(UUID(name).bytes_le + bytes([0, 0xaa, kind, 0])
                         + (24+len(payload)).to_bytes(3, "little") + b"\xf8")
+        if (kind == 0x0b and case == "large-boot") or (kind == 2 and case == "short-large"):
+            hdr[19:23] = b"\x01\0\0\0"
+            hdr += struct.pack("<Q",32+len(payload))
         hdr[16] = -(sum(hdr)-hdr[17]-hdr[23]) & 255
         return hdr + payload
 
@@ -133,7 +143,10 @@ elif tool == "build":
             struct.pack_into("<I", hdr, 0, 0x14000001)
         # MdePkg/Include/Guid/FirmwareFileSystem2.h:18-19.
         hdr[16:32] = UUID("8c8ce578-8a3d-4f1c-9935-896185c32dd3").bytes_le
-        struct.pack_into("<Q4sIHHHBBIIII", hdr, 32, size, b"_FVH", 0x800,
+        if (boot and case == "large-boot") or (not boot and case in ("short-extended","short-large")):
+            hdr[16:32] = UUID("5473c07a-3dcb-4dca-bd6f-1e9689e7349a").bytes_le
+        attrs = 0x800 if not boot and case == "no-read-status" else 0x804
+        struct.pack_into("<Q4sIHHHBBIIII", hdr, 32, size, b"_FVH", attrs,
                          72, 0, 0, 0, 2, size, 1, 0, 0)
         struct.pack_into("<H", hdr, 50, -sum(struct.unpack("<36H",hdr)) & 0xffff)
         return (hdr + content).ljust(size, b"\xff")
@@ -152,6 +165,8 @@ elif tool == "build":
         files.insert(0, file(container, 2, sec(0x19, tree[:4])))
     stream = sec(0x17, fv(files))
     packed = lzma.compress(stream, format=lzma.FORMAT_ALONE)
+    if case != "unknown-size":
+        packed = packed[:5] + struct.pack("<Q",len(stream)) + packed[13:]
     if case == "corrupt":
         packed = packed[:-5]
     section = sec(2, UUID("ee4e5898-3914-4259-9d6e-dc7bd79403cf").bytes_le
@@ -245,6 +260,27 @@ def git(cwd, *args):
 
 
 class GateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # make test must work before the real EDK2 build. Build the one C
+        # decoder in scratch, without modifying the production tool stamp/bin.
+        scratch = ROOT / "out"
+        scratch.mkdir(exist_ok=True)
+        tmp = tempfile.TemporaryDirectory(prefix="fel-test-basetools-", dir=scratch)
+        cls.addClassCleanup(tmp.cleanup)
+        edk2 = ROOT / "firmware/edk2"
+        source = edk2 / "BaseTools/Source/C"
+        dest = Path(tmp.name)
+        for name in ("Makefiles", "Common", "LzmaCompress", "Include"):
+            shutil.copytree(
+                source / name, dest / name, ignore=shutil.ignore_patterns("*.o", "*.d")
+            )
+        shutil.copy2(source / "GNUmakefile", dest)
+        subprocess.run(
+            ["make", "-s", "-C", dest, f"EDK2_PATH={edk2}", "LzmaCompress"], check=True
+        )
+        cls.decoder = dest / "bin/LzmaCompress"
+
     def setUp(self):
         scratch = ROOT / "out"
         scratch.mkdir(exist_ok=True)
@@ -330,6 +366,8 @@ class GateTests(unittest.TestCase):
         )
         if (SOURCE / "scripts/fel-tools.py").exists():
             shutil.copy2(SOURCE / "scripts/fel-tools.py", scripts)
+        if (SOURCE / "scripts/fel-fmmt.py").exists():
+            shutil.copy2(SOURCE / "scripts/fel-fmmt.py", scripts)
         mkimage = scripts / "mkimage.py"
         text = mkimage.read_text()
         marker = "    disk, entries = build_firmware("
@@ -355,6 +393,15 @@ class GateTests(unittest.TestCase):
         )
         self.file("firmware/edk2/MdePkg/Library/BaseFdtLib/libfdt/libfdt/fdt.h", "")
         self.file("firmware/edk2/BaseTools/Source/C/bin/GenFv", "").chmod(0o755)
+        source = ROOT / "firmware/edk2/BaseTools/Source"
+        dest = self.edk2 / "BaseTools/Source"
+        for name in ("FirmwareStorageFormat", "FMMT"):
+            shutil.copytree(
+                source / "Python" / name,
+                dest / "Python" / name,
+                ignore=shutil.ignore_patterns("__pycache__", "*.log", "Img"),
+            )
+        shutil.copy2(self.decoder, dest / "C/bin")
         self.file("firmware/edk2-platforms/Platform/Radxa/CubieA7APkg/CubieA7A.dsc", "")
         self.file(
             "firmware/edk2-platforms/OreEdk2Boot/OreEdk2BootPkg/OreEdk2BootPkg.dec", ""
@@ -967,6 +1014,48 @@ class GateTests(unittest.TestCase):
                 self.refusal(self.make("fel-image", FAKE_EMBED=case), reason)
                 self.assertFalse((self.workspace / "out/fel/.records").exists())
 
+    def test_loader_refusals(self):
+        for case, reason in (
+            ("unknown-size", "LZMA"),
+            ("short-extended", "extended section size"),
+            ("ffs2-extended", "extended section in FFS2"),
+            ("large-boot", "large FFS header in boot FV"),
+            ("short-large", "large FFS size"),
+            ("no-read-status", "read status"),
+        ):
+            with self.subTest(case=case):
+                self.refusal(self.make("fel-image", FAKE_EMBED=case), reason)
+                self.assertFalse((self.workspace / "out/fel/.records").exists())
+
+    def test_loader_fdt_limits(self):
+        for reason, tree in (
+            ("libfdt", DTB[:20] + bytes(4) + DTB[24:]),
+            (
+                "4 MiB",
+                DTB[:4]
+                + struct.pack(">I", (4 << 20) + 1)
+                + DTB[8:]
+                + bytes((4 << 20) + 1 - len(DTB)),
+            ),
+        ):
+            with self.subTest(reason=reason):
+                dtb = self.root / "input.dtb"
+                dtb.write_bytes(tree)
+                self.refusal(self.make("fel-image", f"FEL_DTB_INPUT={dtb}"), reason)
+                self.assertFalse((self.workspace / "out/fel/.records").exists())
+
+    def test_tool_offset_agreement(self):
+        # Shift only FMMT's reported RAW data offset, not the bytes or GUID path.
+        path = self.edk2 / "BaseTools/Source/Python/FMMT/core/BinaryFactoryProduct.py"
+        text = path.read_text()
+        marker = "Section_Info.DOffset = Section_Offset + Section_Info.HeaderLength + Rel_Whole_Offset"
+        self.assertIn(marker, text)
+        path.write_text(text.replace(marker, marker + " + (Section_Info.Type == 0x19)"))
+        git(self.edk2, "commit", "-qam", "offset disagreement fixture")
+        git(self.workspace, "commit", "-qam", "pin offset disagreement fixture")
+        self.refusal(self.make("fel-image"), "disagreement")
+        self.assertFalse((self.workspace / "out/fel/.records").exists())
+
     def test_xfel_override_needs_digest(self):
         self.build()
         with (self.tools / "xfel").open("a") as f:
@@ -1057,7 +1146,10 @@ class GateTests(unittest.TestCase):
             read_json(stamp),
             {
                 "edk2_head": git(self.edk2, "rev-parse", "HEAD"),
-                "binaries": {"GenFv": sha(self.edk2 / "BaseTools/Source/C/bin/GenFv")},
+                "binaries": {
+                    name: sha(self.edk2 / "BaseTools/Source/C/bin" / name)
+                    for name in ("GenFv", "LzmaCompress")
+                },
             },
         )
         self.assertEqual(
