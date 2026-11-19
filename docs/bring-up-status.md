@@ -31,7 +31,7 @@ attempt; it did not change the result.
 | Part | State |
 |---|---|
 | bt0: clocks, DCXO, UART0, PMIC rails, DVFS | works (CPU_L 1612 / CPU_B 1794 / DSU 1222 MHz after DRAM) |
-| bt0: DRAM, no vendor input (the default build) | **boots Fedora at 1200 MHz**, its default clock, and passes memtester and stress-ng there. At 2400 MHz (`DRAM_MHZ=2400`) Linux starts with a corrected read latency, but memory tests in Linux fail on one data bit: not usable yet (see [DRAM without vendor code](#dram-without-vendor-code)). 4 GB board, USB FEL only so far |
+| bt0: DRAM, no vendor input (the default build) | **boots Fedora at 1200 MHz**, its default clock, and passes `memtester 2600M` once and a 5-minute `stress-ng` run with verify there. At 2400 MHz (`DRAM_MHZ=2400`) the kernel fails to decompress at the hand-over read latency of 6; at 5 Linux starts but the memory tests fail on bit 37: not usable yet (see [DRAM without vendor code](#dram-without-vendor-code)). 4 GB board, USB FEL only so far |
 | bt0: DRAM, vendor library (`VENDOR_DRAM=yes`) | works: all four pstates trained, 4096 MiB at 2400 MHz. The comparison build |
 | bt0: DRAM, our driver with the PHY's training firmware as data (`VENDOR_DRAM=phyfw`) | builds; controller and PHY set-up are ours. Not booted as a default |
 | bt0: USB FEL (`fel`) | works |
@@ -97,25 +97,21 @@ settings of that boot built in (and those of the 2400 MHz runs below as
 `DRAM_MHZ=2400`); the vendor library is the comparison build
 (`VENDOR_DRAM=yes`).
 
-**What was shown** (boot over USB FEL, root on a USB disk, the protective
-default entry):
+**What was shown** (one boot over USB FEL, root on a USB disk, the protective
+default entry, 4 GB board):
 
 - bt0 reports 4096 MiB; main, EDK2, GRUB and Fedora 7.3.3 come up, and
   Linux sees the same memory as on vendor DRAM (MemTotal 3970952 kB).
-- `memtester 512M 1`: all tests pass.
-- `stress-ng --vm 2 --vm-bytes 30% --verify --timeout 3m`: passed, no
-  oops, no EDAC error.
-- Repeated on 2026-11-18 with the firmware built from this workspace's
-  pinned sources at their defaults (no build options): `stress-ng --vm 4
-  --vm-bytes 80% --vm-method all --verify` for 5 minutes and `memtester
-  2600M 1` both pass, with a clean kernel log.
-- A control boot on vendor DRAM, same entry and same tests, gives the same
-  results.
+- `memtester 2600M 1`: all tests pass, once.
+- `stress-ng --vm 4 --vm-bytes 80% --vm-method all --verify` for 5 minutes:
+  passed, no oops, no EDAC error.
+- A control boot on vendor DRAM (`VENDOR_DRAM=yes`, a measurement build),
+  same entry and same tests, gives the same results.
 - Before Linux, bt0's own tests pass: mode-register reads on all four
   ranks, and a hash memory test over 2 GiB (the 32-bit bt0 cannot address
   more) with 0 errors.
 
-**Limits.** This is a first boot, not a stability result:
+**Limits.** This is one boot at 1200 MHz, not a stability result:
 
 - It runs at **1200 MHz**, the default build's clock. The vendor path
   trains 2400 MHz. At 2400 MHz (`DRAM_MHZ=2400`):
@@ -123,14 +119,14 @@ default entry):
     bt0 (12 runs in a row; a write reference voltage and a centred write
     delay made the difference there), and main, EDK2 and GRUB run;
   - with the settings as built, the kernel then fails to decompress
-    (`ZSTD-decompression failed`). The hand-over read latency (DFIMRL)
-    was 6, the last value before the edge: cache line-fill probes in bt0
-    are clean at 5 and 6 and fail at 7;
+    (`ZSTD-decompression failed`) at the hand-over read latency (DFIMRL) of
+    6, the last value before the edge: cache line-fill probes in bt0 are
+    clean at 5 and 6 and fail at 7;
   - with the read latency at 5, Linux starts, but its initramfs is found
     corrupt and `memtester` and `stress-ng --verify` fail within seconds.
-    Every memtester failure is the same single bit (bit 5 of the upper
-    32-bit half of the 64-bit word), flipping both ways, spread over the
-    whole buffer. bt0's own tests do not catch it;
+    Every failure is the same single bit, bit 37 (bit 5 of the upper 32-bit
+    half of the 64-bit word), flipping both ways, spread over the whole
+    buffer. bt0's own tests do not catch it;
   - per-lane write centring (below) moves individual lanes by up to 14
     delay steps but does not remove those errors.
 
@@ -142,7 +138,7 @@ default entry):
   selects the 6 GB board's parameters by its strap and has not run there;
   a boot from a card or the eMMC has not run either. The 8 and 12 GB
   parameter sets run another DRAM clock and are refused by our driver.
-- Only the 3-minute stress above has run. No long soak, no temperature
+- Only the 5-minute stress above has run. No long soak, no temperature
   sweep, no load test of the rank-to-rank margins.
 - Without the PHY's sequencer microcode, nothing compensates for drift at
   run time. An earlier partly-open build reached a login prompt and then

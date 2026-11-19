@@ -31,12 +31,12 @@ vendor input.
   below).
 - **DRAM without vendor code is the default build:** no Allwinner DRAM
   library, no Synopsys PHY training firmware. It runs DRAM at 1200 MHz and
-  boots Fedora: 4096 MiB, a 2.6 GB memtester loop and a 5-minute
-  stress-ng run with verification pass, as on the vendor-DRAM control boot.
-  At 2400 MHz (`DRAM_MHZ=2400`) Linux starts once the read latency is
-  corrected, but memory tests in Linux find errors on a single data bit, so
-  2400 MHz is not usable yet. All of it on the 4 GB board over USB FEL: a
-  boot from a card or the eMMC and the 6 GB board are still to run. See
+  boots Fedora: 4096 MiB, `memtester 2600M` once and a 5-minute `stress-ng`
+  run with verify pass, matching the vendor-DRAM control boot. At 2400 MHz
+  (`DRAM_MHZ=2400`) the kernel fails to decompress at the hand-over read
+  latency of 6; at 5 Linux starts but the memory tests fail on bit 37, so
+  2400 MHz is not usable yet. All of it on the 4 GB board over USB FEL: no
+  card or eMMC boot, and the 6 GB board, are still to run. See
   [docs/bring-up-status.md](docs/bring-up-status.md#dram-without-vendor-code).
 - **Fastboot over FEL (development build):** firmware sent at 25.7 MB/s and
   read back at about 42 MB/s over the USB 2.0 port, then booted from RAM.
