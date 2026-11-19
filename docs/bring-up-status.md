@@ -1,4 +1,4 @@
-# Bring-up status (2026-11-12)
+# Bring-up status (2026-11-18)
 
 Board: Radxa Cubie A7A, Allwinner A733 (SoC rev B), 4 GB CXMT LPDDR5,
 AXP318W PMIC, Maxio MAE0621A-Q3C Ethernet PHY. Tested with Fedora 45, kernel
@@ -31,7 +31,7 @@ attempt; it did not change the result.
 | Part | State |
 |---|---|
 | bt0: clocks, DCXO, UART0, PMIC rails, DVFS | works (CPU_L 1612 / CPU_B 1794 / DSU 1222 MHz after DRAM) |
-| bt0: DRAM, no vendor input (the default build) | **boots Fedora at 1200 MHz**, its default clock. At 2400 MHz (`DRAM_MHZ=2400`) the bring-up and the memory tests before Linux pass, but the kernel fails to decompress: no Linux boot yet (see [DRAM without vendor code](#dram-without-vendor-code)). 4 GB board, USB FEL only so far |
+| bt0: DRAM, no vendor input (the default build) | **boots Fedora at 1200 MHz**, its default clock, and passes memtester and stress-ng there. At 2400 MHz (`DRAM_MHZ=2400`) Linux starts with a corrected read latency, but memory tests in Linux fail on one data bit: not usable yet (see [DRAM without vendor code](#dram-without-vendor-code)). 4 GB board, USB FEL only so far |
 | bt0: DRAM, vendor library (`VENDOR_DRAM=yes`) | works: all four pstates trained, 4096 MiB at 2400 MHz. The comparison build |
 | bt0: DRAM, our driver with the PHY's training firmware as data (`VENDOR_DRAM=phyfw`) | builds; controller and PHY set-up are ours. Not booted as a default |
 | bt0: USB FEL (`fel`) | works |
@@ -105,6 +105,10 @@ default entry):
 - `memtester 512M 1`: all tests pass.
 - `stress-ng --vm 2 --vm-bytes 30% --verify --timeout 3m`: passed, no
   oops, no EDAC error.
+- Repeated on 2026-11-18 with the firmware built from this workspace's
+  pinned sources at their defaults (no build options): `stress-ng --vm 4
+  --vm-bytes 80% --vm-method all --verify` for 5 minutes and `memtester
+  2600M 1` both pass, with a clean kernel log.
 - A control boot on vendor DRAM, same entry and same tests, gives the same
   results.
 - Before Linux, bt0's own tests pass: mode-register reads on all four
@@ -114,12 +118,26 @@ default entry):
 **Limits.** This is a first boot, not a stability result:
 
 - It runs at **1200 MHz**, the default build's clock. The vendor path
-  trains 2400 MHz. At 2400 MHz (`DRAM_MHZ=2400`) our driver has shown
-  repeated bring-ups over USB FEL that end with clean memory tests on both
-  ranks (a write reference voltage and a centred write delay made the
-  difference there), and main, EDK2 and GRUB run on it; the kernel then
-  fails to decompress (`ZSTD-decompression failed`), which points at rare
-  data errors under load. It is not usable as a boot clock yet.
+  trains 2400 MHz. At 2400 MHz (`DRAM_MHZ=2400`):
+  - bring-ups over USB FEL end with clean memory tests on both ranks in
+    bt0 (12 runs in a row; a write reference voltage and a centred write
+    delay made the difference there), and main, EDK2 and GRUB run;
+  - with the settings as built, the kernel then fails to decompress
+    (`ZSTD-decompression failed`). The hand-over read latency (DFIMRL)
+    was 6, the last value before the edge: cache line-fill probes in bt0
+    are clean at 5 and 6 and fail at 7;
+  - with the read latency at 5, Linux starts, but its initramfs is found
+    corrupt and `memtester` and `stress-ng --verify` fail within seconds.
+    Every memtester failure is the same single bit (bit 5 of the upper
+    32-bit half of the 64-bit word), flipping both ways, spread over the
+    whole buffer. bt0's own tests do not catch it;
+  - per-lane write centring (below) moves individual lanes by up to 14
+    delay steps but does not remove those errors.
+
+  So 2400 MHz is not usable as a boot clock yet. The missing full-speed
+  stages (WCK duty-cycle adjustment, two-dimensional read reference
+  voltage, command-bus reference voltage) and per-lane read timing are the
+  candidates being worked on.
 - Every run was on the 4 GB board, loaded over USB FEL. The same build
   selects the 6 GB board's parameters by its strap and has not run there;
   a boot from a card or the eMMC has not run either. The 8 and 12 GB
@@ -157,16 +175,29 @@ were found that way. Each was in our own sequence, not in the hardware:
    DRAM showed that single reads were correct while cache line fills
    (back-to-back bursts) returned wrong data: with the instruction cache off
    the code ran, with it on it executed the wrong instructions. A sweep of
-   the PHY's DFI read latency gave: the trained 4 fails, 5 passes every
-   probe, 6 and 8 fail. Training at 5 moves the gate along with it and fails
-   too, so the hand-over keeps the trained value and adds one.
+   the PHY's DFI read latency at 1200 MHz gave: 5 passes every probe, 6
+   loses a few words, 8 loses whole lines (a run first recorded as "4"
+   had in fact run at 8). Training at 5 moves the gate along with it and
+   fails too, so the hand-over keeps the trained value and adds one. At
+   2400 MHz that rule gives 6, the edge (see the limits above), so the
+   rule is to be replaced by one that centres in the measured window.
 
 The DRAM keeps its contents across bt0's warm reset into main; that was
 checked separately and ruled out as a cause.
+
+**Write lanes.** The write stage's lane discovery used to fail every time,
+so all eight lanes of a byte shared one write delay. The cause was that
+the check also counted the data-mask lane, whose writes affect a whole
+byte. With that fixed, discovery works on the board at 2400 MHz on both
+ranks, and an optional per-lane centring (a stage bit, off by default)
+measures write windows of 38 to 59 delay steps per lane and places each
+lane in its own window. It runs cleanly but has not yet been shown to
+change any test result.
 
 **Tooling.** A lab build of bt0 runs a DRAM training pass with options set
 at run time and returns results and memory dumps over fastboot, so one
 image covers many experiments. Open: after a lab DRAM run, the lab's
 watchdog reset does not return the board to FEL (it does without a run),
-so lab runs need a USB-C replug. The experiments above used plain FEL
-images instead.
+so lab runs need a USB-C replug. A workaround is in the source (the lab
+leaves through the mask ROM's FEL entry instead) but has not run on a
+board. The experiments above used plain FEL images instead.

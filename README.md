@@ -22,7 +22,7 @@ There is no vendor boot0, TF-A or U-Boot in this chain.
 `make fedora-image`. Never commit or upload a built image, firmware binary or
 vendor input.
 
-## Board status (2026-11-12)
+## Board status (2026-11-18)
 
 - **Boots to a Fedora 45 login over USB FEL:** bt0 → main → EDK2 → GRUB →
   Fedora 7.3.3 (stock kernel) on all 8 cores, with the root on a USB disk in
@@ -30,12 +30,12 @@ vendor input.
   DRAM library path (`VENDOR_DRAM=yes` now, see "DRAM" below).
 - **DRAM without vendor code is the default build:** no Allwinner DRAM
   library, no Synopsys PHY training firmware. It runs DRAM at 1200 MHz and
-  boots Fedora: 4096 MiB, memtester and a 3-minute stress-ng run pass, as
-  on the vendor-DRAM control boot. At 2400 MHz (`DRAM_MHZ=2400`) it does
-  not boot Linux yet: the bring-up and the memory tests before Linux pass
-  and the firmware runs, but the kernel fails to decompress. All of it on
-  the 4 GB board over USB FEL: a boot from a card or the eMMC and the 6 GB
-  board are still to run. See
+  boots Fedora: 4096 MiB, a 2.6 GB memtester loop and a 5-minute
+  stress-ng run with verification pass, as on the vendor-DRAM control boot.
+  At 2400 MHz (`DRAM_MHZ=2400`) Linux starts once the read latency is
+  corrected, but memory tests in Linux find errors on a single data bit, so
+  2400 MHz is not usable yet. All of it on the 4 GB board over USB FEL: a
+  boot from a card or the eMMC and the 6 GB board are still to run. See
   [docs/bring-up-status.md](docs/bring-up-status.md#dram-without-vendor-code).
 - **Fastboot over FEL (development build):** firmware sent at 25.7 MB/s and
   read back at about 42 MB/s over the USB 2.0 port, then booted from RAM.
@@ -55,7 +55,7 @@ vendor input.
   AIC8800 package built from a local driver tree (`AIC8800_SRC`).
 - **Not yet:** the GPU (its power domains are now switched on only on
   demand, but GPU_CORE still does not come up, so no rendering), cpufreq, a
-  Linux boot on our own DRAM driver at 2400 MHz, and a cause for three
+  error-free 2400 MHz on our own DRAM driver, and a cause for three
   memory-corruption oopses on 2026-11-12 (two followed the Wi-Fi driver's
   start). Persistent UEFI variables on the card are built
   (`-D SD_VARSTORE_ENABLE=TRUE`) but not yet confirmed on the board.
