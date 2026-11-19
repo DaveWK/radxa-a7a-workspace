@@ -696,7 +696,7 @@ class RunnerTests(unittest.TestCase):
                         nonlocal now
                         now += seconds
 
-                    def offline(argv, timeout, lease_fd, *, watch=None):
+                    def offline(argv, timeout, lease_fd, **options):
                         nonlocal polls
                         assert argv == ("--discover", "--port", port)
                         assert not (self.sysfs / port).exists()

@@ -30,7 +30,7 @@ class FakeSelector:
     def peers(self, port):
         return {}
 
-    def invoke(self, args, timeout, lease_fd, *, watch=None):
+    def invoke(self, args, timeout, lease_fd, *, watch=None, poll_deadline=None):
         if args[0] == "--discover":
             key, text = ("discover",), str(self.devnum)
         else:
@@ -91,11 +91,11 @@ class SessionTests(Fixture):
         old = self.state.read_bytes()
         self.selector.devnum = 24
         self.selector.failure[("version",)] = 65
-        self.assert_exit(EXIT.ACK, session.reconnect, seconds=0.2)
+        self.assert_exit(EXIT.ACK, session.reconnect, seconds=2)
         self.assertEqual(old, self.state.read_bytes())
         self.assertEqual(self.record["devnums"], [12])
         self.selector.failure.clear()
-        session.reconnect(seconds=0.2)
+        session.reconnect(seconds=2)
         self.assertEqual(self.record["devnums"], [12, 24])
         self.assertIsNone(session.state["pending"])
         self.assertEqual(session.state["epoch"], 2)
@@ -110,9 +110,9 @@ class SessionTests(Fixture):
         observed = []
         original = self.selector.invoke
 
-        def late(args, timeout, lease_fd, *, watch=None):
+        def late(args, timeout, lease_fd, **options):
             observed.append(timeout)
-            reply = original(args, timeout, lease_fd, watch=watch)
+            reply = original(args, timeout, lease_fd, **options)
             clock[0] += 59 if args[0] == "--discover" else 2
             return reply
 
@@ -128,7 +128,7 @@ class SessionTests(Fixture):
         runner.start()
         runner.submit(M["WDT"][-1], returns=True)
         old = self.state.read_bytes()
-        for expiry in ("between polls", "before discovery", "late discovery"):
+        for expiry in ("between polls", "before discovery", "late discovery", "floor"):
             with self.subTest(expiry=expiry):
                 self.selector.devnum = 12
                 now = 100.0
@@ -145,6 +145,8 @@ class SessionTests(Fixture):
                     observations += 1
                     if observations == 2 and expiry == "before discovery":
                         now = 160
+                    if observations == 2 and expiry == "floor":
+                        now = 159.5
 
                 def discover(args, timeout, *options, **kwargs):
                     nonlocal now, polls
@@ -164,6 +166,85 @@ class SessionTests(Fixture):
                 self.assertEqual(polls, 2 if expiry == "late discovery" else 1)
                 self.assertEqual(self.state.read_bytes(), old)
 
+    def test_fresh_devnum_with_less_than_a_second_left_is_not_probed(self):
+        runner = self.make_session()
+        runner.start()
+        runner.submit(M["WDT"][-1], returns=True)
+        self.selector.devnum = 24
+        old = self.state.read_bytes()
+        clock = [100.0]
+        calls = []
+        invoke = self.selector.invoke
+
+        def discover(args, timeout, *options, **kwargs):
+            calls.append((args, timeout))
+            if args[0] == "--discover":
+                clock[0] = 159.5
+            return invoke(args, timeout, *options, **kwargs)
+
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch.object(self.selector, "invoke", side_effect=discover),
+        ):
+            self.assert_exit(EXIT.LIVE_TIMEOUT, runner.reconnect)
+        self.assertEqual(calls, [(("--discover", "--port", PORT), 60)])
+        self.assertEqual(self.state.read_bytes(), old)
+
+    def undrained_selector(self):
+        child = SimpleNamespace(
+            pid=1234,
+            communicate=lambda timeout: ("", ""),
+        )
+        with (
+            patch("os.killpg") as killpg,
+            patch("os.waitpid", return_value=(0, 0)),
+            patch("time.sleep"),
+            patch("time.monotonic", side_effect=[0, 1, 1, 4]),
+        ):
+            try:
+                M["Selector"].cancel(child)
+            finally:
+                self.assertEqual(
+                    [call.args[1] for call in killpg.call_args_list], [15, 0, 9, 0]
+                )
+
+    def test_reconnect_hang_or_failed_drain_is_not_masked_by_prior_poll(self):
+        runner = self.make_session()
+        runner.start()
+        runner.submit(M["WDT"][-1], returns=True)
+        old = self.state.read_bytes()
+        for prior, first_rc in (("unchanged", 0), ("lost", 66)):
+            with self.subTest(prior=prior):
+                clock = [100.0]
+                polls = []
+
+                def invoke(args, timeout, lease_fd, **options):
+                    polls.append(timeout)
+                    if len(polls) == 1:
+                        return first_rc, "12", "", False
+                    clock[0] = 161
+                    if prior == "lost":
+                        self.undrained_selector()
+                    return -9, "", "fixture hung", True
+
+                with (
+                    patch("time.monotonic", side_effect=lambda: clock[0]),
+                    patch(
+                        "time.sleep",
+                        side_effect=lambda s: clock.__setitem__(0, clock[0] + s),
+                    ),
+                    patch.object(self.selector, "invoke", side_effect=invoke),
+                ):
+                    with self.assertRaises(M["SessionError"]) as caught:
+                        runner.reconnect()
+                self.assertEqual(caught.exception.code, EXIT.LIVE_TIMEOUT)
+                self.assertIn(
+                    "did not drain" if prior == "lost" else "terminated and reaped",
+                    str(caught.exception),
+                )
+                self.assertEqual(len(polls), 2)
+                self.assertEqual(self.state.read_bytes(), old)
+
     def test_first_discovery_hang_has_no_prior_reconnect_observation(self):
         runner = self.make_session()
         runner.start()
@@ -177,8 +258,8 @@ class SessionTests(Fixture):
     def test_entry_two_mailbox_budget_does_not_accept_late_ready(self):
         clock, observed = [100], []
 
-        def mailbox(timeout):
-            observed.append(timeout)
+        def mailbox(deadline):
+            observed.append(deadline - clock[0])
             clock[0] += 11
             return (0x46413741, 0x21, 4096, 1200)
 
@@ -189,36 +270,41 @@ class SessionTests(Fixture):
         self.assertEqual(observed, [10])
 
     def test_stuck_entry_two_mailbox_keeps_last_completed_state_at_deadline(self):
-        for expiry in ("between polls", "late read", "selector timeout"):
+        for expiry, code, reads in (
+            ("between polls", EXIT.SERIAL_UNCONFIRMED, 1),
+            ("late read", EXIT.SERIAL_UNCONFIRMED, 2),
+            ("floor", EXIT.SERIAL_UNCONFIRMED, 1),
+            ("failed drain", EXIT.LIVE_TIMEOUT, 2),
+        ):
             with self.subTest(expiry=expiry):
                 clock, observed = [100], []
                 record = {}
                 stuck = (0x46413741, 0x11, 4096, 1200)
 
-                def mailbox(timeout):
-                    observed.append(timeout)
+                def mailbox(deadline):
+                    observed.append(deadline - clock[0])
                     if len(observed) == 1:
                         return stuck
                     clock[0] = 111
-                    if expiry == "selector timeout":
-                        raise M["SessionError"](EXIT.LIVE_TIMEOUT, "fixture timed out")
+                    if expiry == "failed drain":
+                        self.undrained_selector()
                     return (0x46413741, 0x21, 4096, 1200)
 
                 def sleep(seconds):
-                    clock[0] += 10 if expiry == "between polls" else seconds
+                    clock[0] += {"between polls": 10, "floor": 9.5}.get(expiry, seconds)
 
                 with (
                     patch("time.monotonic", side_effect=lambda: clock[0]),
                     patch("time.sleep", side_effect=sleep),
                 ):
                     self.assert_exit(
-                        EXIT.SERIAL_UNCONFIRMED,
+                        code,
                         M["wait_for_handover_target"],
                         mailbox,
                         record,
                     )
                 self.assertEqual(record["entry_two_mailbox"], stuck)
-                self.assertEqual(len(observed), 1 if expiry == "between polls" else 2)
+                self.assertEqual(len(observed), reads)
 
     def test_loss_before_and_after_without_submission_ack(self):
         session = self.make_session()

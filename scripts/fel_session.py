@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import ctypes
 from enum import IntEnum
 import fcntl
+from functools import partial
 import hashlib
 import json
 import os
@@ -46,6 +47,7 @@ NORMAL_RESET = re.compile(
 ENTRY_TWO = b"[bt0] FEL: entry 2: checking the images in DRAM"
 MAX_SERIAL = 1 << 20
 IDENTITY_LIFETIME = 120
+MIN_POLL_BUDGET = 1.0
 BOARDS = {"4g": (b"CXMT 4GB", b"4096"), "6g": (b"CXMT 6GB", b"6144")}
 # The pinned oreboot board's bt0/src/dram.rs, bt0/src/main.rs and
 # dram/src/sets.rs define the two emitted identity fields.
@@ -93,6 +95,13 @@ class SessionError(ValueError):
         self.code = code
 
 
+class PollingWindowExpired(SessionError):
+    """A check could not start in budget, or completed late without a hang."""
+
+    def __init__(self, message):
+        super().__init__(Exit.LIVE_TIMEOUT, message)
+
+
 class ClientWatch:
     def __init__(self, endpoint, stage):
         self.stage = stage
@@ -106,10 +115,12 @@ class ClientWatch:
             raise SessionError(Exit.CLIENT_GONE, f"{self.stage} client disconnected")
 
 
-def command_budget(deadline, purpose):
+def command_budget(deadline, purpose, *, minimum=0):
     seconds = deadline - time.monotonic()
     if seconds <= 0:
-        raise SessionError(Exit.LIVE_TIMEOUT, f"{purpose} deadline expired")
+        raise PollingWindowExpired(f"{purpose} deadline expired")
+    if seconds < minimum:
+        raise PollingWindowExpired(f"{purpose}: less than {minimum:g} s remaining")
     return seconds
 
 
@@ -276,7 +287,7 @@ class Selector:
     def __init__(self, path=None):
         self.path = path or SCRIPTS / "xfel-port"
 
-    def invoke(self, args, timeout, lease_fd, *, watch=None):
+    def invoke(self, args, timeout, lease_fd, *, watch=None, poll_deadline=None):
         # Orphaned descendants in the selector's process group are reparented
         # here so cancellation can reap them as well as the direct child.
         libc = ctypes.CDLL(None, use_errno=True)
@@ -286,6 +297,9 @@ class Selector:
         if watch is not None:
             watch()
         deadline = time.monotonic() + timeout
+        if poll_deadline is not None:
+            command_budget(poll_deadline, "selector", minimum=MIN_POLL_BUDGET)
+            deadline = min(deadline, poll_deadline)
         child = subprocess.Popen(
             [self.path, *args],
             stdin=subprocess.DEVNULL,
@@ -312,8 +326,8 @@ class Selector:
                     continue
                 if watch is not None:
                     watch()
-                if time.monotonic() >= deadline:
-                    raise subprocess.TimeoutExpired(args, timeout)
+                # Return a completed, drained result as such. Session.run
+                # still rejects late replies; they are not evidence of a hang.
                 break
         except subprocess.TimeoutExpired:
             out, err = self.cancel(child)
@@ -432,19 +446,27 @@ class Session:
                     )[-16:]
         self.peers = new
 
-    def run(self, *args, timeout=65):
+    def run(self, *args, timeout=65, poll_deadline=None):
         if self.watch is not None:
             self.watch()
-        deadline = time.monotonic() + timeout
+        if poll_deadline is None:
+            deadline = time.monotonic() + timeout
+            options = {}
+        else:
+            deadline = poll_deadline
+            options = {"poll_deadline": poll_deadline}
         self.observe()
         event = dict(argv=args, started_ns=time.time_ns())
         self.record["calls"].append(event)
         try:
             rc, out, err, timed_out = self.selector.invoke(
                 args,
-                command_budget(deadline, "selector"),
+                command_budget(
+                    deadline, "selector", minimum=MIN_POLL_BUDGET if options else 0
+                ),
                 self.lease_fd,
                 watch=self.watch,
+                **options,
             )
         except SessionError as exc:
             event.update(
@@ -459,11 +481,12 @@ class Session:
             event.update(exit=None, error=str(exc), ended_ns=time.time_ns())
             raise SessionError(Exit.TRANSPORT, f"cannot run selector: {exc}") from exc
         event.update(exit=rc, stderr=err, ended_ns=time.time_ns(), timed_out=timed_out)
-        if timed_out or time.monotonic() >= deadline:
+        if timed_out:
             raise SessionError(
                 Exit.LIVE_TIMEOUT,
                 "selector timed out; its process group was terminated and reaped",
             )
+        command_budget(deadline, "selector")
         if rc == SelectorExit.LOST:
             raise SessionError(
                 Exit.LOST_AFTER if self.submitted else Exit.LOST_BEFORE,
@@ -493,8 +516,10 @@ class Session:
             Exit.TRANSPORT, f"unexpected selector exit {rc}: {err.strip()}"
         )
 
-    def discover(self, *, timeout=65):
-        number = self.run("--discover", "--port", self.port, timeout=timeout).strip()
+    def discover(self, *, poll_deadline=None):
+        number = self.run(
+            "--discover", "--port", self.port, poll_deadline=poll_deadline
+        ).strip()
         if (
             not number.isascii()
             or not number.isdecimal()
@@ -503,7 +528,7 @@ class Session:
             raise SessionError(Exit.IDENTITY, "invalid selector discovery output")
         return int(number)
 
-    def at(self, number, *command, timeout=65):
+    def at(self, number, *command, timeout=65, poll_deadline=None):
         return self.run(
             "--port",
             self.port,
@@ -512,12 +537,14 @@ class Session:
             "--",
             *command,
             timeout=timeout,
+            poll_deadline=poll_deadline,
         )
 
     def probe(self, number, *, deadline=None):
+        if deadline is not None:
+            command_budget(deadline, "reconnect probe", minimum=MIN_POLL_BUDGET)
         self.event("probe-attempt", devnum=number)
-        timeout = 65 if deadline is None else command_budget(deadline, "reconnect")
-        version = self.at(number, "version", timeout=timeout)
+        version = self.at(number, "version", poll_deadline=deadline)
         if deadline is not None:
             command_budget(deadline, "reconnect")
         if EXACT_ID.findall(version) != ["0x00190300"]:
@@ -539,7 +566,7 @@ class Session:
         self.commit(devnum=number, epoch=1, pending=None)
         return version
 
-    def __call__(self, *command, timeout=65):
+    def __call__(self, *command, timeout=65, poll_deadline=None):
         if self.state is None or self.state["pending"] is not None:
             raise SessionError(
                 Exit.IDENTITY, "FEL command requires a live verified epoch"
@@ -548,7 +575,9 @@ class Session:
             raise SessionError(
                 Exit.INPUT, "reset or Entry 2 requires the submission gate"
             )
-        return self.at(self.state["devnum"], *command, timeout=timeout)
+        return self.at(
+            self.state["devnum"], *command, timeout=timeout, poll_deadline=poll_deadline
+        )
 
     def submit(self, command, *, returns, timeout=65):
         if self.state is None or self.state["pending"] is not None:
@@ -579,24 +608,17 @@ class Session:
             if observe is not None:
                 observe()
             try:
-                budget = command_budget(deadline, "reconnect")
-                if (
-                    budget < 1
-                    and last_observation is not None
-                    and last_observation.code == Exit.LOST_AFTER
-                ):
-                    # Don't start a discovery with a subsecond budget after loss.
-                    break
-                number = self.discover(timeout=budget)
+                command_budget(deadline, "reconnect", minimum=MIN_POLL_BUDGET)
+                number = self.discover(poll_deadline=deadline)
                 command_budget(deadline, "reconnect")
+            except PollingWindowExpired as exc:
+                if last_observation is None:
+                    raise
+                if self.watch is not None:
+                    self.watch()
+                raise last_observation from exc
             except SessionError as exc:
-                if (
-                    exc.code == Exit.LIVE_TIMEOUT
-                    and last_observation is not None
-                    and time.monotonic() >= deadline
-                ):
-                    raise last_observation from exc
-                if exc.code != Exit.LOST_AFTER or time.monotonic() >= deadline:
+                if exc.code != Exit.LOST_AFTER:
                     raise
                 last_observation = exc
             else:
@@ -611,9 +633,6 @@ class Session:
                     Exit.IDENTITY, "no fresh enumeration after submission"
                 )
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-        if self.watch is not None:
-            self.watch()
-        raise last_observation
 
     def watchdog(self):
         for command in WDT[:-1]:
@@ -1126,7 +1145,8 @@ def wait_for_handover_target(mailbox, record, seconds=10):
             # Only a classified disconnect can proceed without an ACKed mailbox
             # read; a generic failure is never treated as offline handover.
             try:
-                current = mailbox(command_budget(deadline, "Entry 2 mailbox"))
+                command_budget(deadline, "Entry 2 mailbox", minimum=MIN_POLL_BUDGET)
+                current = mailbox(deadline)
             except SessionError as exc:
                 if exc.code != Exit.LOST_AFTER:
                     raise
@@ -1145,8 +1165,8 @@ def wait_for_handover_target(mailbox, record, seconds=10):
                 return
             stuck = True
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-    except SessionError as exc:
-        if stuck and exc.code == Exit.LIVE_TIMEOUT and time.monotonic() >= deadline:
+    except PollingWindowExpired as exc:
+        if stuck:
             raise SessionError(
                 Exit.SERIAL_UNCONFIRMED, "Entry 2 mailbox remained at 0x11"
             ) from exc
@@ -1205,7 +1225,9 @@ def workspace_boot(args, fd, record):
         try:
             record["handover_cursor"] = cursor = serial.capture(generation)
             wait_for_handover_target(
-                lambda budget: cached["read_mailbox"](session, work, timeout=budget),
+                lambda deadline: cached["read_mailbox"](
+                    partial(session, poll_deadline=deadline), work
+                ),
                 record,
             )
             wait_for_handover(serial, cursor, record)

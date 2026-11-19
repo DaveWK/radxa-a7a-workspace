@@ -65,19 +65,22 @@ python3 -I scripts/fel_session.py verify-handover --receipt "$run/receipt.json"
 ```
 
 On the cached path, resume never exits 0. After the Entry 2 ACK it waits
-up to 60 seconds for the board to re-enumerate in FEL, seals the serial
-slice from Entry 2 to that moment in the receipt (`handover_end`,
-`handover_sha256`), and exits with one of these normal outcomes:
+up to 60 seconds for the board to re-enumerate in FEL; it does not start
+another device check with less than one second remaining. It attempts to
+seal the serial slice from Entry 2 to the end of reconnect in the receipt
+(`handover_end`, `handover_sha256`). These are the normal resume outcomes:
 
 | Resume exit | Receipt `reconnect` | Meaning |
 |---:|---|---|
 | 3 | `{"exit": 0, "outcome": "verified"}` | The board is already back in FEL (a short run) |
-| 5 | `{"exit": 5, "outcome": "lost"}` | The board left FEL and stayed away for the 60-second reconnect window. The slice is sealed; this is normal for a long memtest, when `main` may still be running. |
+| 5 | `{"exit": 5, "outcome": "lost"}` | The board was seen to leave FEL and no return was observed. This is normal for a long memtest, when `main` may still be running. |
 
-Only these two outcomes permit `verify-handover`; its exit 0 is the
-confirmed handover. Any other resume exit, or any other `reconnect`
-value, cannot be confirmed. Each preflight needs a new `--state` path
-(and a new receipt): the session refuses an existing state file.
+Neither outcome by itself confirms handover: a valid seal and an exit of 0
+from `verify-handover` are required. Resume can still exit 5 if sealing fails;
+in that case the receipt has `handover_capture_error` and no valid seal.
+Any other resume exit, or any other `reconnect` value, cannot be confirmed.
+Each preflight needs a new `--state` path (and a new receipt): the session
+refuses an existing state file.
 
 Keep the preflight caller open until it returns ready, and keep the resume
 caller open for the rest of the transaction. If either disconnects at its
