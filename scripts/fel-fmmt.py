@@ -54,11 +54,25 @@ def files(volume, data, boot=False):
     # bytes instead (DXE FwVol.c:636, Ffs.c:92-102).
     hdr = data[: volume.Data.HeaderLength]
     require(
-        len(hdr) >= 72
+        72 <= len(hdr) == volume.Data.HeaderLength
         and len(hdr) % 2 == 0
         and not sum(w[0] for w in struct.iter_unpack("<H", hdr)) & 0xFFFF,
         "invalid FV header checksum",
     )
+    # edk2 556dcfb: FwVolBlock.c:507-513 counts the LBAs; :356-358
+    # rejects reads beyond them. DXE FwVol.c:190-195,229-235 reads the
+    # header via ReadFvbData (:88-109), which can cross block boundaries.
+    readable = 0
+    for pos in range(56, len(hdr) - 7, 8):
+        count, length = struct.unpack_from("<II", hdr, pos)
+        if (count, length) == (0, 0):
+            break
+        require(count and length, "invalid FV block map entry")
+        readable += count * length
+    else:
+        require(False, "unterminated FV block map")
+    require(readable >= len(hdr), "FV block map cannot cover the header")
+    require(readable == len(data), "FV block map does not cover the volume")
     polarity = 255 if volume.Data.Header.Attributes & 0x800 else 0
     for node in volume.Child:
         if node.type not in ("FFS", "FFS_PAD"):

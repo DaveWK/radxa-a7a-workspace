@@ -148,6 +148,14 @@ elif tool == "build":
         attrs = 0x800 if not boot and case == "no-read-status" else 0x804
         struct.pack_into("<Q4sIHHHBBIIII", hdr, 32, size, b"_FVH", attrs,
                          72, 0, 0, 0, 2, size, 1, 0, 0)
+        if not boot and case == "one-short-block":
+            struct.pack_into("<II", hdr, 56, 1, 32)
+        elif boot and case == "short-map":
+            struct.pack_into("<II", hdr, 56, 1, size-1)
+        elif not boot and case == "no-map-terminator":
+            struct.pack_into("<II", hdr, 64, 1, 1)
+        elif not boot and case == "zero-block-size":
+            struct.pack_into("<II", hdr, 56, 1, 0)
         struct.pack_into("<H", hdr, 50, -sum(struct.unpack("<36H",hdr)) & 0xffff)
         return (hdr + content).ljust(size, b"\xff")
 
@@ -1009,6 +1017,17 @@ class GateTests(unittest.TestCase):
             ("wrong-type", "board DTB section is not RAW"),
             ("outside-boot", "FVMAIN container, found 0"),
             ("two-files", "board DTB file, found 2"),
+        ):
+            with self.subTest(case=case):
+                self.refusal(self.make("fel-image", FAKE_EMBED=case), reason)
+                self.assertFalse((self.workspace / "out/fel/.records").exists())
+
+    def test_fv_block_map(self):
+        for case, reason in (
+            ("one-short-block", "cannot cover the header"),
+            ("short-map", "does not cover the volume"),
+            ("no-map-terminator", "unterminated FV block map"),
+            ("zero-block-size", "invalid FV block map entry"),
         ):
             with self.subTest(case=case):
                 self.refusal(self.make("fel-image", FAKE_EMBED=case), reason)
