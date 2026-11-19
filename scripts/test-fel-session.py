@@ -30,7 +30,7 @@ class FakeSelector:
     def peers(self, port):
         return {}
 
-    def invoke(self, args, timeout, lease_fd):
+    def invoke(self, args, timeout, lease_fd, *, watch=None):
         if args[0] == "--discover":
             key, text = ("discover",), str(self.devnum)
         else:
@@ -91,14 +91,51 @@ class SessionTests(Fixture):
         old = self.state.read_bytes()
         self.selector.devnum = 24
         self.selector.failure[("version",)] = 65
-        self.assert_exit(EXIT.ACK, session.reconnect, seconds=0)
+        self.assert_exit(EXIT.ACK, session.reconnect, seconds=0.2)
         self.assertEqual(old, self.state.read_bytes())
         self.assertEqual(self.record["devnums"], [12])
         self.selector.failure.clear()
-        session.reconnect(seconds=0)
+        session.reconnect(seconds=0.2)
         self.assertEqual(self.record["devnums"], [12, 24])
         self.assertIsNone(session.state["pending"])
         self.assertEqual(session.state["epoch"], 2)
+
+    def test_reconnect_passes_remaining_time_and_rejects_late_acked_probe(self):
+        session = self.make_session()
+        session.start()
+        session.submit(M["WDT"][-1], returns=True)
+        self.selector.devnum = 24
+        old = self.state.read_bytes()
+        clock = [100.0]
+        observed = []
+        original = self.selector.invoke
+
+        def late(args, timeout, lease_fd, *, watch=None):
+            observed.append(timeout)
+            reply = original(args, timeout, lease_fd, watch=watch)
+            clock[0] += 59 if args[0] == "--discover" else 2
+            return reply
+
+        with patch("time.monotonic", side_effect=lambda: clock[0]):
+            with patch.object(self.selector, "invoke", side_effect=late):
+                self.assert_exit(EXIT.LIVE_TIMEOUT, session.reconnect)
+        self.assertEqual(observed, [60, 1])
+        self.assertEqual(self.state.read_bytes(), old)
+        self.assertEqual(self.record["devnums"], [12])
+
+    def test_entry_two_mailbox_budget_does_not_accept_late_ready(self):
+        clock, observed = [100], []
+
+        def mailbox(timeout):
+            observed.append(timeout)
+            clock[0] += 11
+            return (0x46413741, 0x21, 4096, 1200)
+
+        with patch("time.monotonic", side_effect=lambda: clock[0]):
+            self.assert_exit(
+                EXIT.LIVE_TIMEOUT, M["wait_for_handover_target"], mailbox, {}
+            )
+        self.assertEqual(observed, [10])
 
     def test_loss_before_and_after_without_submission_ack(self):
         session = self.make_session()
@@ -318,6 +355,7 @@ class SerialTests(Fixture):
             port=PORT,
             handover_cursor=cursor,
             handover_end_cursor=self.serial.capture(cursor),
+            handover_sha256=M["sha"](RVBAR + PROMPT),
             events=[],
             reconnect=dict(outcome="verified", exit=0),
         )

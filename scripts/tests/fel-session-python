@@ -30,10 +30,10 @@ with patch("pwd.getpwuid", return_value=SimpleNamespace(pw_dir=str(home))):
     if os.getenv("FEL_FIXTURE_TIMEOUT"):
         invoke = entry["Selector"].invoke
 
-        def shorter(self, argv, timeout, lease_fd):
+        def shorter(self, argv, timeout, lease_fd, **options):
             if argv[-1] == "version" and argv[3] == "22":
                 timeout = 0.35
-            return invoke(self, argv, timeout, lease_fd)
+            return invoke(self, argv, timeout, lease_fd, **options)
 
         entry["Selector"].invoke = shorter
     entry["cli"](entry["cached_main"] if args[:1] == ["--stage"] else entry["main"])

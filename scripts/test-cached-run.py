@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Cached-set host fixtures. The transport records calls in memory."""
 
+import fcntl
 import hashlib
 import json
 import os
@@ -25,8 +26,8 @@ ORDER = """# Set A — 2400 MHz — cached memtest
 3. After that gate, upload/read back the table frame to 0xdf200, then layout kind 1 (main) to 0x40000000 and kind 2 (EDK2 FD) to 0x41000000.
 4. Execute entry 2 (0x90044).
 """
-FAKE = """#!/usr/bin/python3 -I
-import os, shutil, struct, sys, time
+FAKE = r"""#!/usr/bin/python3 -I
+import os, shutil, signal, socket, struct, sys, time
 from pathlib import Path
 
 ports = Path(os.environ["FEL_SYSFS_ROOT"])
@@ -54,7 +55,9 @@ try:
 except FileNotFoundError:
     sys.exit(66)
 root = fixture / port
-mb, name = {"3-3.4": (4096, "CXMT 4GB"), "3-6": (6144, "CXMT 6GB")}[port]
+# GPIO wording and the 163 mV ADC line: archived serial-pass1.log:11–12.
+# The 6 GB values come from the firmware's PARAM_SETS and ADC_STRAPS.
+mb, name, mv = {"3-3.4": (4096, "CXMT 4GB", 163), "3-6": (6144, "CXMT 6GB", 382)}[port]
 
 if cmd == "version":
     if int(number) >= 22 and (rc := os.getenv("RECONNECT_RC")):
@@ -63,15 +66,26 @@ if cmd == "version":
         sys.exit(int(rc))
     print("AWUC ID=0x00190300(A733)")
 elif cmd == "write":
+    if args[0] == os.getenv("CANCEL_AT"):
+        with socket.socket(socket.AF_UNIX) as control:
+            control.connect("\0" + os.environ["CANCEL_CONTROL"])
+            signal.signal(signal.SIGTERM, lambda *_: control.sendall(b"term\n"))
+            control.sendall(f"ready {os.getpid()}\n".encode())
+            control.recv(1)  # The host must cancel the group rather than release this write.
     shutil.copyfile(args[1], root / args[0])
 elif cmd == "read":
     data = (root / args[0]).read_bytes()
     Path(args[2]).write_bytes(data[:int(args[1])])
 elif (cmd, args) == ("exec", ["0x90040"]):
     (root / "0xdf000").write_bytes(struct.pack("<7I", 0x46413741, 0x11, mb, 2400, 0, 0, 0))
-    with Path((root / "serial-path").read_text()).open("a") as log:
-        print(f"[bt0] DRAM: strap 640 mV (nearest 640 mV) -> {name}", file=log)
-        print(f"[bt0] DRAM: {mb} MiB", file=log)
+    with Path((root / "serial-path").read_text()).open("ab") as log:
+        lines = [
+            "[bt0] DRAM: strap GPIOs PH17:PH16 = 10 (GPIO strap not fitted); selecting by the ADC",
+            f"[bt0] DRAM: strap {mv} mV (nearest {mv} mV) -> {name}",
+            f"[bt0] DRAM: init with {name} parameters (2400 MHz)",
+            f"[bt0] DRAM: {mb} MiB",
+        ]
+        log.write(("\r\n".join(lines) + "\r\n").encode())
 elif (cmd, args) == ("exec", ["0x90044"]):
     if os.getenv("REJECT_ENTRY_TWO"):
         sys.exit(76)
@@ -89,6 +103,7 @@ elif (cmd, args) == ("exec", ["0x90044"]):
             time.sleep(0.02)
     device.rename(reset)
     (reset / "devnum").write_text(str(int(number) + 10))
+    (root / "reset-ready").touch()
     # Return the acknowledgement while the port is absent; fixture controller
     # alone decides when the two devices reappear.
 """
@@ -136,7 +151,7 @@ class CachedTests(unittest.TestCase):
     def stage(self):
         return cached["stage"](self.source, self.work, self.manifest())
 
-    def call(self, cmd, *args):
+    def call(self, cmd, *args, timeout=65):
         self.calls.append((cmd, *args))
         if cmd == "version":
             return "AWUC    ID=0x00190300(A733) dflag=0x00"
@@ -184,7 +199,7 @@ class CachedTests(unittest.TestCase):
     def test_readback_mismatch(self):
         self.stage()
 
-        def corrupt(cmd, *args):
+        def corrupt(cmd, *args, timeout=65):
             result = self.call(cmd, *args)
             if cmd == "read":
                 Path(args[-1]).write_bytes(b"incorrect")
@@ -243,6 +258,7 @@ class RunnerTests(unittest.TestCase):
             shutil.copy2(SCRIPTS / name, scripts)
         shutil.copytree(SCRIPTS / "lib", scripts / "lib")
         self.runner = scripts / "fel_session.py"
+        self.resume_cli = scripts / "a7a-cached-run"
         self.python = self.root / "python3"
         shutil.copy2(SCRIPTS / "tests/fel-session-python", self.python)
         self.python.chmod(0o700)
@@ -258,8 +274,11 @@ class RunnerTests(unittest.TestCase):
         )
 
     def launch(self, stage, *args):
+        entry = (
+            [self.resume_cli] if stage == "resume" else [self.python, "-I", self.runner]
+        )
         return subprocess.Popen(
-            [self.python, "-I", self.runner, "--stage", stage, *args],
+            [*entry, "--stage", stage, *args],
             env=self.env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -283,9 +302,9 @@ class RunnerTests(unittest.TestCase):
     def receipt(self, port):
         return json.loads(self.paths(port)[0].read_text())
 
-    def preflight(self, port="3-3.4", rc=0):
+    def launch_preflight(self, port):
         receipt, state = self.paths(port)
-        proc = self.launch(
+        return self.launch(
             "preflight",
             "--port",
             port,
@@ -300,7 +319,9 @@ class RunnerTests(unittest.TestCase):
             "--serial-log",
             self.logs[port],
         )
-        err = self.finish(proc, rc)
+
+    def preflight(self, port="3-3.4", rc=0):
+        err = self.finish(self.launch_preflight(port), rc)
         self.assert_no_dram(port)
         return err
 
@@ -339,13 +360,21 @@ class RunnerTests(unittest.TestCase):
 
     def wait_offline(self, port):
         target = self.sysfs / (port + ".offline")
-        self.wait_path(target / "devnum")
+        self.wait_path(self.root / port / "reset-ready")
+        self.assertRegex((target / "devnum").read_text(), r"^[0-9]+$")
         return target
 
     def test_happy_path_ack_disappears_and_reconnects(self):
         self.setup_runner()
         self.preflight()
-        with self.resume() as proc:
+        port = "3-3.4"
+        # The range may omit the legitimate GPIO diagnostic even though the
+        # guardian scans the full Entry 1 window.
+        start = self.receipt(port)["identity_window_start"]
+        data = self.logs[port].read_bytes()
+        self.assertIn(b"selecting by the ADC\r\n", data[start:])
+        start = data.index(b"\n", start) + 1
+        with self.resume(port, self.range(port, start=start)) as proc:
             offline = self.wait_offline("3-3.4")
             self.assertFalse((self.sysfs / "3-3.4").exists())
             offline.rename(self.sysfs / "3-3.4")
@@ -419,6 +448,7 @@ class RunnerTests(unittest.TestCase):
             "wrong digest": "identity clearance digest mismatch",
             "wrong board": "one matching strap and size",
             "two straps": "one matching strap and size",
+            "malformed ADC": "one matching strap and size",
             "wrong log": "invalid identity clearance path",
             "mid-line": "complete serial line boundaries",
             "size first": "strap and size identity in order",
@@ -454,8 +484,12 @@ class RunnerTests(unittest.TestCase):
                 elif case == "two straps":
                     with log.open("ab") as stream:
                         stream.write(
-                            b"[bt0] DRAM: strap 640 mV (nearest 640 mV) -> CXMT 4GB\n"
+                            b"[bt0] DRAM: strap 163 mV (nearest 163 mV) -> CXMT 4GB\r\n"
                         )
+                elif case == "malformed ADC":
+                    log.write_bytes(
+                        log.read_bytes().replace(b"nearest 163 mV", b"nearest error mV")
+                    )
                 elif case == "wrong log":
                     clearance = self.range(port, path=self.logs["3-6"])
                 elif case in (
@@ -473,7 +507,8 @@ class RunnerTests(unittest.TestCase):
                         )
                     elif case == "size first":
                         lines = data.splitlines(keepends=True)
-                        log.write_bytes(prefix + b"".join(reversed(lines)))
+                        lines[1], lines[3] = lines[3], lines[1]
+                        log.write_bytes(prefix + b"".join(lines))
                     elif case == "skipped failure":
                         failure = b"[bt0] halted; resetting\n"
                         log.write_bytes(prefix + failure + data)
@@ -578,7 +613,11 @@ class RunnerTests(unittest.TestCase):
                     offline = self.wait_offline(port)
                     self.wait_path(self.root / port / "poll-peer-present")
                     with self.logs[port].open("ab") as stream:
-                        stream.write(b"[bt0] RVBAR 00000000:40000000, fixture\nmain>")
+                        stream.write(
+                            b"[bt0] RVBAR 00000000:40000000, fixture\n"
+                            + b"ordinary output\n" * 600
+                            + b"main>"
+                        )
                     offline.rename(self.sysfs / port)
                     self.finish(proc, code)
                 expected = (
@@ -602,6 +641,74 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(
                     verified.returncode, verify_code, verified.stdout + verified.stderr
                 )
+                if outcome == "":
+                    log = self.logs[port]
+                    old = log.read_bytes()
+                    # Still matches both anchors and the marker grammar.
+                    log.write_bytes(
+                        old.replace(b"ordinary output", b"modified output", 1)
+                    )
+                    replay = subprocess.run(
+                        verified.args,
+                        env=self.env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(
+                        replay.returncode, 3, replay.stdout + replay.stderr
+                    )
+                    self.assertIn(
+                        "closed handover slice digest mismatch", replay.stderr
+                    )
+
+    def test_actual_client_death_cancels_inflight_transfer_and_keeps_fence(self):
+        port = "3-3.4"
+        for stage, address in (("preflight", "0xdf000"), ("resume", "0xdf200")):
+            with self.subTest(stage=stage):
+                self.setUp()
+                self.setup_runner()
+                name = hashlib.sha256(os.fsencode(self.root)).hexdigest()
+                self.env.update(CANCEL_AT=address, CANCEL_CONTROL=name)
+                if stage == "resume":
+                    self.preflight(port)
+                with socket.socket(socket.AF_UNIX) as listener:
+                    listener.bind("\0" + name)
+                    listener.listen()
+                    listener.settimeout(5)
+                    proc = (
+                        self.resume(port)
+                        if stage == "resume"
+                        else self.launch_preflight(port)
+                    )
+                    with proc:
+                        control, _ = listener.accept()
+                        with control, control.makefile("rb") as frames:
+                            control.settimeout(5)
+                            ready = frames.readline(64)
+                            self.assertRegex(ready, rb"^ready [0-9]+\n$")
+                            transfer = int(ready.split()[1])
+                            proc.kill()
+                            self.assertEqual(proc.wait(timeout=5), -9)
+                            self.assertEqual(frames.readline(64), b"term\n")
+                            lock = self.home / ".cache/a7a-fel-locks" / f"{port}.lock"
+                            with lock.open("a") as competing:
+                                with self.assertRaises(BlockingIOError):
+                                    fcntl.flock(
+                                        competing, fcntl.LOCK_EX | fcntl.LOCK_NB
+                                    )
+                            self.assertEqual(frames.readline(64), b"")
+                deadline = time.monotonic() + 5
+                while (receipt := self.receipt(port))["status"] != f"{stage}-refused":
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                self.assertIn(f"{stage} client disconnected", receipt["error"])
+                self.assertTrue(receipt["calls"][-1]["client_disconnected"])
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(transfer, 0)
+                self.assert_no_dram(port)
+                self.assertFalse((self.root / port / "entry-two").exists())
+                self.assertEqual(receipt["calls"][-1]["argv"][5:7], ["write", address])
 
 
 if __name__ == "__main__":

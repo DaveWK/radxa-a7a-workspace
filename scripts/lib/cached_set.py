@@ -97,10 +97,10 @@ def put(call, work, address, source):
         raise ValueError(f"read-back mismatch at {address}")
 
 
-def read_mailbox(call, work):
+def read_mailbox(call, work, *, timeout=65):
     mailbox = work / "mailbox"
     mailbox.unlink(missing_ok=True)
-    call("read", "0xdf000", "28", str(mailbox))
+    call("read", "0xdf000", "28", str(mailbox), timeout=timeout)
     data = mailbox.read_bytes()
     if len(data) != 28:
         raise ValueError("short Entry 1 mailbox")
@@ -120,16 +120,18 @@ def entry_one(call, work, port, mhz, before_exec=lambda: None):
     call("read32", "0x90040")
     deadline = time.monotonic() + 60
     before_exec()
-    call("exec", "0x90040")
+    call("exec", "0x90040", timeout=max(0, deadline - time.monotonic()))
     while time.monotonic() < deadline:
-        mailbox = read_mailbox(call, work)
+        mailbox = read_mailbox(call, work, timeout=max(0, deadline - time.monotonic()))
+        if time.monotonic() >= deadline:
+            break
         state = mailbox[1]
         if state == 0x11:
             require_ready(mailbox, port, mhz)
             return mailbox
         if state not in (0, 0x10):
             raise ValueError(f"unexpected Entry 1 mailbox state {state:#x}")
-        time.sleep(0.5)
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
     raise ValueError("Entry 1 mailbox timeout")
 
 

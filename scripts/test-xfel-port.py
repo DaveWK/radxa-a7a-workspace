@@ -276,9 +276,11 @@ class SelectorTests(unittest.TestCase):
                 text=True,
             ) as proc:
                 control, _ = listener.accept()
-                with control, lock.open("a") as probe:
+                with control, control.makefile("rb") as frames, lock.open("a") as probe:
                     control.settimeout(5)
-                    transfer, parent = map(int, control.recv(64).split())
+                    frame = frames.readline(64)
+                    self.assertRegex(frame, rb"^[0-9]+ [0-9]+\n$")
+                    transfer, parent = map(int, frame.split())
                     selector = int(proc.stdout.readline())
                     self.assertEqual(parent, selector)
                     proc.kill()

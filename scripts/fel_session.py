@@ -14,6 +14,7 @@ from pathlib import Path
 import pwd
 import re
 import runpy
+import select
 import shutil
 import signal
 import socket
@@ -49,6 +50,10 @@ BOARDS = {"4g": (b"CXMT 4GB", b"4096"), "6g": (b"CXMT 6GB", b"6144")}
 # The pinned oreboot board's bt0/src/dram.rs, bt0/src/main.rs and
 # dram/src/sets.rs define the two emitted identity fields.
 STRAP = re.compile(rb"\[bt0\] DRAM: strap [0-9]+ mV \(nearest [0-9]+ mV\) -> (.+)")
+GPIO_STRAP = re.compile(
+    rb"\[bt0\] DRAM: strap GPIOs PH17:PH16 = (?:01|10|11) "
+    rb"\(GPIO strap not fitted\); selecting by the ADC"
+)
 SIZE = re.compile(rb"\[bt0\] DRAM: ([0-9]+) MiB")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 WDT = (
@@ -69,6 +74,7 @@ class Exit(IntEnum):
     IDENTITY = 8
     LEASE = 9
     TRANSPORT = 10
+    CLIENT_GONE = 11
 
 
 class SelectorExit(IntEnum):
@@ -85,6 +91,26 @@ class SessionError(ValueError):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+class ClientWatch:
+    def __init__(self, endpoint, stage):
+        self.stage = stage
+        self.poller = select.poll()
+        self.poller.register(
+            endpoint, select.POLLERR | select.POLLHUP | select.POLLRDHUP
+        )
+
+    def __call__(self):
+        if self.poller.poll(0):
+            raise SessionError(Exit.CLIENT_GONE, f"{self.stage} client disconnected")
+
+
+def command_budget(deadline, purpose):
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise SessionError(Exit.LIVE_TIMEOUT, f"{purpose} deadline expired")
+    return seconds
 
 
 def atomic(path, data):
@@ -250,13 +276,16 @@ class Selector:
     def __init__(self, path=None):
         self.path = path or SCRIPTS / "xfel-port"
 
-    def invoke(self, args, timeout, lease_fd):
+    def invoke(self, args, timeout, lease_fd, *, watch=None):
         # Orphaned descendants in the selector's process group are reparented
         # here so cancellation can reap them as well as the direct child.
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.prctl(36, 1, 0, 0, 0):  # PR_SET_CHILD_SUBREAPER
             code = ctypes.get_errno()
             raise OSError(code, os.strerror(code))
+        if watch is not None:
+            watch()
+        deadline = time.monotonic() + timeout
         child = subprocess.Popen(
             [self.path, *args],
             stdin=subprocess.DEVNULL,
@@ -269,12 +298,31 @@ class Selector:
             start_new_session=True,
         )
         try:
-            out, err = child.communicate(timeout=timeout)
+            while True:
+                seconds = deadline - time.monotonic()
+                if seconds <= 0:
+                    raise subprocess.TimeoutExpired(args, timeout)
+                if watch is not None:
+                    watch()
+                try:
+                    out, err = child.communicate(
+                        timeout=min(seconds, 0.05) if watch else seconds
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
+                if watch is not None:
+                    watch()
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(args, timeout)
+                break
         except subprocess.TimeoutExpired:
             out, err = self.cancel(child)
             return child.returncode, out, err, True
-        except BaseException:
-            self.cancel(child)
+        except BaseException as problem:
+            try:
+                self.cancel(child)
+            except SessionError as cancellation:
+                raise problem from cancellation
             raise
         else:
             try:
@@ -359,6 +407,7 @@ class Session:
         self.state = None
         self.submission_attempted = False
         self.submitted = False
+        self.watch = None
         self.record.setdefault("calls", [])
         self.record.setdefault("events", [])
         self.record.setdefault("devnums", [])
@@ -384,21 +433,33 @@ class Session:
         self.peers = new
 
     def run(self, *args, timeout=65):
+        if self.watch is not None:
+            self.watch()
+        deadline = time.monotonic() + timeout
         self.observe()
         event = dict(argv=args, started_ns=time.time_ns())
         self.record["calls"].append(event)
         try:
-            rc, out, err, timed_out = self.selector.invoke(args, timeout, self.lease_fd)
+            rc, out, err, timed_out = self.selector.invoke(
+                args,
+                command_budget(deadline, "selector"),
+                self.lease_fd,
+                watch=self.watch,
+            )
         except SessionError as exc:
             event.update(
-                exit=None, error=str(exc), ended_ns=time.time_ns(), timed_out=True
+                exit=None,
+                error=str(exc),
+                ended_ns=time.time_ns(),
+                timed_out=exc.code == Exit.LIVE_TIMEOUT,
+                client_disconnected=exc.code == Exit.CLIENT_GONE,
             )
             raise
         except OSError as exc:
             event.update(exit=None, error=str(exc), ended_ns=time.time_ns())
             raise SessionError(Exit.TRANSPORT, f"cannot run selector: {exc}") from exc
         event.update(exit=rc, stderr=err, ended_ns=time.time_ns(), timed_out=timed_out)
-        if timed_out:
+        if timed_out or time.monotonic() >= deadline:
             raise SessionError(
                 Exit.LIVE_TIMEOUT,
                 "selector timed out; its process group was terminated and reaped",
@@ -432,8 +493,8 @@ class Session:
             Exit.TRANSPORT, f"unexpected selector exit {rc}: {err.strip()}"
         )
 
-    def discover(self):
-        number = self.run("--discover", "--port", self.port).strip()
+    def discover(self, *, timeout=65):
+        number = self.run("--discover", "--port", self.port, timeout=timeout).strip()
         if (
             not number.isascii()
             or not number.isdecimal()
@@ -453,9 +514,12 @@ class Session:
             timeout=timeout,
         )
 
-    def probe(self, number):
+    def probe(self, number, *, deadline=None):
         self.event("probe-attempt", devnum=number)
-        version = self.at(number, "version")
+        timeout = 65 if deadline is None else command_budget(deadline, "reconnect")
+        version = self.at(number, "version", timeout=timeout)
+        if deadline is not None:
+            command_budget(deadline, "reconnect")
         if EXACT_ID.findall(version) != ["0x00190300"]:
             raise SessionError(Exit.IDENTITY, "expected exact A733 ID=0x00190300")
         self.event("probe-verified", devnum=number)
@@ -508,17 +572,22 @@ class Session:
             raise SessionError(Exit.IDENTITY, "no acknowledged reset is pending")
         deadline = time.monotonic() + seconds
         self.event("reconnect-attempt", devnum=self.state["devnum"])
+        last_loss = None
         while True:
+            if time.monotonic() >= deadline and last_loss is not None:
+                raise last_loss
             if observe is not None:
                 observe()
             try:
-                number = self.discover()
+                number = self.discover(timeout=command_budget(deadline, "reconnect"))
             except SessionError as exc:
                 if exc.code != Exit.LOST_AFTER or time.monotonic() >= deadline:
                     raise
+                last_loss = exc
             else:
+                last_loss = None
                 if number != self.state["devnum"]:
-                    self.probe(number)
+                    self.probe(number, deadline=deadline)
                     self.commit(
                         devnum=number, epoch=self.state["epoch"] + 1, pending=None
                     )
@@ -580,7 +649,7 @@ def clear_identity(serial, cursor, clearance, board, expected_mb):
             banners += 1
             if banners > 1 or markers:
                 raise ValueError("another boot in Entry 1 capture window")
-        if line.startswith(b"[bt0] DRAM: strap"):
+        if line.startswith(b"[bt0] DRAM: strap") and not GPIO_STRAP.fullmatch(line):
             match = STRAP.fullmatch(line)
             markers.append(("strap", match[1] if match else None, offset, line_end))
         if re.match(rb"\[bt0\] DRAM: [0-9]+ .*MiB", line):
@@ -745,15 +814,18 @@ def cached_resume(request, receipt, session, serial, cached, work):
         close_handover(serial, record, rolling)
     except (OSError, ValueError) as exc:
         raise SessionError(Exit.SERIAL_UNCONFIRMED, str(exc)) from exc
+    if session.watch is not None:
+        session.watch()
     record["reconnect_epoch"] = session.state
     record["status"] = "reconnected-handover-unconfirmed"
     return Exit.SERIAL_UNCONFIRMED, record["handover"]
 
 
 def close_handover(serial, record, rolling):
-    end = serial.capture(record["handover_cursor"], rolling=rolling)
-    record["handover_end"] = end["start"]
-    record["handover_end_cursor"] = end
+    eof, end, data = serial.observe(record["handover_cursor"], rolling=rolling)
+    record["handover_end"] = end
+    record["handover_end_cursor"] = eof
+    record["handover_sha256"] = sha(data)
 
 
 def guardian(args, reply):
@@ -778,6 +850,7 @@ def guardian(args, reply):
         if os.path.lexists(args.state):
             raise SessionError(Exit.IDENTITY, "preflight requires fresh FEL state")
         session = Session(args.port, args.state, receipt.record, fd)
+        session.watch = ClientWatch(reply, "preflight")
         serial = Serial(args.port, args.serial_log)
         cached = runpy.run_path(str(SCRIPTS / "lib/cached_set.py"))
         with tempfile.TemporaryDirectory(dir=receipt.path.parent) as scratch:
@@ -807,13 +880,23 @@ def guardian(args, reply):
                 record["entry_one_monotonic"] = time.monotonic()
                 record["epoch"] = session.state
                 record["epoch_sha256"] = state_hash(session)
+                session.watch()
                 receipt.ready()
+                session.watch()
             except Exception as exc:
                 receipt.record.update(status="preflight-refused", error=str(exc))
                 receipt.save()
                 raise
-            send(reply, Exit.SUCCESS, "")
+            try:
+                send(reply, Exit.SUCCESS, "")
+            except BrokenPipeError as exc:
+                record.update(
+                    status="preflight-refused", error="preflight client disconnected"
+                )
+                receipt.save()
+                raise SessionError(Exit.CLIENT_GONE, record["error"]) from exc
             reply.close()
+            session.watch = None
             deadline = record["entry_one_monotonic"] + IDENTITY_LIFETIME
             while True:
                 try:
@@ -836,6 +919,8 @@ def guardian(args, reply):
                     try:
                         request = receive_request(conn, deadline)
                         request_received = True
+                        session.watch = ClientWatch(conn, "resume")
+                        session.watch()
                         code, message = cached_resume(
                             request, receipt, session, serial, cached, work
                         )
@@ -847,7 +932,11 @@ def guardian(args, reply):
                         record.update(status="resume-expired", error=message)
                     except (OSError, ValueError, KeyError, TypeError) as exc:
                         code, message = getattr(exc, "code", Exit.INPUT), str(exc)
-                        if record["status"] == "resume-started" or not request_received:
+                        if (
+                            record["status"] == "resume-started"
+                            or not request_received
+                            or code == Exit.CLIENT_GONE
+                        ):
                             record.update(status="resume-refused", error=message)
                     if record["status"] != "preflight-ready":
                         record["resume_ended_ns"] = time.time_ns()
@@ -974,6 +1063,8 @@ def verify_attempt(record):
         cursor = record["handover_cursor"]
         serial = Serial(record["port"], cursor["log"])
         end, data = serial.interval(cursor, closed=record["handover_end_cursor"])
+        if sha(data) != record["handover_sha256"]:
+            raise ValueError("closed handover slice digest mismatch")
         if not handover_markers(attempt_lines(cursor, data)):
             raise ValueError("no fresh RVBAR then main> in this attempt")
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -1017,12 +1108,14 @@ def wait_for_handover_target(mailbox, record, seconds=10):
         # Only a classified disconnect can proceed without an ACKed mailbox
         # read; a generic failure is never treated as offline handover.
         try:
-            current = mailbox()
+            current = mailbox(command_budget(deadline, "Entry 2 mailbox"))
         except SessionError as exc:
             if exc.code != Exit.LOST_AFTER:
                 raise
+            command_budget(deadline, "Entry 2 mailbox")
             record["device_loss"] = int(exc.code)
             return
+        command_budget(deadline, "Entry 2 mailbox")
         record["entry_two_mailbox"] = current
         magic, state, *_ = current
         if magic != 0x46413741 or state not in (0x11, 0x21):
@@ -1091,7 +1184,8 @@ def workspace_boot(args, fd, record):
         try:
             record["handover_cursor"] = cursor = serial.capture(generation)
             wait_for_handover_target(
-                lambda: cached["read_mailbox"](session, work), record
+                lambda budget: cached["read_mailbox"](session, work, timeout=budget),
+                record,
             )
             wait_for_handover(serial, cursor, record)
         except (OSError, ValueError) as exc:

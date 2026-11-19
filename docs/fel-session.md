@@ -49,7 +49,8 @@ the byte range containing the complete strap and size lines, and hash
 receipt and its `.sha256` sidecar. The runner checks the sealed receipt,
 capture generation, the uninterrupted Entry 1 log window, identity, epoch
 and mailbox before loading the payload. The range must begin and end on
-line boundaries, and the strap must precede the size.
+line boundaries, and the ADC strap must precede the size. The firmware's
+GPIO strap diagnostic is not an ADC identity candidate.
 Failure, expiry and completion all end the transaction; a receipt is not
 replayable.
 
@@ -62,6 +63,13 @@ window offline, without another FEL command:
 ```sh
 python3 -I scripts/fel_session.py verify-handover --receipt "$run/receipt.json"
 ```
+
+Keep the preflight caller open until it returns ready, and keep the resume
+caller open for the rest of the transaction. If either disconnects at its
+stage, the guardian cancels and reaps its active selector group before
+releasing the port, stops issuing commands, and keeps a refused or
+unconfirmed receipt. Cancellation cannot undo effects already submitted to
+the device. Do not retry an interrupted submission.
 
 ## Capture boundaries
 
@@ -80,6 +88,9 @@ or RVBAR markers before `main>` invalidate the evidence. The expected single
 `done in …, warm reset into AArch64` announcement before RVBAR is not a
 failure. Fast messages received before the host's post-ACK cursor may be
 excluded; do not expand the window to claim them.
+
+Cached handover receipts seal the entire bounded slice at closure. Offline
+verification must match that digest as well as the capture anchors.
 
 An identical-prefix copytruncate and regrowth or an unmarked reset is not
 observable from these long-lived regular files. This is not a producer
@@ -119,3 +130,4 @@ window; no other selector failure is treated as handover.
 | 8 | Identity refusal | `125`, invalid A733 identity/epoch, or old devnum never changed |
 | 9 | Port already leased | Local lease refusal |
 | 10 | Transfer/setup I/O or unexpected selector exit | `74`, signal, or unrecognized exit |
+| 11 | Preflight or resume client disconnected | Local transaction cancellation |
