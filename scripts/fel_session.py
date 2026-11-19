@@ -102,6 +102,13 @@ class PollingWindowExpired(SessionError):
         super().__init__(Exit.LIVE_TIMEOUT, message)
 
 
+class UnchangedEnumeration(SessionError):
+    """The reconnect window ended with the original FEL devnum still present."""
+
+    def __init__(self):
+        super().__init__(Exit.IDENTITY, "no fresh enumeration after submission")
+
+
 class ClientWatch:
     def __init__(self, endpoint, stage):
         self.stage = stage
@@ -666,9 +673,7 @@ class Session:
                     )
                     self.event("reconnect-verified", devnum=number)
                     return
-                last_observation = SessionError(
-                    Exit.IDENTITY, "no fresh enumeration after submission"
-                )
+                last_observation = UnchangedEnumeration()
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
     def watchdog(self):
@@ -875,11 +880,29 @@ def cached_resume(request, receipt, session, serial, cached, work):
             outcome="lost" if problem.code == Exit.LOST_AFTER else "refused",
             exit=int(problem.code),
         )
-        if problem.code == Exit.LOST_AFTER:
+        unchanged = isinstance(problem, UnchangedEnumeration)
+        if problem.code == Exit.LOST_AFTER or unchanged:
             try:
-                close_handover(serial, record, rolling)
+                data = close_handover(serial, record, rolling)
             except (OSError, ValueError) as exc:
                 record["handover_capture_error"] = str(exc)
+            else:
+                if unchanged:
+                    try:
+                        if not handover_markers(
+                            attempt_lines(record["handover_cursor"], data)
+                        ):
+                            raise ValueError(
+                                "no fresh RVBAR then main> in this attempt"
+                            )
+                    except ValueError as exc:
+                        raise SessionError(problem.code, f"{problem}: {exc}") from exc
+                    record["reconnect"] = dict(
+                        outcome="stale", exit=int(Exit.LOST_AFTER)
+                    )
+                    raise SessionError(
+                        Exit.LOST_AFTER, "unchanged FEL devnum after serial handover"
+                    ) from problem
         raise
     record["reconnect"] = dict(outcome="verified", exit=int(Exit.SUCCESS))
     try:
@@ -898,6 +921,7 @@ def close_handover(serial, record, rolling):
     record["handover_end"] = end
     record["handover_end_cursor"] = eof
     record["handover_sha256"] = sha(data)
+    return data
 
 
 def guardian(args, reply):
@@ -1126,6 +1150,7 @@ def verify_attempt(record):
     if record.get("reconnect") not in (
         dict(outcome="verified", exit=int(Exit.SUCCESS)),
         dict(outcome="lost", exit=int(Exit.LOST_AFTER)),
+        dict(outcome="stale", exit=int(Exit.LOST_AFTER)),
     ):
         raise SessionError(
             Exit.SERIAL_UNCONFIRMED,

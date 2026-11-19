@@ -55,8 +55,9 @@ Failure, expiry and completion all end the transaction; a receipt is not
 replayable.
 
 Resume records the Entry 2 ACK separately from its watchdog reconnect.
-Only a verified reconnect or explicit post-ACK device loss permits serial
-confirmation; reconnect refusal, ACK failure, timeout and generic I/O do not.
+Only a verified reconnect, explicit post-ACK device loss, or a stale
+enumeration with valid handover markers permits serial confirmation.
+Reconnect refusal, ACK failure, timeout and generic I/O do not.
 Reconnect alone does not confirm handover. To verify the closed serial
 window offline, without another FEL command:
 
@@ -74,10 +75,15 @@ seal the serial slice from Entry 2 to the end of reconnect in the receipt
 |---:|---|---|
 | 3 | `{"exit": 0, "outcome": "verified"}` | The board is already back in FEL (a short run) |
 | 5 | `{"exit": 5, "outcome": "lost"}` | The board was seen to leave FEL and no return was observed. This is normal for a long memtest, when `main` may still be running. |
+| 5 | `{"exit": 5, "outcome": "stale"}` | The FEL device stayed enumerated with its old devnum, but this attempt's sealed serial slice shows the handover markers. |
 
-Neither outcome by itself confirms handover: a valid seal and an exit of 0
-from `verify-handover` are required. Resume can still exit 5 if sealing fails;
-in that case the receipt has `handover_capture_error` and no valid seal.
+An unchanged devnum alone never proves the board stayed in FEL. The runner
+does not probe it; without a sealed slice and valid markers it records
+`{"exit": 8, "outcome": "refused"}`.
+These outcomes alone do not confirm handover: a valid seal and an exit of 0
+from `verify-handover` are required. After a device loss, resume can still
+exit 5 if sealing fails; the receipt then has `handover_capture_error` and
+no valid seal.
 Any other resume exit, or any other `reconnect` value, cannot be confirmed.
 Each preflight needs a new `--state` path (and a new receipt): the session
 refuses an existing state file.

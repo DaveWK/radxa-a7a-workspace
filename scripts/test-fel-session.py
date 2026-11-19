@@ -621,13 +621,20 @@ class SerialTests(Fixture):
             handover_end_cursor=self.serial.capture(cursor),
             handover_sha256=M["sha"](RVBAR + PROMPT),
             events=[],
-            reconnect=dict(outcome="verified", exit=0),
         )
-        with self.assertRaises(M["SessionError"]) as caught:
+        for outcome, code in (("verified", 0), ("lost", 5), ("stale", 5)):
+            with self.subTest(outcome=outcome):
+                record["reconnect"] = dict(outcome=outcome, exit=code)
+                record["events"] = []
+                with self.assertRaisesRegex(M["SessionError"], "no matching Entry 2"):
+                    M["verify_attempt"](record)
+                record["events"] = [
+                    dict(event="submission-acked", command=["exec", "0x90044"])
+                ]
+                self.assertEqual(M["verify_attempt"](record)["end"], end)
+        record["reconnect"] = dict(outcome="stale", exit=8)
+        with self.assertRaisesRegex(M["SessionError"], "reconnect outcome"):
             M["verify_attempt"](record)
-        self.assertEqual(caught.exception.code, EXIT.SERIAL_UNCONFIRMED)
-        record["events"] = [dict(event="submission-acked", command=["exec", "0x90044"])]
-        self.assertEqual(M["verify_attempt"](record)["end"], end)
 
 
 if __name__ == "__main__":

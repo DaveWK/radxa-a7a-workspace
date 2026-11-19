@@ -100,6 +100,8 @@ elif (cmd, args) == ("exec", ["0x90040"]):
 elif (cmd, args) == ("exec", ["0x90044"]):
     if os.getenv("REJECT_ENTRY_TWO"):
         sys.exit(76)
+    if os.getenv("KEEP_DEVNUM"):
+        sys.exit(0)
     # Remove with one atomic rename; never expose partially edited sysfs.
     reset = ports / (port + ".offline")
     if os.getenv("CONCURRENT"):
@@ -677,6 +679,120 @@ class RunnerTests(unittest.TestCase):
                         "closed handover slice digest mismatch", replay.stderr
                     )
 
+    def start_with_reconnect(self, port, entry, reconnect):
+        receipt, state = self.paths(port)
+        args = SimpleNamespace(
+            port=port,
+            receipt=receipt,
+            state=state,
+            set=self.source,
+            expect_set_sha256=self.digest,
+            serial_log=self.logs[port],
+        )
+        with (
+            patch.dict(os.environ, self.env, clear=True),
+            patch("pwd.getpwuid", return_value=SimpleNamespace(pw_dir=str(self.home))),
+            patch.object(entry["Session"], "reconnect", reconnect),
+        ):
+            self.assertEqual(entry["start_guardian"](args), (0, ""))
+
+    def verify_handover(self, port):
+        return subprocess.run(
+            [
+                self.python,
+                "-I",
+                self.runner,
+                "verify-handover",
+                "--receipt",
+                self.paths(port)[0],
+            ],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_4g_unchanged_devnum_requires_sealed_handover_markers(self):
+        port = "3-3.4"
+        rvbar = b"[bt0] RVBAR 00000000:40000000, fixture\n"
+        for case, data, code, outcome, verify_code, error in (
+            ("handover", rvbar + b"main>", 5, "stale", 0, None),
+            ("no markers", b"ordinary output\n", 8, "refused", 3, "no fresh RVBAR"),
+            (
+                "reset before main",
+                rvbar + b"[bt0] reset\nmain>",
+                8,
+                "refused",
+                3,
+                "serial reset or failure marker",
+            ),
+        ):
+            with self.subTest(case=case):
+                self.setUp()
+                self.setup_runner()
+                self.env["KEEP_DEVNUM"] = "1"
+                entry = runpy.run_path(str(self.runner))
+                reconnect = entry["Session"].reconnect
+
+                def fake_reconnect(runner, seconds=60, *, observe=None):
+                    self.assertEqual(seconds, 60)
+                    now = 100.0
+                    polls = 0
+
+                    def advance(seconds):
+                        nonlocal now
+                        now += seconds
+
+                    def same_device(argv, timeout, lease_fd, **options):
+                        nonlocal polls
+                        assert argv == ("--discover", "--port", port)
+                        polls += 1
+                        if polls == 1:
+                            with self.logs[port].open("ab") as stream:
+                                stream.write(data)
+                        advance(29.75)
+                        return 0, (self.sysfs / port / "devnum").read_text(), "", False
+
+                    clock = SimpleNamespace(
+                        monotonic=lambda: now, sleep=advance, time_ns=time.time_ns
+                    )
+                    with (
+                        patch.dict(reconnect.__globals__, time=clock),
+                        patch.object(
+                            runner.selector, "invoke", side_effect=same_device
+                        ),
+                    ):
+                        return reconnect(runner, seconds, observe=observe)
+
+                self.start_with_reconnect(port, entry, fake_reconnect)
+                with self.resume(port) as proc:
+                    out, err = proc.communicate(timeout=15)
+                result = self.receipt(port)
+                verified = self.verify_handover(port)
+                self.assertEqual(
+                    (
+                        proc.returncode,
+                        result["reconnect"],
+                        "handover_sha256" in result,
+                        verified.returncode,
+                    ),
+                    (code, {"outcome": outcome, "exit": code}, True, verify_code),
+                    out + err + verified.stdout + verified.stderr,
+                )
+                if error:
+                    self.assertIn(error, result["error"])
+                self.assertEqual((self.sysfs / port / "devnum").read_text(), "12")
+                self.assertEqual(result["devnums"], [12])
+                calls = [call["argv"] for call in result["calls"]]
+                submission = next(
+                    i
+                    for i, argv in enumerate(calls)
+                    if argv[-2:] == ["exec", "0x90044"]
+                )
+                self.assertEqual(
+                    calls[submission + 1 :], [["--discover", "--port", port]] * 2
+                )
+
     def test_6g_cached_memtest_stays_away_until_reconnect_deadline(self):
         port = "3-6"
         for first_poll, expected_polls in ((58, 2), (59.5, 1)):
@@ -720,41 +836,11 @@ class RunnerTests(unittest.TestCase):
                         ):
                             return reconnect(runner, seconds, observe=observe)
 
-                receipt, state = self.paths(port)
-                args = SimpleNamespace(
-                    port=port,
-                    receipt=receipt,
-                    state=state,
-                    set=self.source,
-                    expect_set_sha256=self.digest,
-                    serial_log=self.logs[port],
-                )
-                with (
-                    patch.dict(os.environ, self.env, clear=True),
-                    patch(
-                        "pwd.getpwuid",
-                        return_value=SimpleNamespace(pw_dir=str(self.home)),
-                    ),
-                    patch.object(entry["Session"], "reconnect", fake_reconnect),
-                ):
-                    self.assertEqual(entry["start_guardian"](args), (0, ""))
+                self.start_with_reconnect(port, entry, fake_reconnect)
                 with self.resume(port) as proc:
                     out, err = proc.communicate(timeout=15)
                 result = self.receipt(port)
-                verified = subprocess.run(
-                    [
-                        self.python,
-                        "-I",
-                        self.runner,
-                        "verify-handover",
-                        "--receipt",
-                        receipt,
-                    ],
-                    env=self.env,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
+                verified = self.verify_handover(port)
                 self.assertEqual(
                     (
                         proc.returncode,
