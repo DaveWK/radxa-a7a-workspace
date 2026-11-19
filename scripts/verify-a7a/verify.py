@@ -49,6 +49,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
@@ -60,6 +61,12 @@ MAIN_DIR = "src/mainboard/radxa/cubie-a7a/main"
 COMMON_LIB = "src/mainboard/radxa/cubie-a7a/common/src/lib.rs"
 BT0_BUILD = f"{BT0_DIR}/build.rs"
 MKIMAGE = Path(__file__).resolve().parents[1] / "mkimage.py"
+TRACKED_PATH_TYPES = {
+    "100644": stat.S_IFREG,
+    "100755": stat.S_IFREG,
+    "120000": stat.S_IFLNK,
+    "160000": stat.S_IFDIR,
+}
 
 # The five host suites required by the retained verification record. The board
 # fastboot and bootlog suites live at these paths at the verified SHA; there is
@@ -388,16 +395,22 @@ class SubprocessRunner:
         env: dict[str, str],
         log: Path | None = None,
     ) -> CommandResult:
+        # NUL-delimited Git output carries arbitrary filesystem names, not text
+        # lines. Preserve their bytes and line endings for lstat().
+        git_paths = argv[0] == "git" and "-z" in argv
         try:
             proc = subprocess.run(
                 argv,
                 cwd=str(cwd),
                 env=env,
                 capture_output=True,
-                text=True,
-                errors="replace",
+                text=not git_paths,
+                errors=None if git_paths else "replace",
             )
-            stdout, stderr = proc.stdout, proc.stderr
+            if git_paths:
+                stdout, stderr = os.fsdecode(proc.stdout), os.fsdecode(proc.stderr)
+            else:
+                stdout, stderr = proc.stdout, proc.stderr
             returncode = proc.returncode
         except FileNotFoundError as exc:
             stdout, stderr = "", f"{argv[0]}: {exc}\n"
@@ -559,6 +572,8 @@ class Harness:
             "TMPDIR": str(args.out / "tmp"),
         }
         self.source_head: str | None = None
+        self.workspace = MKIMAGE.parents[1]
+        self.workspace_head: str | None = None
         self.gate_base: str | None = None
         self.gate_head: str | None = None
         self.baseline_digests: dict[str, str] = {}
@@ -612,6 +627,7 @@ class Harness:
             except (OSError, ValueError, SyntaxError) as exc:
                 errors.append(f"could not read image caps: {exc}")
             errors.extend(self.check_cargo_config())
+        errors.extend(self.check_workspace())
         if not a.baseline.is_dir():
             errors.append(f"baseline directory not found: {a.baseline}")
         else:
@@ -702,18 +718,89 @@ class Harness:
         return env
 
     def git(self, *argv: str) -> CommandResult:
-        source = self.args.source
-        return self.runner.run(["git", "-C", str(source), *argv], source, self.git_env)
+        return self.tree_git(self.args.source, *argv)
 
-    def source_is_worktree_root(self) -> bool:
-        root = self.git("rev-parse", "--show-toplevel")
-        return root.returncode == 0 and root.stdout.rstrip("\n") == str(
-            self.args.source
+    def tree_git(self, tree: Path, *argv: str) -> CommandResult:
+        return self.runner.run(["git", "-C", str(tree), *argv], tree, self.git_env)
+
+    def is_worktree_root(self, tree: Path) -> bool:
+        root = self.tree_git(tree, "rev-parse", "--show-toplevel")
+        return root.returncode == 0 and root.stdout.rstrip("\n") == str(tree)
+
+    def worktree_error(self, tree: Path, label: str) -> str | None:
+        for key in ("core.sparseCheckout", "core.sparseCheckoutCone"):
+            setting = self.tree_git(tree, "config", "--type=bool", "--get-all", key)
+            if setting.returncode not in (0, 1):
+                return f"could not read {label} Git setting {key}"
+            if "true" in setting.stdout.splitlines():
+                return f"{label} uses sparse checkout ({key})"
+        sparse = self.tree_git(
+            tree,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/sparse-checkout",
         )
+        if sparse.returncode != 0:
+            return f"could not locate {label} sparse-checkout configuration"
+        try:
+            if Path(sparse.stdout.rstrip("\n")).stat().st_size:
+                return f"{label} has a non-empty Git info/sparse-checkout"
+        except FileNotFoundError:
+            pass
+
+        # The combined listing gives us both the index flags and the expected
+        # type of each NUL-delimited pathname, without following symlinks.
+        tracked = self.tree_git(tree, "ls-files", "-v", "--stage", "-z")
+        if tracked.returncode != 0:
+            return f"could not list {label} tracked paths"
+        for entry in tracked.stdout.split("\0")[:-1]:
+            metadata, _, name = entry.partition("\t")
+            tag, mode, _oid, stage = metadata.split()
+            if tag == "S":
+                return f"{label} has a skip-worktree entry: {name!r}"
+            if tag.islower():
+                return f"{label} has an assume-unchanged entry: {name!r}"
+            if stage != "0" or mode not in TRACKED_PATH_TYPES:
+                return f"{label} has an unexpected index entry: {name!r}"
+            try:
+                actual_type = stat.S_IFMT((tree / name).lstat().st_mode)
+            except FileNotFoundError:
+                return f"{label} tracked path is missing: {name!r}"
+            if actual_type != TRACKED_PATH_TYPES[mode]:
+                return f"{label} tracked path has the wrong type: {name!r}"
+        deleted = self.tree_git(tree, "ls-files", "--deleted", "-z")
+        if deleted.returncode != 0:
+            return f"could not list {label} deleted paths"
+        if deleted.stdout:
+            return f"{label} has deleted tracked paths"
+        status = self.tree_git(tree, "status", "--porcelain", "--untracked-files=all")
+        if status.returncode != 0:
+            return f"could not read the {label} worktree status"
+        if status.stdout.strip():
+            return f"{label} worktree is dirty"
+        return None
+
+    def check_workspace(self) -> list[str]:
+        if not self.is_worktree_root(self.workspace):
+            return [
+                f"workspace is not the root of its own Git worktree: {self.workspace}"
+            ]
+        head = self.tree_git(self.workspace, "rev-parse", "HEAD")
+        if head.returncode != 0:
+            return ["could not read the workspace HEAD"]
+        actual = head.stdout.strip()
+        if self.workspace_head is not None and actual != self.workspace_head:
+            return [
+                f"workspace HEAD changed during the run: {actual} (was {self.workspace_head})"
+            ]
+        self.workspace_head = actual
+        error = self.worktree_error(self.workspace, "workspace")
+        return [error] if error else []
 
     def _check_source(self, errors: list[str]) -> None:
         a = self.args
-        if not self.source_is_worktree_root():
+        if not self.is_worktree_root(a.source):
             errors.append(f"source is not the root of its own git worktree: {a.source}")
             return
         head = self.git("rev-parse", "HEAD")
@@ -749,11 +836,8 @@ class Harness:
         else:
             self.gate_base = base_sha
             self.gate_head = self.source_head
-        status = self.git("status", "--porcelain", "--untracked-files=all")
-        if status.returncode != 0:
-            errors.append("could not read the source worktree status")
-        elif status.stdout.strip():
-            errors.append("source worktree is dirty; check out a clean commit")
+        if error := self.worktree_error(a.source, "source"):
+            errors.append(error)
 
     def _check_baseline_sums(self) -> list[str]:
         a = self.args
@@ -1470,7 +1554,7 @@ class Harness:
 
     def verify_source_unchanged(self) -> list[str]:
         errors: list[str] = []
-        if not self.source_is_worktree_root():
+        if not self.is_worktree_root(self.args.source):
             return ["source is no longer the root of its own Git worktree"]
         head = self.git("rev-parse", "HEAD")
         if head.returncode != 0:
@@ -1480,11 +1564,8 @@ class Harness:
                 f"source HEAD changed during the run: {head.stdout.strip()} "
                 f"(was {self.source_head})"
             )
-        status = self.git("status", "--porcelain", "--untracked-files=all")
-        if status.returncode != 0:
-            errors.append("could not read the source worktree status after the build")
-        elif status.stdout.strip():
-            errors.append("source worktree is dirty after the build")
+        if error := self.worktree_error(self.args.source, "source"):
+            errors.append(error)
         return errors
 
     # -- report and entry --------------------------------------------------
@@ -1501,6 +1582,7 @@ class Harness:
         print("=== A7A bt0/main host verification ===")
         print(f"source: {a.source}")
         print(f"source HEAD: {self.source_head} (expected {a.source_sha})")
+        print(f"workspace HEAD: {self.workspace_head}")
         print(f"gate base: {self.gate_base}  head: {self.gate_head}")
         print(f"toolchain: {self.toolchain.get('channel')}")
         for key in ("rustc_version", "cargo_version"):
@@ -1601,12 +1683,16 @@ class Harness:
         suites = self.run_suites()
         gate = self.run_gate()
         digests = self.check_digests()
-        post = self.verify_source_unchanged()
+        post = self.verify_source_unchanged() + self.check_workspace()
         self.print_report(matrix, negative, suites, gate, digests)
         if post:
-            print("source changed during the run:")
+            print("checkout checks failed after the build:")
             for error in post:
                 print(f"  - {error}")
+        else:
+            print(
+                "source and workspace: complete, clean Git worktrees before and after"
+            )
         ok = (
             matrix.ok
             and negative.ok

@@ -85,9 +85,12 @@ signing or daemon.
 Every stage's real exit status is checked. A missing source, baseline directory,
 required baseline image, suite directory, build input or gate is a failure.
 `--source` must be the absolute root of its own clean Git worktree at
-`--source-sha`, with the base as an ancestor. The root, HEAD and cleanliness
-are rechecked before PASS. Input checks finish before creating the output
-directory exclusively (0700); even an existing empty output is refused. The
+`--source-sha`, with the base as an ancestor. Both that tree and the workspace
+that runs the harness must be clean, full Git worktrees. Sparse checkout,
+skip-worktree and assume-unchanged entries, and missing or wrong-type tracked
+paths are refused. Both checkouts are rechecked before PASS. Input checks
+finish before creating the output directory exclusively (0700); even an
+existing empty output is refused. The
 output, `TMPDIR` and both Cargo output locations must not overlap any input.
 
 Git runs with only `PATH`, `HOME` and the harness's isolation settings: no

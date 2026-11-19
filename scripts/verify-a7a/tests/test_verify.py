@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 VERIFY_PATH = Path(__file__).resolve().parents[1] / "verify.py"
 _spec = importlib.util.spec_from_file_location("verify_a7a_under_test", VERIFY_PATH)
@@ -272,6 +273,12 @@ class HarnessRegressionTest(unittest.TestCase):
         )
         self.tmp = Path(self._tmp.name)
         self.source = make_source(self.tmp / "oreboot")
+        workspace = self.tmp / "workspace"
+        mkimage = workspace / "scripts" / "mkimage.py"
+        mkimage.parent.mkdir(parents=True)
+        mkimage.write_bytes(verify.MKIMAGE.read_bytes())
+        make_source(workspace)
+        self.enterContext(patch.object(verify, "MKIMAGE", mkimage))
         self.baseline = make_baseline(self.tmp / "baseline")
         self.gate = self.tmp / "gate.py"
         self.gate.write_text("pass\n", encoding="utf-8")

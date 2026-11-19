@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -32,6 +33,8 @@ LAB = ("lab-drift", ("fel", "bl-mission", "dram-lab", "drift-log"))
 NEGATIVE = verify.NEGATIVE_ENTRIES[0]
 EXT = b"A7AX"
 MAIN = b"main fixture"
+STAGE_TEST = f"{SUITE}/tests/stage_check.rs"
+MKIMAGE = Path(__file__).resolve().parents[2] / "mkimage.py"
 
 
 def digest(data):
@@ -63,6 +66,7 @@ class BenchTools(verify.SubprocessRunner):
 
     def __init__(self, bench):
         self.bench = bench
+        self.cargo_invocations = []
         self.cargo_envs = []
         self.git_envs = []
         self.row = ""
@@ -79,6 +83,8 @@ class BenchTools(verify.SubprocessRunner):
     def run(self, argv, cwd, env, log=None):
         b = self.bench
         cmd = Path(argv[0]).name
+        if cmd == "cargo":
+            self.cargo_invocations.append(tuple(argv))
         if cmd == "git":
             self.git_envs.append(dict(env))
         if cmd.startswith("suite-"):
@@ -97,11 +103,15 @@ class BenchTools(verify.SubprocessRunner):
                 kwargs["stdout"] = f"{directory / argv[-1]}\n"
             elif argv[1] == "run":
                 kwargs["stdout"] = f"host: {HOST}\n"
+            elif argv[1:3] == ["target", "list"]:
+                kwargs["stdout"] = "\n".join(b.toolchain_targets)
         elif cmd == "rustc":
-            kwargs["stdout"] = f"host: {HOST}\nrelease: 1.97.0\n"
+            kwargs["stdout"] = f"host: {HOST}\nrelease: {b.toolchain_version}\n"
         elif cmd == "cargo" and argv[1:] == ["-V"]:
-            kwargs["stdout"] = "cargo 1.97.0 (fixture)\n"
+            kwargs["stdout"] = f"cargo {b.toolchain_version} (fixture)\n"
         elif cmd == "cargo":
+            if b.before_first_build is not None and not self.cargo_envs:
+                b.before_first_build()
             self.cargo_envs.append(dict(env))
             target = Path(env["CARGO_TARGET_DIR"])
             if "CARGO_BUILD_BUILD_DIR" in env:
@@ -218,22 +228,22 @@ class CliTest(unittest.TestCase):
         self.home = self.root / "home"
         self.home.mkdir()
         self.source = self.root / "source"
+        self.workspace = self.root / "workspace"
+        self.mkimage = self.workspace / "scripts" / "mkimage.py"
+        self.mkimage.parent.mkdir(parents=True)
+        shutil.copyfile(MKIMAGE, self.mkimage)
+        self.commit(self.workspace)
         self.baseline = self.root / "baseline"
         self.baseline.mkdir()
         self.manifest = self.baseline / "SHA256SUMS"
         self.out = self.root / "out"
-        self.pinned_bin = (
-            self.home / ".rustup" / "toolchains" / f"1.97.0-{HOST}" / "bin"
-        )
-        self.pinned_bin.mkdir(parents=True)
-        for tool in ("cargo", "rustc", "rustdoc"):
-            (self.pinned_bin / tool).write_bytes(b"mock tool")
         for rel in (verify.BT0_DIR, verify.MAIN_DIR, SUITE):
             directory = self.source / rel
             directory.mkdir(parents=True)
             (directory / "README").write_text("fixture\n", encoding="utf-8")
         for name, content in (
             (verify.COMMON_LIB, "pub const MAIN_MAX_SIZE: usize = 0x80000;\n"),
+            (STAGE_TEST, "// fixture test\n"),
             (
                 FEL_DEF,
                 'const MEMORY_FEL: &str = "SRAM : ORIGIN = 0x90000, LENGTH = 0x4f000";\n',
@@ -244,6 +254,7 @@ class CliTest(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
         self.commit(self.source)
+        self.pin_fixture_tools()
         self.dram_lib = self.root / "libdram-a733.a"
         self.phyfw = self.root / "libdram"
         self.gate = self.root / "gate.py"
@@ -274,10 +285,44 @@ class CliTest(unittest.TestCase):
         self.empty_binary = False
         self.wrong_toolchain = False
         self.diagnostic_suffix = ""
+        self.before_first_build = None
+
+    def pin_fixture_tools(self):
+        spec = tomllib.loads((self.source / "rust-toolchain.toml").read_text())[
+            "toolchain"
+        ]
+        channel = spec["channel"]
+        self.toolchain_version = (
+            "1.97.0-nightly" if channel.startswith("nightly-") else channel
+        )
+        self.toolchain_targets = spec.get("targets", [])
+        self.pinned_bin = (
+            self.home / ".rustup" / "toolchains" / f"{channel}-{HOST}" / "bin"
+        )
+        self.pinned_bin.mkdir(parents=True, exist_ok=True)
+        for tool in ("cargo", "rustc", "rustdoc"):
+            (self.pinned_bin / tool).write_bytes(b"mock tool")
+
+    def copy_oreboot(self):
+        # Evidence runs use the pinned full clone; standalone quick runs can
+        # exercise the same accidents in copies of the miniature Git fixture.
+        oreboot = Path(os.environ.get("VERIFY_A7A_OREBOOT", self.source))
+        self.source = Path(
+            shutil.copytree(oreboot, self.root / "oreboot-copy", symlinks=True)
+        )
+        self.pin_fixture_tools()
+        self.assertEqual(self.git(self.source, "status", "--porcelain"), "")
+        # Refresh the copied index's inode/ctime metadata, not the original.
+        self.git(self.source, "update-index", "--refresh")
+        return self.source / STAGE_TEST
 
     def git(self, cwd, *args):
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-        env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        env.update(
+            GIT_CONFIG_GLOBAL="/dev/null",
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_OPTIONAL_LOCKS="0",
+        )
         return subprocess.run(
             ["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True
         ).stdout.strip()
@@ -338,6 +383,7 @@ class CliTest(unittest.TestCase):
                 patch.multiple(
                     verify,
                     SubprocessRunner=lambda: self.tools,
+                    MKIMAGE=self.mkimage,
                     OLD_SETS=(),
                     NEW_ENTRIES=tuple(
                         row
@@ -472,6 +518,89 @@ class CliTest(unittest.TestCase):
         self.commit(parent)
         self.check(1, "not the root of its own git worktree")
         self.assertFalse(self.out.exists())
+
+    def assert_clean_git_refused_without_build(self, message):
+        self.assertEqual(self.git(self.source, "status", "--porcelain"), "")
+        self.check(1, message)
+        self.assertEqual(self.tools.cargo_invocations, [])
+        self.assertFalse(self.out.exists())
+
+    def test_sparse_checkout_omitting_real_suite_test_refused(self):
+        path = self.copy_oreboot()
+        self.assertTrue(path.is_file())
+        self.git(
+            self.source,
+            "sparse-checkout",
+            "set",
+            "--cone",
+            verify.BT0_DIR,
+            verify.MAIN_DIR,
+            str(Path(verify.COMMON_LIB).parent),
+            f"{SUITE}/src",
+        )
+        self.assertFalse(path.exists())
+        self.assert_clean_git_refused_without_build("source uses sparse checkout")
+
+    def test_skip_worktree_hiding_modified_test_refused(self):
+        path = self.copy_oreboot()
+        self.git(self.source, "update-index", "--skip-worktree", "--", STAGE_TEST)
+        path.write_bytes(b"// replaced while marked skip-worktree\n")
+        self.assert_clean_git_refused_without_build("source has a skip-worktree entry")
+
+    def test_assume_unchanged_hiding_modified_test_refused(self):
+        path = self.copy_oreboot()
+        self.git(self.source, "update-index", "--assume-unchanged", "--", STAGE_TEST)
+        path.write_bytes(b"// replaced while marked assume-unchanged\n")
+        self.assert_clean_git_refused_without_build(
+            "source has an assume-unchanged entry"
+        )
+
+    def test_assume_unchanged_hiding_deleted_test_refused(self):
+        path = self.copy_oreboot()
+        self.git(self.source, "update-index", "--assume-unchanged", "--", STAGE_TEST)
+        path.unlink()
+        self.assert_clean_git_refused_without_build(
+            "source has an assume-unchanged entry"
+        )
+
+    def test_workspace_sparse_pattern_file_refused(self):
+        info = self.workspace / ".git" / "info"
+        (info / "sparse-checkout").write_text("/*\n")
+        self.check(1, "workspace has a non-empty Git info/sparse-checkout")
+        self.assertEqual(self.tools.cargo_invocations, [])
+        self.assertFalse(self.out.exists())
+
+    def test_workspace_index_flag_set_during_build_refused_before_pass(self):
+        self.before_first_build = lambda: self.git(
+            self.workspace,
+            "update-index",
+            "--assume-unchanged",
+            "--",
+            "scripts/mkimage.py",
+        )
+        self.check(1, "workspace has an assume-unchanged entry")
+        self.assertTrue(self.tools.cargo_envs)
+
+    def test_wrong_type_hidden_by_git_symlink_config_refused(self):
+        path = self.source / "link"
+        path.symlink_to("rust-toolchain.toml")
+        self.git(self.source, "add", "--", "link")
+        self.git(
+            self.source,
+            "-c",
+            "user.name=DaveWK",
+            "-c",
+            "user.email=13626476+DaveWK@users.noreply.github.com",
+            "commit",
+            "-qm",
+            "tracked symlink",
+        )
+        self.git(self.source, "config", "core.symlinks", "false")
+        path.unlink()
+        path.write_text("rust-toolchain.toml")
+        self.assert_clean_git_refused_without_build(
+            "source tracked path has the wrong type"
+        )
 
     def test_inherited_build_dir_cannot_put_intermediates_in_source(self):
         spill = self.source / "intermediates"
