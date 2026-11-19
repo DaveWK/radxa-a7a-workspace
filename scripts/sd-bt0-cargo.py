@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import tempfile
 import tomllib
 
@@ -166,11 +167,17 @@ def verify(args):
     egon = runpy.run_path(str(ROOT / "scripts/mkimage.py"))["egon"]
     expected_prefix = egon(raw)
     with args.firmware.open("rb") as package:
-        if package.read(len(expected_prefix)) != expected_prefix:
+        prefix = package.read(len(expected_prefix))
+        if prefix != expected_prefix:
             raise SystemExit(
                 "sd-bt0: packaged bt0 does not match the fingerprinted raw bt0"
             )
-    print(f"sd-bt0: packaged bt0 matches {actual} ({digest})")
+        # Hash the checked prefix plus the remainder from this same open file.
+        firmware_digest = sha256(prefix)
+        for chunk in iter(lambda: package.read(1024 * 1024), b""):
+            firmware_digest.update(chunk)
+    print(f"sd-bt0: packaged bt0 matches {actual} ({digest})", file=sys.stderr)
+    print(firmware_digest.hexdigest())
 
 
 def main():

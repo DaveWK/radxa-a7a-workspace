@@ -41,6 +41,13 @@ assert "FW" not in os.environ, tool
 if tool == "build-rpms.sh":
     assert args == [str(rpmbuild)], args
     assert os.environ["FWREPO"] == "stub-fwrepo"
+    if os.environ.get("TEST_REPLACE_FIRMWARE"):
+        (firmware,) = out.glob(".devcard-firmware-*/firmware/firmware.bin")
+        # Preserve the eGON prefix: this regression requires a whole-file
+        # digest pinned before the RPM step, not a second prefix check.
+        replacement = firmware.with_suffix(".replacement")
+        replacement.write_bytes(firmware.read_bytes() + b"replacement tail")
+        replacement.replace(firmware)
     run.mkdir(parents=True)
     print(run)
 elif tool == "build-aarch64-rpms.sh":
@@ -62,10 +69,17 @@ elif tool == "mkdevcard.sh":
     assert staged.is_relative_to(build) and work.is_relative_to(build)
     assert not staged.exists() and not work.exists()
     staged.parent.mkdir(parents=True)
+    firmware = Path(args[0]).read_bytes()
+    if os.environ.get("TEST_REPLACE_FIRMWARE"):
+        assert firmware.endswith(b"replacement tail")
+        (out / "mkdevcard-read-replacement").touch()
     payloads = {
         "": "image",
         ".devcard-manifest.json": "manifest",
-        ".build-receipt.json": json.dumps({"manifest_sha256": seal}),
+        ".build-receipt.json": json.dumps({
+            "manifest_sha256": seal,
+            "firmware": {"sha256": sha256(firmware).hexdigest()},
+        }),
     }
     if compressed:
         payloads[".xz"] = "compressed"
@@ -354,6 +368,40 @@ def run_case(case):
             command.append("XZ=no")
         if case == "private-firmware":
             env["TEST_PRIVATE_FIRMWARE"] = "1"
+        if case == "firmware-replaced-during-rpms":
+            env["TEST_REPLACE_FIRMWARE"] = "1"
+            image_dir = root / "out/image"
+            image_dir.mkdir()
+            old_artifacts = {
+                image_dir / f"a7a-fedora45.img{suffix}": f"previous{suffix}\n"
+                for suffix in (
+                    "",
+                    ".xz",
+                    ".devcard-manifest.json",
+                    ".build-receipt.json",
+                    ".sha256",
+                )
+            }
+            for path, contents in old_artifacts.items():
+                path.write_text(contents)
+            result = subprocess.run(
+                [*command, "fedora-image"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 2, result
+            assert (
+                "receipt firmware.sha256 does not match verified firmware"
+                in result.stderr
+            )
+            assert (root / "out/mkdevcard-read-replacement").exists()
+            assert not (root / "out/verified").exists()
+            assert not list(fedora.glob("build/image-*/package/*"))
+            for path, contents in old_artifacts.items():
+                assert path.read_text() == contents, path
+            return
         if case == "wrong-packaged-prefix":
             env["TEST_WRONG_PREFIX"] = "1"
             result = subprocess.run(
@@ -409,6 +457,7 @@ def main():
         "wrong-binary-profile",
         "unknown-binary",
         "wrong-packaged-prefix",
+        "firmware-replaced-during-rpms",
     )
     for case in sys.argv[1:] or cases:
         assert case in cases, case

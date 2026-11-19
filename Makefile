@@ -317,14 +317,21 @@ fedora-image: fel-image
 	mkdir -p "$(dir $(IMAGE))" "$(FEDORA)/build" "$(DEVCARD_SCRATCH)"
 	mkdir -- "$(DEVCARD_FW_BUILD)"
 	$(MAKE) OUT="$(DEVCARD_FW_BUILD)" firmware
-	python3 -I scripts/sd-bt0-cargo.py verify "$(DRAM_FIRMWARE_IDENTITY)" \
-		"$(DEVCARD_FW_BUILD)/oreboot/bt0.bin" "$(DEVCARD_FW_BIN)"
-	scripts/binfmt-aarch64.sh
 	set -eu; \
+		firmware_sha=$$(python3 -I scripts/sd-bt0-cargo.py verify "$(DRAM_FIRMWARE_IDENTITY)" \
+			"$(DEVCARD_FW_BUILD)/oreboot/bt0.bin" "$(DEVCARD_FW_BIN)"); \
+		scripts/binfmt-aarch64.sh; \
 		$(build-rpm-run); \
 		WORK="$(IMG_BUILD)" OUT="$(STAGED_IMAGE)" FEDORA_RELEASE="$(FEDORA_RELEASE)" \
 			FIRMWARE_DTB_VERSION="$(DTB_VERSION)" DRAM_FIRMWARE_IDENTITY="$(DRAM_FIRMWARE_IDENTITY)" \
 			"$(FEDORA)/fedora/mkdevcard.sh" "$(DEVCARD_FW_BIN)" "$$run"; \
+		if ! python3 -I -c 'import json, sys; sys.exit(json.load(sys.stdin)["firmware"]["sha256"] != sys.argv[1])' \
+				"$$firmware_sha" < "$(STAGED_IMAGE).build-receipt.json"; then \
+			echo "devcard: receipt firmware.sha256 does not match verified firmware" >&2; \
+			rm -f -- "$(STAGED_IMAGE)" "$(STAGED_IMAGE).xz" "$(STAGED_IMAGE).devcard-manifest.json" \
+				"$(STAGED_IMAGE).build-receipt.json" "$(STAGED_IMAGE).sha256"; \
+			exit 1; \
+		fi; \
 		for suffix in '' .devcard-manifest.json .build-receipt.json .sha256; do \
 			mv -fT -- "$(STAGED_IMAGE)$$suffix" "$(IMAGE)$$suffix"; \
 		done; \
