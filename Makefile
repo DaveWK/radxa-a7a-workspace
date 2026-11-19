@@ -7,10 +7,8 @@
 #   make firmware      bt0 + main + EDK2 -> out/firmware/firmware.bin (SD card or eMMC, LBA 256)
 #   make fel-image     the FEL bundle for one mode and profile ->
 #                      out/fel/<mode>-<mhz>/ (blobfree-1200, blobfree-2400,
-#                      dramlib-2400, phyfw-2400). Its own cargo target and
-#                      intermediates under out/fel/<mode>-<mhz>/build/, and a
-#                      build-manifest.json (mode, profile, features, source
-#                      SHA, image SHA256)
+#                      dramlib-2400, phyfw-2400). Private build and packaging
+#                      directories, and a build record under out/fel/.records/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
 #   make fel-boot      boot the board over USB FEL with out/fel/<mode>-<mhz>/
 #                      (board in FEL on the host's USB). Only a blobfree
@@ -45,8 +43,8 @@
 #   FEL_DRAM=dramlib builds only the FEL bt0 with the library (a measurement
 #   build; a plain `make fel-boot` refuses it; FEL_MEASUREMENT_AUTH=<file> to
 #   boot it).
-#   A7A_* variables in the environment reach the bt0 build and override
-#   single settings of our driver (see the board README in firmware/oreboot).
+#   fel-image refuses inherited A7A_* and A733_* variables in every mode.
+#   Use the separate lab tooling for individual driver settings.
 
 TOP      := $(abspath .)
 OUT      := $(TOP)/out
@@ -56,7 +54,6 @@ FEDORA   := $(TOP)/fedora
 DTS      := $(FEDORA)/fedora/dts
 
 VENDOR_DRAM ?= no
-DRAM_MHZ    ?=
 FEL_DRAM    ?=
 OTP         ?= no
 DRAM_LIB    ?= $(TOP)/vendor/dramlib/libdram
@@ -102,14 +99,14 @@ IMAGE   := $(OUT)/image/a7a-fedora$(FEDORA_RELEASE).img
 
 # The DRAM path of bt0 and of the FEL bt0: no (ours, nothing from a vendor),
 # yes (the vendor library) or phyfw (ours with the PHY's firmware as data).
-ifeq ($(filter no yes phyfw,$(VENDOR_DRAM)),)
+ifneq ($(words $(filter no yes phyfw,$(VENDOR_DRAM))):$(words $(VENDOR_DRAM)),1:1)
 $(error VENDOR_DRAM=$(VENDOR_DRAM): no (default), yes or phyfw)
 endif
-ifeq ($(filter 1200 2400,$(or $(DRAM_MHZ),1200)),)
+ifneq ($(words $(filter 1200 2400,$(or $(DRAM_MHZ),1200))):$(words $(or $(DRAM_MHZ),1200)),1:1)
 $(error DRAM_MHZ=$(DRAM_MHZ): 1200 or 2400)
 endif
-BT0_DRAM := $(VENDOR_DRAM)
-FEL_BT0_DRAM := $(if $(filter dramlib,$(FEL_DRAM)),yes,$(VENDOR_DRAM))
+override BT0_DRAM := $(VENDOR_DRAM)
+override FEL_BT0_DRAM := $(if $(filter dramlib,$(FEL_DRAM)),yes,$(VENDOR_DRAM))
 # dram-cargo <no|yes|phyfw>: the cargo arguments that select the path. bt0's
 # default features are the blob-free boot; the other two are built without
 # them.
@@ -126,19 +123,27 @@ dram-dep = $(if $(filter yes,$(1)),$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),$(DRA
 dram-tag = $(if $(filter no,$(1)),blobfree,$(if $(filter yes,$(1)),dramlib,phyfw))
 # Each DRAM mode and profile gets its own FEL build and output directory, so
 # two builds never share or overwrite the same intermediate or bundle.
-FEL_TAG_MODE := $(call dram-tag,$(FEL_BT0_DRAM))
-FEL_PROFILE := $(or $(DRAM_MHZ),$(if $(filter blobfree,$(FEL_TAG_MODE)),1200,2400))
-FEL_SLOT := $(FEL_TAG_MODE)-$(FEL_PROFILE)
-FEL_OUT := $(OUT)/fel/$(FEL_SLOT)
-FEL_BUILD := $(FEL_OUT)/build
-FEL_TGT := $(FEL_BUILD)/target
-FEL_DTB := $(FEL_BUILD)/dtb/sun60i-a733-cubie-a7a.dtb
-FEL_EDK2_DIR := $(FEL_BUILD)/edk2
-FEL_BT0 := $(FEL_BUILD)/bt0.bin
-FEL_BT0_FEL := $(FEL_BUILD)/bt0-fel.bin
-FEL_MAIN := $(FEL_BUILD)/main-fel.bin
+override FEL_TAG_MODE := $(call dram-tag,$(FEL_BT0_DRAM))
+override PROFILE := $(if $(filter blobfree,$(FEL_TAG_MODE)),$(or $(DRAM_MHZ),1200),2400)
+override FEL_SLOT := $(FEL_TAG_MODE)-$(PROFILE)
+ifneq ($(or $(FEL_IMAGE_EXPECT),$(FEL_SLOT)),$(FEL_SLOT))
+$(error FEL compile slot $(FEL_SLOT) does not match the requested $(FEL_IMAGE_EXPECT))
+endif
+override FEL_OUT := $(OUT)/fel/$(FEL_SLOT)
+override FEL_BUILD := $(or $(FEL_RUN_DIR),$(FEL_OUT)/build)
+override FEL_TGT := $(FEL_BUILD)/target
+override FEL_DTB := $(FEL_BUILD)/dtb/sun60i-a733-cubie-a7a.dtb
+override FEL_EDK2_DIR := $(FEL_BUILD)/edk2
+override FEL_BT0 := $(FEL_BUILD)/bt0.bin
+override FEL_BT0_FEL := $(FEL_BUILD)/bt0-fel.bin
+override FEL_MAIN := $(FEL_BUILD)/main-fel.bin
 BT0_FEATURES = $(strip $(call dram-feature,$(BT0_DRAM)) $(if $(filter yes,$(OTP)),otp))
-FEL_FEATURES = $(strip fel $(call dram-feature,$(FEL_BT0_DRAM)))
+override FEL_FEATURES = $(strip fel $(call dram-feature,$(FEL_BT0_DRAM)))
+# The old FEL_DRAM=dramlib alias uses the vendor library only in the FEL bt0.
+# Its SD bt0 is blob-free at the pinned default, with no profile override.
+override FEL_SD_ENV = $(if $(filter blobfree,$(FEL_TAG_MODE)),A7A_PROFILE=$(PROFILE),$(call dram-env,$(BT0_DRAM)))
+override FEL_BT0_ENV = $(if $(filter blobfree,$(FEL_TAG_MODE)),A7A_PROFILE=$(PROFILE),$(call dram-env,$(FEL_BT0_DRAM)))
+fel-profile-check = $(if $(filter-out blobfree,$(FEL_TAG_MODE)),$(if $(filter-out undefined,$(origin DRAM_MHZ)),$(error DRAM_MHZ must be unset for FEL measurement mode $(FEL_TAG_MODE), which runs at 2400 MHz)))
 empty :=
 space := $(empty) $(empty)
 
@@ -148,9 +153,9 @@ define check-bt0-size
 	echo "$(1): $$s bytes (limit $(BT0_MAX_BYTES))"
 endef
 
-# bt0_build <features> <target dir> <output .bin> <DRAM path: no|yes|phyfw>
+# bt0_build <features> <target dir> <output .bin> <DRAM path> <env assignments>
 define bt0_build
-	cd $(BOARD)/bt0 && env $(strip $(call dram-env,$(4))) CARGO_TARGET_DIR=$(2) \
+	cd $(BOARD)/bt0 && env $(5) CARGO_TARGET_DIR=$(2) \
 		$(CARGO) build --release --locked $(call dram-cargo,$(4)) $(if $(1),--features "$(1)")
 	$(OBJCOPY) -O binary $(2)/armv7a-none-eabi/release/oreboot-cubie-a7a-bt0 $(3)
 	$(call check-bt0-size,$(3))
@@ -197,7 +202,7 @@ dtb: check-sources
 	$(MAKE) -C $(DTS) OUT=$(DTB) DTB_ORIGIN=firmware
 
 bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(OUT)/oreboot
-	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM))
+	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM),$(strip $(call dram-env,$(BT0_DRAM))))
 
 $(FEL_BUILD):
 	mkdir -p $@
@@ -206,14 +211,16 @@ fel-dtb: check-sources
 	mkdir -p $(dir $(FEL_DTB))
 	$(MAKE) -C $(DTS) OUT=$(FEL_DTB) DTB_ORIGIN=firmware
 
-fel-edk2: check-sources fel-dtb
-	EDK2_OUT=$(FEL_EDK2_DIR) BUILD_TAG=$(FEL_SLOT) scripts/build-edk2.sh $(EDK2_TARGET) $(EDK2_ARGS) -D DTB_FILE=$(FEL_DTB)
+fel-edk2: check-sources $(if $(FEL_DTB_INPUT),,fel-dtb)
+	EDK2_OUT=$(FEL_EDK2_DIR) BUILD_TAG=$(FEL_SLOT) scripts/build-edk2.sh $(EDK2_TARGET) $(EDK2_ARGS) -D DTB_FILE=$(or $(FEL_DTB_INPUT),$(FEL_DTB))
 
 fel-bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(FEL_BUILD)
-	$(call bt0_build,$(BT0_FEATURES),$(FEL_TGT)/bt0-sd,$(FEL_BT0),$(BT0_DRAM))
+	$(fel-profile-check)
+	$(call bt0_build,$(BT0_FEATURES),$(FEL_TGT)/bt0-sd,$(FEL_BT0),$(BT0_DRAM),$(strip $(FEL_SD_ENV)))
 
 bt0-fel: check-sources $(call dram-dep,$(FEL_BT0_DRAM)) | $(FEL_BUILD)
-	$(call bt0_build,$(FEL_FEATURES),$(FEL_TGT)/bt0-fel,$(FEL_BT0_FEL),$(FEL_BT0_DRAM))
+	$(fel-profile-check)
+	$(call bt0_build,$(FEL_FEATURES),$(FEL_TGT)/bt0-fel,$(FEL_BT0_FEL),$(FEL_BT0_DRAM),$(strip $(FEL_BT0_ENV)))
 	@echo "$(FEL_BT0_FEL): linked at 0x90000"
 
 main: check-sources | $(OUT)/oreboot
@@ -232,18 +239,16 @@ firmware: bt0 main edk2
 		--out $(FW_OUT) --egon-offset $(EGON_OFFSET)
 	cd $(FW_OUT) && sha256sum firmware.bin firmware.seek | tee SHA256SUMS
 
-# USB FEL boot set for scripts/fel-boot.sh: bt0-fel.bin plus a firmware.bin
-# whose layout table names main (FEL_BRINGUP) and EDK2. The intermediates
-# stay under $(FEL_BUILD); the packaging step reads only from there and
-# writes build-manifest.json (mode, profile, features, source SHA, image
-# SHA256) next to the images. fel-boot validates a staged copy before any
-# USB access.
-fel-image: fel-bt0 bt0-fel main-fel fel-edk2
-	python3 -I scripts/fel-manifest.py record --build-dir $(FEL_BUILD) \
-		--mode $(FEL_TAG_MODE) --profile $(FEL_PROFILE) --features "$(FEL_FEATURES)" \
-		--workspace $(TOP) --oreboot $(OREBOOT)
-	python3 -I scripts/fel-manifest.py package --build-dir $(FEL_BUILD) --out-dir $(FEL_OUT) \
-		--egon-offset $(EGON_OFFSET)
+# The recursive Make invocation inherits the jobserver. The orchestrator
+# handles -n without acquiring locks, creating directories or compiling.
+fel-image:
+	$(fel-profile-check)
+	$(if $(findstring t,$(filter-out -%,$(firstword $(MAKEFLAGS)))),:,python3 -I scripts/fel-manifest.py build \
+		--make "$(MAKE)" $(if $(findstring n,$(filter-out -%,$(firstword $(MAKEFLAGS)))),--dry-run) \
+		--out-dir "$(FEL_OUT)" --mode $(FEL_TAG_MODE) --profile $(PROFILE) \
+		--features "$(FEL_FEATURES)" --sd-features "$(BT0_FEATURES)" \
+		--main-features "$(FEL_BRINGUP)" --fel-env "$(strip $(FEL_BT0_ENV))" \
+		--sd-env "$(strip $(FEL_SD_ENV))" --egon-offset $(EGON_OFFSET))
 
 xfel: $(XFEL)
 $(XFEL):
@@ -251,13 +256,14 @@ $(XFEL):
 
 # Needs the board in FEL (USB 1f3a:efe8) on this host and root for xfel
 # (SUDO=, with xfel's udev rule installed, runs it as you). Run it on the
-# host, not in the build container. Only a blobfree bundle is booted: the
-# staged manifest must say blobfree, match the current workspace and oreboot
-# SHAs and the requested profile. A dramlib or phyfw measurement build needs
+# host, not in the build container. The workspace build record, looked up
+# by staged bt0 digest, must agree with the bundle and the requested profile.
+# A dramlib or phyfw measurement build needs
 # FEL_MEASUREMENT_AUTH=<file> naming this bt0 and a human authorization.
 fel-boot: $(XFEL)
+	$(fel-profile-check)
 	@test -f $(FEL_OUT)/bt0-fel.bin || { echo "run make fel-image first (in the container)" >&2; exit 1; }
-	XFEL=$(XFEL) EXPECT_PROFILE=$(FEL_PROFILE) scripts/fel-boot.sh $(FEL_OUT)
+	XFEL=$(XFEL) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh $(FEL_OUT)
 
 rpms: check-sources
 	FWREPO=$(FWREPO) FEDORA_RELEASE=$(FEDORA_RELEASE) $(if $(AIC8800_SRC),AIC8800_SRC=$(abspath $(AIC8800_SRC))) \

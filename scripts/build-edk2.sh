@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Build the EDK2 payload for the Radxa Cubie A7A.
 #
 # Usage: scripts/build-edk2.sh [DEBUG|RELEASE] [extra build args...]
 #   e.g. scripts/build-edk2.sh RELEASE -D USB_ENABLE=TRUE
 #
-# BUILD_TAG=<name> builds into Build/CubieA7A-<name> and out/edk2-<name>
-# instead, so two builds can run side by side.
+# BUILD_TAG=<name> selects separate output paths. All builds serialize access
+# to the shared EDK2 package links, BaseTools, Conf and Build trees.
 #
 # Output: out/edk2/CUBIEA7A_EFI.fd -- a raw 4 MiB FD that oreboot loads at
 # 0x41000000 and enters at its first byte (AArch64 EL2, x0 = DTB).
@@ -55,6 +56,10 @@ command -v aarch64-linux-gnu-gcc >/dev/null || die "aarch64-linux-gnu-gcc not fo
 # The shared EDK2 packages (OreEdk2BootPkg, DesignWarePkg).
 COMMON=$PLAT/OreEdk2Boot
 [[ -f $COMMON/OreEdk2BootPkg/OreEdk2BootPkg.dec ]] || die "no OreEdk2Boot in $PLAT"
+mkdir -p "$TOP/out"
+exec {lock}>"$TOP/out/.edk2-build.lock"
+flock -x "$lock"
+
 # EDK2 matches module paths against the workspace and PACKAGES_PATH by
 # string prefix, so firmware/edk2-platforms (which starts with the
 # workspace's firmware/edk2) and OreEdk2Boot (inside it) would land in the

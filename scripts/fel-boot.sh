@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Boot the Radxa Cubie A7A over USB FEL, without its SD card slot.
 #
 #   scripts/fel-boot.sh <image dir>
@@ -34,7 +35,7 @@
 # bt0-fel.bin (bt0 feature fel, linked at 0x90000), firmware.bin +
 # firmware.seek, whose boot layout table names oreboot main and the EDK2 FD,
 # and build-manifest.json. fel-boot copies the bundle into a private staging
-# directory under out/ (mode 0700), validates the copies with
+# directory under out/ (mode 0700), checks the copies against the local record with
 # scripts/fel-check.py before any USB access, and passes only the staged paths
 # to xfel. A dramlib or phyfw bundle is a measurement build: it needs
 # FEL_MEASUREMENT_AUTH=<file> naming this bt0's digest and a human
@@ -48,21 +49,22 @@ ENTRY1=0x90040
 ENTRY2=0x90044
 MAILBOX=0xdf000
 TABLE=0xdf200
-TABLE_OFFSET=0x1ff000 # layout table offset on the boot medium
 
 SCRIPTS=$(cd "$(dirname "$0")" && pwd)
 XFEL=${XFEL:-xfel}
 SUDO=${SUDO-sudo}
+sudo_prefix=()
+if [[ -n $SUDO ]]; then
+    read -r -a sudo_prefix <<<"$SUDO"
+fi
 
 die() {
     printf 'fel-boot: %s\n' "$*" >&2
     exit 1
 }
 step() { printf '\n==> %s\n' "$*"; }
-# SUDO may be empty, hence unquoted; stdin closed so xfel/sudo never eat
-# the plan file the loops below read.
-# shellcheck disable=SC2086
-x() { $SUDO "$XFEL" "$@" </dev/null; }
+# Keep stdin closed so xfel/sudo never reads the plan file.
+x() { "${sudo_prefix[@]}" "$XFEL" "$@" </dev/null; }
 
 [ $# -eq 1 ] || die "usage: $0 <image dir with bt0-fel.bin, firmware.bin, firmware.seek, build-manifest.json>"
 IMAGE=$(cd "$1" && pwd)
@@ -81,7 +83,7 @@ cp "$IMAGE/bt0-fel.bin" "$IMAGE/firmware.bin" "$IMAGE/firmware.seek" \
 WORK="$STAGE/work"
 mkdir -p "$WORK"
 
-check_args=(--expect-profile "${EXPECT_PROFILE:-${DRAM_MHZ:-1200}}")
+check_args=(--work "$WORK" --expect-profile "${EXPECT_PROFILE:-${DRAM_MHZ:-1200}}")
 if [ -n "${FEL_MEASUREMENT_AUTH:-}" ]; then
     check_args+=(--measurement-auth "$FEL_MEASUREMENT_AUTH")
 fi
@@ -103,8 +105,7 @@ put() {
 # mailbox [seconds]: prints "magic state dram_mb dram_mhz rom_sctlr
 # rom_cpsr rom_vbar", or "none" if FEL does not answer within the time.
 mailbox() {
-    # shellcheck disable=SC2086
-    if timeout "${1:-30}" $SUDO "$XFEL" read "$MAILBOX" 28 "$WORK/mailbox" </dev/null >/dev/null 2>&1; then
+    if timeout "${1:-30}" "${sudo_prefix[@]}" "$XFEL" read "$MAILBOX" 28 "$WORK/mailbox" </dev/null >/dev/null 2>&1; then
         od -An -v -tx4 -w28 "$WORK/mailbox" | tr -s ' ' | sed 's/^ //'
     else
         echo none
@@ -118,41 +119,9 @@ printf '  %s\n' "$ver"
 grep -q 'ID=0x00190300' <<<"$ver" || die "FEL device is not an A733 (ID 0x00190300)"
 
 step "Images from $STAGE"
-# The layout table frame and every image it names, out of firmware.bin; the
-# table's CRCs are checked here as bt0 will check them.
-python3 -I - "$STAGE" "$WORK" "$TABLE_OFFSET" >"$WORK/plan" <<'PY'
-import struct, sys, zlib
-image, work, table_offset = sys.argv[1], sys.argv[2], int(sys.argv[3], 0)
-fw = open(f"{image}/firmware.bin", "rb").read()
-base = int(open(f"{image}/firmware.seek").read()) * 512
-frame = fw[table_offset - base:table_offset - base + 512]
-if len(frame) != 512 or frame[:8] != b"A7ABOOT1":
-    sys.exit("fel-boot: no A7ABOOT1 layout table in firmware.bin")
-version, count, crc = struct.unpack_from("<III", frame, 8)
-size = 24 + 32 * 8
-zeroed = frame[:16] + b"\0" * 4 + frame[20:size]
-if zlib.crc32(zeroed) != crc:
-    sys.exit("fel-boot: layout table CRC mismatch")
-open(f"{work}/table.bin", "wb").write(frame)
-names = {1: "main", 2: "edk2-fd", 3: "dtb"}
-for i in range(count):
-    kind, flags, off, n, load, crc32, _ = struct.unpack_from("<IIIIQII", frame, 24 + 32 * i)
-    if kind not in names:      # 4: a vendor SPL in older images; never loaded
-        continue
-    data = fw[off - base:off - base + n]
-    if len(data) != n:
-        sys.exit(f"fel-boot: kind {kind} extends past firmware.bin")
-    if crc32 and zlib.crc32(data) != crc32:
-        sys.exit(f"fel-boot: kind {kind} CRC mismatch in firmware.bin")
-    path = f"{work}/kind{kind}.bin"
-    open(path, "wb").write(data)
-    print(f"{kind} {load:#x} {n} {path} {names[kind]}")
-PY
-while read -r kind addr size path name; do
+while read -r kind addr size _ name; do
     printf '  kind %s %-20s %8d bytes -> %s\n' "$kind" "$name" "$size" "$addr"
 done <"$WORK/plan"
-grep -q '^1 ' "$WORK/plan" || die "no oreboot main in the layout table"
-grep -q '^2 ' "$WORK/plan" || die "no payload in the layout table"
 
 step "bt0 (FEL build) to $BT0_BASE"
 head -c 4096 /dev/zero >"$WORK/zero"
@@ -181,14 +150,13 @@ printf '  back in FEL after %d s: DRAM %d MiB at %d MHz; mask ROM SCTLR 0x%s CPS
 
 step "Images to DRAM"
 put "$WORK/table.bin" "$TABLE" "layout table frame"
-while read -r kind addr size path name; do
-    put "$path" "$addr" "$name"
+while read -r _ addr _ file name; do
+    put "$WORK/$file" "$addr" "$name"
 done <"$WORK/plan"
 
 step "Entry 2 ($ENTRY2): check the images, warm reset into oreboot main"
 rc=0
-# shellcheck disable=SC2086
-timeout 15 $SUDO "$XFEL" exec "$ENTRY2" </dev/null || rc=$?
+timeout 15 "${sudo_prefix[@]}" "$XFEL" exec "$ENTRY2" </dev/null || rc=$?
 state=none
 if [ "$rc" -eq 0 ]; then
     # exec answered; whether entry 2 has started yet is the mailbox's to say.
