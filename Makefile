@@ -288,10 +288,12 @@ test: check-sources xfel
 	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/fel-fmmt.py scripts/fel-check.py scripts/fel-tools.py scripts/test-fel-manifest.py
 	python3 -I scripts/test-fel-manifest.py
 	python3 -I scripts/test-xfel-port.py
+	python3 -I scripts/test-cached-run.py
+	python3 -I scripts/test-fel-session.py
 	bash -n scripts/fel-boot.sh scripts/build-edk2.sh scripts/serial-log.sh scripts/fetch-vendor.sh scripts/build-xfel.sh scripts/binfmt-aarch64.sh
 	shellcheck scripts/*.sh
 	shfmt -d scripts/*.sh
-	black --check scripts/*.py scripts/xfel-port
+	black --check scripts/*.py scripts/xfel-port scripts/a7a-cached-run scripts/lib/cached_set.py
 
 clean:
 	rm -rf $(OUT)

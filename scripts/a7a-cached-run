@@ -1,0 +1,9 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-only
+"""Run a cached memtest with the shared FEL transaction module."""
+
+from pathlib import Path
+import runpy
+
+session = runpy.run_path(str(Path(__file__).with_name("fel_session.py")))
+session["cli"](session["cached_main"])

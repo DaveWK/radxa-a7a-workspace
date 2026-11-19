@@ -18,6 +18,7 @@ INFRA = {
     "scripts/test-xfel-binary.py",
     "scripts/test-fel-callers.py",
     "scripts/test-fel-manifest.py",
+    "scripts/test-cached-run.py",
 }
 ALLOW = {
     "Makefile": (

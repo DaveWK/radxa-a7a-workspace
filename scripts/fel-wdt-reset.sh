@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-printf '%s\n' 'FEL resets go through scripts/fel_session.py (task-000141); not available in the selector layer.' >&2
-exit 1
+set -euo pipefail
+scripts=$(cd "$(dirname "$0")" && pwd)
+exec python3 -I "$scripts/fel_session.py" reset \
+    --port "${FEL_PORT:?}" --state "${FEL_STATE_FILE:?}"

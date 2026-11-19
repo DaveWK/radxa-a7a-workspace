@@ -63,6 +63,18 @@ vendor input.
 
 Details: [docs/bring-up-status.md](docs/bring-up-status.md).
 
+## FEL transaction safety
+
+Use the [port-bound FEL session](docs/fel-session.md) for boot or reset. The
+cached runner requires preflight and a separate, board-specific identity
+clearance before any host DRAM upload. The serial capture check detects
+rotation, shrinkage and a rewrite of the 4 KiB before the attempt cursor.
+The capture has no producer generation or firmware attempt token:
+copytruncate followed by regrowth that reproduces those bytes, or an
+unmarked reset, cannot be detected by the host. Serial attribution is limited
+to the defined markers in the ACKed attempt window; the cached runner's
+per-boot identity check is an independent second gate.
+
 ## Build
 
     git clone --recurse-submodules https://github.com/DaveWK/radxa-a7a-workspace.git
