@@ -46,6 +46,12 @@ SUBMODULES = {
     "oreboot": OREBOOT,
     "edk2": Path("firmware/edk2"),
     "edk2_platforms": Path("firmware/edk2-platforms"),
+    "fedora": Path("fedora"),
+}
+REQUIRED_EDK2 = {
+    "BaseTools/Source/C/BrotliCompress/brotli",
+    "MdePkg/Library/ArmTransferListLib/libtl",
+    "MdePkg/Library/BaseFdtLib/libfdt",
 }
 
 
@@ -66,14 +72,74 @@ def is_hex(value, length):
     )
 
 
-def git_text(cwd, *args):
-    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
-    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
-        env.pop(name, None)
-    result = subprocess.run(
-        ["git", "-C", str(cwd), *args], env=env, capture_output=True, text=True
+def git_run(cwd, *args):
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        env={
+            "HOME": str(Path.home()),
+            "PATH": os.environ.get("PATH", os.defpath),
+            "TMPDIR": os.environ.get("TMPDIR", str(ROOT / "out")),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+        capture_output=True,
     )
-    return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+
+def git_text(cwd, *args):
+    result = git_run(cwd, *args)
+    return os.fsdecode(result.stdout).rstrip("\n") if result.returncode == 0 else None
+
+
+def checked_tree(path, phase):
+    def checked(*args):
+        result = git_run(path, *args)
+        if result.returncode:
+            die(f"{phase}: {path}: git {' '.join(args)}: {os.fsdecode(result.stderr)}")
+        return result.stdout
+
+    for key in ("core.sparseCheckout", "core.sparseCheckoutCone"):
+        setting = git_run(path, "config", "--type=bool", "--get-all", key)
+        if setting.returncode not in (0, 1) or b"true" in setting.stdout.splitlines():
+            die(f"{phase}: {path}: sparse checkout ({key})")
+    sparse = Path(
+        os.fsdecode(
+            checked(
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "info/sparse-checkout",
+            )
+        ).rstrip("\n")
+    )
+    if sparse.exists() and sparse.stat().st_size:
+        die(f"{phase}: {path}: non-empty sparse-checkout file")
+    types = {
+        "100644": stat.S_IFREG,
+        "100755": stat.S_IFREG,
+        "120000": stat.S_IFLNK,
+        "160000": stat.S_IFDIR,
+    }
+    links = []
+    for entry in checked("ls-files", "-v", "--stage", "-z").split(b"\0")[:-1]:
+        meta, raw_name = entry.split(b"\t", 1)
+        flag, mode, _, stage = meta.decode("ascii").split()
+        name = os.fsdecode(raw_name)
+        if flag == "S" or flag.islower():
+            reason = "skip-worktree" if flag == "S" else "assume-unchanged"
+            die(f"{phase}: {path}/{name}: {reason}")
+        if stage != "0" or stat.S_IFMT((path / name).lstat().st_mode) != types.get(
+            mode
+        ):
+            die(f"{phase}: {path}/{name}: unexpected index entry or file type")
+        if mode == "160000":
+            links.append(name)
+    if checked("ls-files", "--deleted", "-z"):
+        die(f"{phase}: {path}: deleted tracked files")
+    if checked("status", "--porcelain", "-uall", "--ignore-submodules=none"):
+        die(f"{phase}: {path} is not clean (git status --porcelain)")
+    return links
 
 
 def git_sha(cwd):
@@ -113,19 +179,52 @@ def source_identity(workspace, phase):
                 die(f"{phase}: {path} HEAD {sha} does not match the workspace gitlink")
         roots[name] = dict(path=str(path), toplevel=top, head=sha, clean=True)
 
-    for name in ("oreboot", "edk2", "edk2_platforms", "workspace"):
-        path = Path(roots[name]["path"])
+    nested = {}
+    required = {workspace / SUBMODULES["edk2"] / rel for rel in REQUIRED_EDK2}
+
+    def inspect(path, head):
+        for rel in checked_tree(path, phase):
+            child = path / rel
+            if child in (workspace / root for root in SUBMODULES.values()):
+                continue  # Checked as an independent root below.
+            key = str(child.relative_to(workspace))
+            if not (child / ".git").exists():
+                if child in required or any(child.iterdir()):
+                    die(f"{phase}: nested submodule {child} is not initialized")
+                nested[key] = dict(path=key, head=None, clean=False)
+                continue
+            actual = git_sha(child)
+            if (
+                not actual
+                or git_text(path, "ls-tree", head, "--", rel)
+                != f"160000 commit {actual}\t{rel}"
+            ):
+                die(f"{phase}: {child} does not match its parent gitlink")
+            nested[key] = dict(path=key, head=actual, clean=True)
+            inspect(child, actual)
+
+    for name in (*SUBMODULES, "workspace"):
+        root = Path(roots[name]["path"])
         if (
-            git_text(path, "status", "--porcelain", "-uall", "--ignore-submodules=none")
-            != ""
+            git_text(
+                root, "-c", "submodule.active=.", "submodule", "status", "--recursive"
+            )
+            is None
         ):
-            die(f"{phase}: {path} is not clean (git status --porcelain)")
+            die(f"{phase}: cannot enumerate nested submodules of {root}")
+        # Walk the index as well: inactive local submodule settings must not
+        # hide an initialized checkout, nor may a needed gitlink be absent.
+        inspect(root, roots[name]["head"])
+    for path in required:
+        if not nested.get(str(path.relative_to(workspace)), {}).get("head"):
+            die(f"{phase}: required nested submodule {path} is not initialized")
     return dict(
         source_sha=roots["workspace"]["head"],
         oreboot_sha=roots["oreboot"]["head"],
         workspace_clean=True,
         oreboot_clean=True,
         source_roots=roots,
+        nested_submodules=nested,
     )
 
 
@@ -457,6 +556,7 @@ def check_manifest(
         "workspace_clean",
         "oreboot_clean",
         "source_roots",
+        "nested_submodules",
         "edk2_target",
         "edk2_args",
         "fel_dtb_input",

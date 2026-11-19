@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT
 BOARD = Path("firmware/oreboot/src/mainboard/radxa/cubie-a7a")
 FD = "CUBIEA7A_EFI.fd"
+PROFILE = Path("src/mainboard/radxa/cubie-a7a/dram/src/knobs/profile.rs")
+LIBTL = "MdePkg/Library/ArmTransferListLib/libtl"
 MAIN = b"main-fel from the fake compiler\n"
 DTB = b"test device tree\n"
 BT0 = b"\0\0\0\0eGON.BT0" + bytes(256)
@@ -185,6 +187,7 @@ class GateTests(unittest.TestCase):
         self.oreboot = self.workspace / "firmware" / "oreboot"
         self.edk2 = self.workspace / "firmware" / "edk2"
         self.platforms = self.workspace / "firmware" / "edk2-platforms"
+        self.fedora = self.workspace / "fedora"
         self.tools = self.root / "tools"
         self.tools.mkdir()
         self.mem = self.root / "mem"
@@ -293,21 +296,21 @@ class GateTests(unittest.TestCase):
             )
             self.file(path / "build.rs", CARGO_BUILD_RS)
             self.file(path / "src/lib.rs", "")
-        deps = (self.oreboot, self.edk2, self.platforms)
+        self.file(Path("firmware/oreboot") / PROFILE, "// pinned fixture\n")
+        children = (
+            LIBTL,
+            "MdePkg/Library/BaseFdtLib/libfdt",
+            "BaseTools/Source/C/BrotliCompress/brotli",
+        )
+        for rel in children:
+            self.file(Path("firmware/edk2") / rel / "tracked", "nested source\n")
+            self.init_repo(self.edk2 / rel)
+        self.init_with_links(self.edk2, children)
+        deps = (self.oreboot, self.platforms, self.fedora)
         for dep in deps:
             self.init_repo(dep)
-        paths = [str(dep.relative_to(self.workspace)) for dep in deps]
-        self.init_repo(self.workspace, *paths)
-        for dep, path in zip(deps, paths):
-            pin = git(dep, "rev-parse", "HEAD")
-            git(
-                self.workspace,
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                f"160000,{pin},{path}",
-            )
-        git(self.workspace, "commit", "-qm", "Pin fixture submodules")
+        paths = [str(dep.relative_to(self.workspace)) for dep in (*deps, self.edk2)]
+        self.init_with_links(self.workspace, paths)
         self.file("vendor/dramlib/libdram", "fixture vendor input only\n")
         self.file("out/oreboot/libdram-a733.a", "fixture archive only\n")
         self.assertEqual(git(self.workspace, "status", "--porcelain"), "")
@@ -317,6 +320,21 @@ class GateTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents)
         return path
+
+    @staticmethod
+    def init_with_links(repo, paths):
+        (repo / ".gitmodules").write_text(
+            "".join(
+                f'[submodule "{rel}"]\n\tpath = {rel}\n\turl = ./{rel}\n'
+                for rel in paths
+            )
+        )
+        GateTests.init_repo(repo, *paths)
+        for rel in paths:
+            pin = git(repo / rel, "rev-parse", "HEAD")
+            git(repo, "update-index", "--add", "--cacheinfo", f"160000,{pin},{rel}")
+            git(repo, "config", f"submodule.{rel}.active", "true")
+        git(repo, "commit", "-qm", "Pin fixture submodules")
 
     @staticmethod
     def init_repo(repo, *excluded):
@@ -742,6 +760,57 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.cargo_log.read_text(), "")
         self.assertIn("before compilation:", proc.stderr)
         self.assertIn("not clean", proc.stderr)
+
+    def refused_before_compile(self, reason):
+        self.refusal(self.make("fel-image"), reason)
+        self.assertEqual(self.cargo_log.read_text(), "")
+        self.assertEqual(self.edk2_log.read_text(), "")
+
+    def test_sparse_oreboot(self):
+        git(
+            self.oreboot,
+            "sparse-checkout",
+            "set",
+            str(PROFILE.parents[3] / "bt0"),
+            str(PROFILE.parents[3] / "main"),
+        )
+        self.assertFalse((self.oreboot / PROFILE).exists())
+        self.refused_before_compile("sparse checkout")
+
+    def changed_profile(self, flag, delete=False):
+        git(self.oreboot, "update-index", "--" + flag, str(PROFILE))
+        if delete:
+            (self.oreboot / PROFILE).unlink()
+        else:
+            (self.oreboot / PROFILE).write_text("// changed\n")
+        self.refused_before_compile(flag)
+
+    def test_skip_worktree_oreboot(self):
+        self.changed_profile("skip-worktree")
+
+    def test_assume_unchanged_oreboot(self):
+        self.changed_profile("assume-unchanged")
+
+    def test_missing_oreboot_profile(self):
+        self.changed_profile("assume-unchanged", delete=True)
+
+    def test_nested_hidden_edit(self):
+        child = self.edk2 / LIBTL
+        git(child, "update-index", "--skip-worktree", "tracked")
+        (child / "tracked").write_text("changed\n")
+        self.refused_before_compile("skip-worktree")
+
+    def test_nested_other_commit(self):
+        # W4's status-only check overlooks this nested HEAD.
+        git(self.edk2, "update-index", "--assume-unchanged", LIBTL)
+        git(self.edk2 / LIBTL, "commit", "-qm", "other HEAD", "--allow-empty")
+        self.refused_before_compile("before compilation")
+
+    def test_nested_required_uninitialized(self):
+        child = self.edk2 / LIBTL
+        child.rename(self.root / "detached-child")
+        child.mkdir()
+        self.refused_before_compile("not initialized")
 
     def test_source_edit_during_compile_refused_without_publication(self):
         proc = self.make(

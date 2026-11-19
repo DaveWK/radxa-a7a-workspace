@@ -232,3 +232,17 @@ Measured on the board on 2026-11-12 (MB = 10^6 bytes):
 - Open: a lab build that runs DRAM training experiments and returns the
   results over fastboot does not come back to FEL through its watchdog
   reset after a DRAM run (it does without one); that needs a USB-C replug.
+# Gated source checkouts
+
+`make fel-image` requires full, clean workspace, oreboot, EDK2,
+edk2-platforms and Fedora trees before compilation and again before
+publication. Sparse checkout, hidden index entries and missing or mistyped
+tracked files are refused. Initialized nested submodules must pass the same
+checks at their parent's gitlink. Optional uninitialized gitlinks must be
+empty; the record distinguishes them from verified checkouts.
+
+At the pinned `439613accf` oreboot has no gitlinks. EDK2's
+`BaseTools/Source/C/GNUmakefile` builds BrotliCompress from its `brotli`
+submodule; `build-edk2.sh` requires BaseFdtLib's `libfdt`. The board DSC
+maps BaseFdtLib and ArmTransferListLib, whose INFs use `libfdt` and `libtl`,
+respectively. These three nested EDK2 checkouts must be initialized.
