@@ -68,6 +68,7 @@ class BenchTools(verify.SubprocessRunner):
         self.row = ""
         self.objcopies = []
         self.paths = []
+        self.test_launches = []
 
     @staticmethod
     def response(argv, cwd, rc=0, stdout="", stderr=""):
@@ -80,6 +81,8 @@ class BenchTools(verify.SubprocessRunner):
         cmd = Path(argv[0]).name
         if cmd == "git":
             self.git_envs.append(dict(env))
+        if cmd.startswith("suite-"):
+            self.test_launches.append(Path(argv[0]))
         if cmd == "git" or cmd.startswith("python") or cmd.startswith("suite-"):
             return super().run(argv, cwd, env, log)
         kwargs = {}
@@ -121,11 +124,12 @@ class BenchTools(verify.SubprocessRunner):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(b"synthetic ELF")
             elif "--no-run" in argv:
-                self.paths = [target / "suite-one", target / "suite-two"]
-                target.mkdir(parents=True, exist_ok=True)
+                second_dir = b.test_binary_dir or target
+                self.paths = [target / "suite-one", second_dir / "suite-two"]
                 for index, path in enumerate(self.paths):
                     if index == 1 and b.missing_binary:
                         continue
+                    path.parent.mkdir(parents=True, exist_ok=True)
                     if index == 1 and b.crash:
                         script = "exit 7\n"
                     else:
@@ -140,6 +144,9 @@ class BenchTools(verify.SubprocessRunner):
                             )
                     path.write_text("#!/bin/sh\n" + script, encoding="utf-8")
                     path.chmod(0o700)
+                if b.test_binary_link:
+                    b.test_binary_link.symlink_to(self.paths[1])
+                    self.paths[1] = b.test_binary_link
                 records = [
                     dict(
                         reason="compiler-artifact",
@@ -260,6 +267,8 @@ class CliTest(unittest.TestCase):
         self.extension = EXT
         self.missing_dram = False
         self.missing_binary = False
+        self.test_binary_dir = None
+        self.test_binary_link = None
         self.crash = False
         self.stderr_noise = False
         self.empty_binary = False
@@ -509,6 +518,28 @@ class CliTest(unittest.TestCase):
     def test_launch_line_does_not_make_missing_binary_a_completion(self):
         self.missing_binary = True
         self.check(1, "missing test binary:")
+
+    def test_executables_from_both_pinned_cargo_roots_are_run(self):
+        self.test_binary_dir = self.out / "build" / "test"
+        self.check(0, "binaries expected 2, completed 2")
+        self.assertEqual(
+            self.tools.test_launches,
+            [
+                self.out / "target" / "test" / "suite-one",
+                self.test_binary_dir / "suite-two",
+            ],
+        )
+
+    def test_executable_in_job_but_outside_both_pinned_roots_is_not_run(self):
+        self.test_binary_dir = self.out / "build" / "test-spill"
+        self.check(1, f"unexpected or duplicate executable: {self.test_binary_dir}")
+        self.assertEqual(self.tools.test_launches, [])
+
+    def test_symlink_escaping_both_pinned_roots_is_not_run(self):
+        self.test_binary_dir = self.root
+        self.test_binary_link = self.out / "build" / "test" / "suite-two"
+        self.check(1, f"unexpected or duplicate executable: {self.test_binary_link}")
+        self.assertEqual(self.tools.test_launches, [])
 
     def test_stderr_is_not_a_test_result_and_preserves_its_order(self):
         self.stderr_noise = True

@@ -1299,7 +1299,10 @@ class Harness:
             return [], f"cargo test --no-run exited {res.returncode}"
         executables: list[Path] = []
         finished = False
-        target_dir = Path(env["CARGO_TARGET_DIR"])
+        cargo_roots = (
+            Path(env["CARGO_TARGET_DIR"]),
+            Path(env["CARGO_BUILD_BUILD_DIR"]),
+        )
         for line in res.stdout.splitlines():
             try:
                 message = json.loads(line)
@@ -1319,14 +1322,15 @@ class Harness:
                 if not isinstance(executable, str):
                     return [], "Cargo test artifact has no executable"
                 path = Path(executable)
+                resolved = Path(os.path.realpath(path))
                 if (
                     not path.is_absolute()
-                    or path.resolve() != path
-                    or not path.is_relative_to(target_dir)
-                    or path in executables
+                    or resolved != path
+                    or not any(resolved.is_relative_to(root) for root in cargo_roots)
+                    or resolved in executables
                 ):
                     return [], f"unexpected or duplicate executable: {path}"
-                executables.append(path)
+                executables.append(resolved)
         if not finished or not executables:
             return [], "Cargo inventory is incomplete or has no executables"
         return executables, ""
