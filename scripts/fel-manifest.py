@@ -472,6 +472,7 @@ def build(args):
                 )
             )
             return
+        edk2_env["EDK2_EXPECT_HEAD"] = before["source_roots"]["edk2"]["head"]
         subprocess.run(command, cwd=ROOT, env=edk2_env, check=True, close_fds=False)
 
     def compile_firmware(run_dir):
@@ -549,6 +550,7 @@ def build(args):
             clean=True,
             **before,
             edk2_target=args.edk2_target,
+            **load_json(compiled / "edk2/tool-config.json"),
             edk2_args=edk2_args,
             fel_dtb_input=str(dtb_input) if dtb_input is not None else None,
             dtb_path=str(dtb_path),
@@ -666,6 +668,8 @@ def check_manifest(
         "source_roots",
         "nested_submodules",
         "edk2_target",
+        "basetools_stamp_sha256",
+        "conf_sha256",
         "edk2_args",
         "fel_dtb_input",
         "dtb_path",

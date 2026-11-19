@@ -71,10 +71,9 @@ ln -sfn "$PLAT/Silicon/Allwinner" "$PKGS/board/Silicon/Allwinner"
 ln -sfn "$COMMON/OreEdk2BootPkg" "$PKGS/common/OreEdk2BootPkg"
 ln -sfn "$COMMON/DesignWarePkg" "$PKGS/common/DesignWarePkg"
 
-# edksetup.sh only exports variables; the C tools have to be compiled once.
-if [[ ! -x $EDK2/BaseTools/Source/C/bin/GenFv ]]; then
-    make -C "$EDK2/BaseTools" -j"$JOBS"
-fi
+tool_gate=(python3 -I "$TOP/scripts/fel-tools.py")
+"${tool_gate[@]}" basetools "$EDK2" "$JOBS"
+mkdir -p "$OUT"
 
 FW_VERSION=$(git -C "$PLAT" describe --always --dirty 2>/dev/null || true)
 FW_VERSION="oreboot-edk2 ${FW_VERSION:-dev} $TARGET"
@@ -97,8 +96,10 @@ rm -f "$FD" "$OPTIONS"
     export PACKAGES_PATH="$EDK2:$PKGS/common:$PKGS/board"
     # shellcheck disable=SC1091
     . ./edksetup.sh BaseTools >/dev/null
+    "${tool_gate[@]}" capture-config "$EDK2" "$OUT/tool-config.json" || exit 1
     build -p Platform/Radxa/CubieA7APkg/CubieA7A.dsc -a AARCH64 -t GCC -b "$TARGET" \
-        -n "$JOBS" -D "FW_VERSION=$FW_VERSION" -D "BUILD_TAG=$TAG" "$@"
+        -n "$JOBS" -D "FW_VERSION=$FW_VERSION" -D "BUILD_TAG=$TAG" "$@" --conf="$EDK2/Conf" || exit 1
+    "${tool_gate[@]}" verify-config "$EDK2" "$OUT/tool-config.json"
 ) || die "EDK2 build failed"
 
 [[ -f $FD ]] || die "build reported success but $FD was not produced"

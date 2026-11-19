@@ -254,3 +254,14 @@ the LZMA-guided FV from `firmware.bin` itself, checks the embedded FDT's
 size and digest, and records both offsets: the section in the package and
 the FDT in the decoded stream. The FDF name comes from the current EDK2
 build's `BuildOptions`, including when `EDK2_ARGS` overrides the DSC default.
+
+The first EDK2 build without `out/edk2-basetools.stamp.json` forces a C
+tool rebuild under the EDK2 lock. Later builds refuse an EDK2 revision
+or binary-set/digest mismatch; investigate it before intentionally starting
+a new stamp. Each build records the stamp digest and the three effective
+`Conf` file digests, checked on both sides of the build under that lock.
+
+Run `scripts/build-xfel.sh` to produce the default tool and its
+`out/tools/xfel.record.json`. For an explicit `XFEL` override, supply the
+known full `EXPECT_XFEL_SHA256`. Before any USB access the boot gate copies
+and hashes the tool in one pass, then runs only the verified private copy.

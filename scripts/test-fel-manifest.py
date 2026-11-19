@@ -136,6 +136,8 @@ elif tool in ("xfel", "lsusb"):
     with open(env["FAKE_USB_LOG"], "a") as log:
         log.write(json.dumps([tool, *args]) + "\n")
     if tool == "lsusb":
+        if "FAKE_XFEL_SWAP" in env:
+            Path(env["FAKE_XFEL_SWAP"]).write_text("#!/bin/sh\nexit 97\n")
         if "FAKE_BOOT_SWAP" in env:
             Path(env["FAKE_BOOT_SWAP"]).write_bytes(b"replacement after validation\n")
     else:
@@ -264,6 +266,7 @@ class GateTests(unittest.TestCase):
             path = self.tools / name
             path.write_text(f"#!{sys.executable}\n{FAKE_TOOLS}")
             path.chmod(0o755)
+        self.env["EXPECT_XFEL_SHA256"] = sha(self.tools / "xfel")
 
         self.workspace.mkdir()
         shutil.copy2(SOURCE / "Makefile", self.workspace)
@@ -282,6 +285,8 @@ class GateTests(unittest.TestCase):
             scripts / "lib",
             ignore=shutil.ignore_patterns("__pycache__"),
         )
+        if (SOURCE / "scripts/fel-tools.py").exists():
+            shutil.copy2(SOURCE / "scripts/fel-tools.py", scripts)
         mkimage = scripts / "mkimage.py"
         text = mkimage.read_text()
         marker = "    disk, entries = build_firmware("
@@ -296,7 +301,15 @@ class GateTests(unittest.TestCase):
         )
         (self.fedora / "fedora/dts/fixture.dtb").write_bytes(DTB)
         self.file("firmware/edk2/edksetup.sh", "# build is on the fixture PATH\n")
-        self.file("firmware/edk2/.gitignore", "/Build/\n")
+        self.file(
+            "firmware/edk2/.gitignore", "/Build/\n/BaseTools/Source/C/bin/\n/Conf/\n"
+        )
+        for name in ("target.txt", "tools_def.txt", "build_rule.txt"):
+            self.file("firmware/edk2/Conf/" + name, f"# fixture {name}\n")
+        self.file(
+            "firmware/edk2/BaseTools/Source/C/Makefile",
+            'all:\n\tmkdir -p bin\n\tprintf "fixture binary" >bin/GenFv\n\tchmod 755 bin/GenFv\n',
+        )
         self.file("firmware/edk2/MdePkg/Library/BaseFdtLib/libfdt/libfdt/fdt.h", "")
         self.file("firmware/edk2/BaseTools/Source/C/bin/GenFv", "").chmod(0o755)
         self.file("firmware/edk2-platforms/Platform/Radxa/CubieA7APkg/CubieA7A.dsc", "")
@@ -652,6 +665,7 @@ class GateTests(unittest.TestCase):
                 record = read_json(self.record(bt0))
                 manifest = read_json(slot / "build-manifest.json")
                 actual = json.loads(self.edk2_log.read_text().splitlines()[-1])
+                self.assertEqual(actual.pop(), f"--conf={self.edk2}/Conf")
                 start = actual.index("-D", actual.index("-n")) + 4
                 effective = ["-D", "USB_ENABLE=FALSE", "-D", "OTHER=with spaces"]
                 self.assertEqual(record.get("edk2_args"), effective)
@@ -892,6 +906,92 @@ class GateTests(unittest.TestCase):
             stream[evidence["decoded_dtb_offset"] :][: evidence["dtb_size"]], DTB
         )
         self.assertEqual(evidence["sha256"], record["dtb_sha256"])
+
+    def test_xfel_override_needs_digest(self):
+        self.build()
+        with (self.tools / "xfel").open("a") as f:
+            f.write("\n# different xfel\n")
+        for expectation in ("", self.env["EXPECT_XFEL_SHA256"]):
+            with self.subTest(expectation=expectation):
+                self.refusal(self.boots(EXPECT_XFEL_SHA256=expectation))
+
+    def test_xfel_runs_only_staged_copy(self):
+        bundle = self.build()
+        self.assert_bundle_writes(
+            self.boots(FAKE_XFEL_SWAP=str(self.tools / "xfel")), bundle
+        )
+
+    def test_default_xfel_needs_build_record(self):
+        bundle = self.build()
+        default = self.workspace / "out/tools/xfel"
+        default.parent.mkdir()
+        shutil.copy2(self.tools / "xfel", default)
+        self.refusal(self.make("fel-boot"))
+        commit = "445e8aefe6914c85817cc9bd1d201629364b0ec6"
+        patched = self.tools / "fel.c"
+        patched.write_text("// patched fixture source\n")
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                self.workspace / "scripts/fel-tools.py",
+                "record-xfel",
+                self.tools,
+                commit,
+            ],
+            check=True,
+        )
+        self.assertEqual(
+            read_json(default.with_suffix(".record.json")),
+            {
+                "binary_sha256": sha(default),
+                "source_commit": commit,
+                "patched_fel_c_sha256": sha(patched),
+            },
+        )
+        self.assert_bundle_writes(self.make("fel-boot"), bundle)
+        with default.open("a") as f:
+            f.write("\n# other binary\n")
+        self.usb_log.write_text("")
+        self.refusal(self.make("fel-boot"))
+
+    def test_basetools_changed_binary(self):
+        self.build()
+        binary = self.edk2 / "BaseTools/Source/C/bin/GenFv"
+        binary.write_bytes(b"changed since stamp")
+        self.edk2_log.write_text("")
+        self.refusal(self.make("fel-image"), "BaseTools stamp mismatch")
+        self.assertEqual(self.edk2_log.read_text(), "")
+
+    def test_basetools_wrong_head(self):
+        self.build()
+        stamp = self.workspace / "out/edk2-basetools.stamp.json"
+        data = read_json(stamp) if stamp.exists() else {}
+        write_json(stamp, dict(data, edk2_head="0" * 40))
+        self.edk2_log.write_text("")
+        self.refusal(self.make("fel-image"), "BaseTools stamp mismatch")
+        self.assertEqual(self.edk2_log.read_text(), "")
+
+    def test_edk2_tool_and_conf_receipt(self):
+        bundle = self.build()
+        record = read_json(self.record(sha(bundle / "bt0-fel.bin")))
+        stamp = self.workspace / "out/edk2-basetools.stamp.json"
+        self.assertIn("basetools_stamp_sha256", record)
+        self.assertEqual(record["basetools_stamp_sha256"], sha(stamp))
+        self.assertEqual(
+            read_json(stamp),
+            {
+                "edk2_head": git(self.edk2, "rev-parse", "HEAD"),
+                "binaries": {"GenFv": sha(self.edk2 / "BaseTools/Source/C/bin/GenFv")},
+            },
+        )
+        self.assertEqual(
+            record["conf_sha256"],
+            {
+                name: sha(self.edk2 / "Conf" / name)
+                for name in ("target.txt", "tools_def.txt", "build_rule.txt")
+            },
+        )
 
     def test_source_edit_during_compile_refused_without_publication(self):
         proc = self.make(

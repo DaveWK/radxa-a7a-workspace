@@ -268,7 +268,7 @@ $(XFEL):
 fel-boot: $(XFEL)
 	$(fel-profile-check)
 	@test -f $(FEL_OUT)/bt0-fel.bin || { echo "run make fel-image first (in the container)" >&2; exit 1; }
-	XFEL=$(XFEL) EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh $(FEL_OUT)
+	$(if $(filter-out file,$(origin XFEL)),XFEL=$(call shell-quote,$(XFEL))) EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh $(FEL_OUT)
 
 rpms: check-sources
 	FWREPO=$(FWREPO) FEDORA_RELEASE=$(FEDORA_RELEASE) $(if $(AIC8800_SRC),AIC8800_SRC=$(abspath $(AIC8800_SRC))) \
@@ -299,7 +299,7 @@ serial:
 test: check-sources
 	cd $(BOARD)/dram && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	cd $(BOARD)/common && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
-	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/fel-check.py scripts/test-fel-manifest.py
+	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/fel-check.py scripts/fel-tools.py scripts/test-fel-manifest.py
 	python3 -I scripts/test-fel-manifest.py
 	bash -n scripts/fel-boot.sh scripts/build-edk2.sh scripts/serial-log.sh scripts/fetch-vendor.sh scripts/build-xfel.sh scripts/binfmt-aarch64.sh
 	shellcheck scripts/*.sh

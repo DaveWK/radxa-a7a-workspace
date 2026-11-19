@@ -24,7 +24,8 @@
 # hand-over to main nothing answers any more.
 #
 # Environment:
-#   XFEL   xfel binary (default: xfel). Upstream xfel waits 10 s for a FEL
+#   XFEL   optional xfel override; requires EXPECT_XFEL_SHA256. The default
+#          uses out/tools/xfel and its build receipt. Upstream waits 10 s for a FEL
 #          call to return; entry 1 takes ~7 s, so use a build with a 60 s USB
 #          timeout: scripts/build-xfel.sh (out/tools/xfel, what make fel-boot
 #          uses).
@@ -53,7 +54,12 @@ MAILBOX=0xdf000
 TABLE=0xdf200
 
 SCRIPTS=$(cd "$(dirname "$0")" && pwd)
-XFEL=${XFEL:-xfel}
+xfel_flags=()
+if [[ -v XFEL ]]; then
+    xfel_flags+=(--override)
+else
+    XFEL=$SCRIPTS/../out/tools/xfel
+fi
 SUDO=${SUDO-sudo}
 sudo_prefix=()
 if [[ -n $SUDO ]]; then
@@ -74,12 +80,14 @@ for f in bt0-fel.bin firmware.bin firmware.seek build-manifest.json; do
     [ -f "$IMAGE/$f" ] || die "$IMAGE/$f missing (make fel-image)"
 done
 command -v python3 >/dev/null || die "python3 not found"
-command -v "$XFEL" >/dev/null || die "xfel not found (XFEL=$XFEL)"
+xfel_source=$(command -v -- "$XFEL") || die "xfel not found (XFEL=$XFEL)"
 
 # Copy the bundle into a private staging directory and validate the copies
 # before any USB access. Nothing reads the original bundle after this.
 STAGE=$(mktemp -d "$(dirname "$IMAGE")/.fel-stage.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
+python3 -I "$SCRIPTS/fel-tools.py" stage-xfel "${xfel_flags[@]}" "$xfel_source" "$STAGE/xfel"
+XFEL=$STAGE/xfel
 cp "$IMAGE/bt0-fel.bin" "$IMAGE/firmware.bin" "$IMAGE/firmware.seek" \
     "$IMAGE/build-manifest.json" "$STAGE/"
 WORK="$STAGE/work"
