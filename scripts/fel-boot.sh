@@ -38,12 +38,15 @@ ENTRY1=0x90040
 ENTRY2=0x90044
 MAILBOX=0xdf000
 TABLE=0xdf200
-TABLE_OFFSET=0x1ff000   # layout table offset on the boot medium
+TABLE_OFFSET=0x1ff000 # layout table offset on the boot medium
 
 XFEL=${XFEL:-xfel}
 SUDO=${SUDO-sudo}
 
-die() { printf 'fel-boot: %s\n' "$*" >&2; exit 1; }
+die() {
+    printf 'fel-boot: %s\n' "$*" >&2
+    exit 1
+}
 step() { printf '\n==> %s\n' "$*"; }
 # SUDO may be empty, hence unquoted; stdin closed so xfel/sudo never eat
 # the plan file the loops below read.
@@ -53,40 +56,40 @@ x() { $SUDO "$XFEL" "$@" </dev/null; }
 [ $# -eq 1 ] || die "usage: $0 <image dir with bt0-fel.bin, firmware.bin, firmware.seek>"
 IMAGE=$(cd "$1" && pwd)
 for f in bt0-fel.bin firmware.bin firmware.seek; do
-	[ -f "$IMAGE/$f" ] || die "$IMAGE/$f missing (make fel-image)"
+    [ -f "$IMAGE/$f" ] || die "$IMAGE/$f missing (make fel-image)"
 done
 command -v python3 >/dev/null || die "python3 not found"
 command -v "$XFEL" >/dev/null || die "xfel not found (XFEL=$XFEL)"
 
 WORK=$(mktemp -d "$IMAGE/.fel-boot.XXXXXX")
 cleanup() {
-	find "$WORK" -maxdepth 1 -type f -delete 2>/dev/null || true
-	rmdir "$WORK" 2>/dev/null || true
+    find "$WORK" -maxdepth 1 -type f -delete 2>/dev/null || true
+    rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # put <file> <address> <label>: write, read back, compare.
 put() {
-	local file=$1 addr=$2 label=$3 size want got
-	size=$(stat -c %s "$file")
-	printf '  %-24s %8d bytes -> %s\n' "$label" "$size" "$addr"
-	x write "$addr" "$file" >/dev/null
-	x read "$addr" "$size" "$WORK/readback" >/dev/null
-	want=$(sha256sum <"$file" | cut -d' ' -f1)
-	got=$(sha256sum <"$WORK/readback" | cut -d' ' -f1)
-	[ "$want" = "$got" ] || die "$label: read-back mismatch at $addr (sha256 $got, want $want)"
-	printf '  %-24s verified, sha256 %s\n' "" "$want"
+    local file=$1 addr=$2 label=$3 size want got
+    size=$(stat -c %s "$file")
+    printf '  %-24s %8d bytes -> %s\n' "$label" "$size" "$addr"
+    x write "$addr" "$file" >/dev/null
+    x read "$addr" "$size" "$WORK/readback" >/dev/null
+    want=$(sha256sum <"$file" | cut -d' ' -f1)
+    got=$(sha256sum <"$WORK/readback" | cut -d' ' -f1)
+    [ "$want" = "$got" ] || die "$label: read-back mismatch at $addr (sha256 $got, want $want)"
+    printf '  %-24s verified, sha256 %s\n' "" "$want"
 }
 
 # mailbox [seconds]: prints "magic state dram_mb dram_mhz rom_sctlr
 # rom_cpsr rom_vbar", or "none" if FEL does not answer within the time.
 mailbox() {
-	# shellcheck disable=SC2086
-	if timeout "${1:-30}" $SUDO "$XFEL" read "$MAILBOX" 28 "$WORK/mailbox" </dev/null >/dev/null 2>&1; then
-		od -An -v -tx4 -w28 "$WORK/mailbox" | tr -s ' ' | sed 's/^ //'
-	else
-		echo none
-	fi
+    # shellcheck disable=SC2086
+    if timeout "${1:-30}" $SUDO "$XFEL" read "$MAILBOX" 28 "$WORK/mailbox" </dev/null >/dev/null 2>&1; then
+        od -An -v -tx4 -w28 "$WORK/mailbox" | tr -s ' ' | sed 's/^ //'
+    else
+        echo none
+    fi
 }
 
 step "FEL device"
@@ -127,7 +130,7 @@ for i in range(count):
     print(f"{kind} {load:#x} {n} {path} {names[kind]}")
 PY
 while read -r kind addr size path name; do
-	printf '  kind %s %-20s %8d bytes -> %s\n' "$kind" "$name" "$size" "$addr"
+    printf '  kind %s %-20s %8d bytes -> %s\n' "$kind" "$name" "$size" "$addr"
 done <"$WORK/plan"
 grep -q '^1 ' "$WORK/plan" || die "no oreboot main in the layout table"
 grep -q '^2 ' "$WORK/plan" || die "no payload in the layout table"
@@ -144,23 +147,23 @@ t0=$(date +%s)
 x exec "$ENTRY1" || die "xfel exec $ENTRY1 failed (see the serial console)"
 # Each read waits while entry 1 runs; poll until it reports DRAM up.
 while :; do
-	mb=$(mailbox 60)
-	[ "$mb" != none ] || die "FEL stopped answering during entry 1 (see the serial console)"
-	read -r magic state dram_mb dram_mhz sctlr cpsr vbar <<<"$mb"
-	[ "$state" = 00000011 ] && break
-	[ "$state" = 00000000 ] || [ "$state" = 00000010 ] ||
-		die "mailbox state 0x$state after entry 1 (magic $magic)"
-	[ $(($(date +%s) - t0)) -lt 60 ] || die "entry 1 did not finish within 60 s (state 0x$state)"
-	sleep 0.5
+    mb=$(mailbox 60)
+    [ "$mb" != none ] || die "FEL stopped answering during entry 1 (see the serial console)"
+    read -r magic state dram_mb dram_mhz sctlr cpsr vbar <<<"$mb"
+    [ "$state" = 00000011 ] && break
+    [ "$state" = 00000000 ] || [ "$state" = 00000010 ] ||
+        die "mailbox state 0x$state after entry 1 (magic $magic)"
+    [ $(($(date +%s) - t0)) -lt 60 ] || die "entry 1 did not finish within 60 s (state 0x$state)"
+    sleep 0.5
 done
 [ "$magic" = 46413741 ] || die "mailbox magic $magic: bt0 entry 1 did not run"
 printf '  back in FEL after %d s: DRAM %d MiB at %d MHz; mask ROM SCTLR 0x%s CPSR 0x%s VBAR 0x%s\n' \
-	$(($(date +%s) - t0)) $((16#$dram_mb)) $((16#$dram_mhz)) "$sctlr" "$cpsr" "$vbar"
+    $(($(date +%s) - t0)) $((16#$dram_mb)) $((16#$dram_mhz)) "$sctlr" "$cpsr" "$vbar"
 
 step "Images to DRAM"
 put "$WORK/table.bin" "$TABLE" "layout table frame"
 while read -r kind addr size path name; do
-	put "$path" "$addr" "$name"
+    put "$path" "$addr" "$name"
 done <"$WORK/plan"
 
 step "Entry 2 ($ENTRY2): check the images, warm reset into oreboot main"
@@ -169,14 +172,17 @@ rc=0
 timeout 15 $SUDO "$XFEL" exec "$ENTRY2" </dev/null || rc=$?
 state=none
 if [ "$rc" -eq 0 ]; then
-	# exec answered; whether entry 2 has started yet is the mailbox's to say.
-	for _ in $(seq 20); do
-		mb=$(mailbox 5)
-		[ "$mb" != none ] || { state=none; break; }
-		read -r _ state _ <<<"$mb"
-		[ "$state" = 00000011 ] || break
-		sleep 0.5
-	done
+    # exec answered; whether entry 2 has started yet is the mailbox's to say.
+    for _ in $(seq 20); do
+        mb=$(mailbox 5)
+        [ "$mb" != none ] || {
+            state=none
+            break
+        }
+        read -r _ state _ <<<"$mb"
+        [ "$state" = 00000011 ] || break
+        sleep 0.5
+    done
 fi
 case $state in
 000000e0) die "bt0 refused the hand-over (state 0xe0: entry 1 has not run in this FEL session); still in FEL" ;;

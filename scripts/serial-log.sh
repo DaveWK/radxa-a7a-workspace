@@ -34,13 +34,13 @@ read_running() {
     run_pid="$pid"
     while IFS= read -r -d '' arg; do
         case "$prev" in
-            -b|--baud) run_baud="$arg" ;;
-            --logfile|-g) run_log="$arg" ;;
+        -b | --baud) run_baud="$arg" ;;
+        --logfile | -g) run_log="$arg" ;;
         esac
         case "$arg" in
-            --baud=*) run_baud="${arg#--baud=}" ;;
-            --logfile=*) run_log="${arg#--logfile=}" ;;
-            /dev/*) run_dev="$arg" ;;
+        --baud=*) run_baud="${arg#--baud=}" ;;
+        --logfile=*) run_log="${arg#--logfile=}" ;;
+        /dev/*) run_dev="$arg" ;;
         esac
         prev="$arg"
     done <"/proc/$pid/cmdline"
@@ -62,17 +62,29 @@ show_running() {
 
 case "${1:-}" in
 attach)
-    [ -n "$(session_pid)" ] || { echo "no $session session running; start one with: scripts/serial-log.sh <label>" >&2; exit 1; }
+    [ -n "$(session_pid)" ] || {
+        echo "no $session session running; start one with: scripts/serial-log.sh <label>" >&2
+        exit 1
+    }
     exec screen -x "$session"
     ;;
 reconcile)
     want_dev="${2:-$default_dev}"
     spid="$(session_pid)"
-    [ -n "$spid" ] || { echo "no $session session running" >&2; exit 1; }
+    [ -n "$spid" ] || {
+        echo "no $session session running" >&2
+        exit 1
+    }
     show_running "$spid" || exit 1
     rc=0
-    [ "$run_dev" = "$want_dev" ] || { echo "  MISMATCH device: running $run_dev, expected $want_dev"; rc=2; }
-    [ "$run_baud" = "$baud" ] || { echo "  MISMATCH baud: running $run_baud, expected $baud"; rc=2; }
+    [ "$run_dev" = "$want_dev" ] || {
+        echo "  MISMATCH device: running $run_dev, expected $want_dev"
+        rc=2
+    }
+    [ "$run_baud" = "$baud" ] || {
+        echo "  MISMATCH baud: running $run_baud, expected $baud"
+        rc=2
+    }
     [ "$rc" -eq 0 ] && echo "  matches: $want_dev at $baud"
     echo "$hint"
     exit "$rc"

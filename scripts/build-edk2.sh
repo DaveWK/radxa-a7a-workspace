@@ -21,16 +21,19 @@ EDK2=$(cd "${EDK2_DIR:-$TOP/firmware/edk2}" && pwd)
 PLAT=$(cd "${EDK2_PLATFORMS_DIR:-$TOP/firmware/edk2-platforms}" && pwd)
 TAG=${BUILD_TAG:+-$BUILD_TAG}
 JOBS=${BUILD_JOBS:-2}
-[[ $JOBS =~ ^[1-9][0-9]*$ ]] || { echo "invalid BUILD_JOBS" >&2; exit 2; }
+[[ $JOBS =~ ^[1-9][0-9]*$ ]] || {
+    echo "invalid BUILD_JOBS" >&2
+    exit 2
+}
 OUT=${EDK2_OUT:-$TOP/out/edk2$TAG}
 TARGET=${1:-DEBUG}
 [[ $# -gt 0 ]] && shift
 case $TARGET in
 DEBUG | RELEASE) ;;
 *)
-  echo "usage: $0 [DEBUG|RELEASE] [extra build args...]" >&2
-  exit 2
-  ;;
+    echo "usage: $0 [DEBUG|RELEASE] [extra build args...]" >&2
+    exit 2
+    ;;
 esac
 
 FD_BASE=0x41000000
@@ -39,13 +42,13 @@ FV_SIZE=0x280000
 FD_SIZE=$((4 * 1024 * 1024))
 
 die() {
-  echo "build-edk2: $*" >&2
-  exit 1
+    echo "build-edk2: $*" >&2
+    exit 1
 }
 
 [[ -f $EDK2/edksetup.sh ]] || die "no EDK2 tree at $EDK2 (git submodule update --init --recursive)"
 [[ -f $EDK2/MdePkg/Library/BaseFdtLib/libfdt/libfdt/fdt.h ]] ||
-  die "EDK2 submodules missing: git -C $EDK2 submodule update --init --recursive --depth 1"
+    die "EDK2 submodules missing: git -C $EDK2 submodule update --init --recursive --depth 1"
 command -v aarch64-linux-gnu-gcc >/dev/null || die "aarch64-linux-gnu-gcc not found"
 
 [[ -f $PLAT/Platform/Radxa/CubieA7APkg/CubieA7A.dsc ]] || die "no CubieA7APkg in $PLAT"
@@ -65,7 +68,7 @@ ln -sfn "$COMMON/DesignWarePkg" "$PKGS/common/DesignWarePkg"
 
 # edksetup.sh only exports variables; the C tools have to be compiled once.
 if [[ ! -x $EDK2/BaseTools/Source/C/bin/GenFv ]]; then
-  make -C "$EDK2/BaseTools" -j"$JOBS"
+    make -C "$EDK2/BaseTools" -j"$JOBS"
 fi
 
 FW_VERSION=$(git -C "$PLAT" describe --always --dirty 2>/dev/null || true)
@@ -78,18 +81,18 @@ rm -f "$FD"
 # failing 'build' slip past 'set -e'. Run it in a subshell and check the
 # status explicitly.
 (
-  set +u
-  cd "$EDK2"
-  export GCC_AARCH64_PREFIX=aarch64-linux-gnu-
-  # Conf/BuildEnv.sh caches absolute paths of the host that last ran
-  # edksetup.sh (another checkout path or the build container).
-  rm -f Conf/BuildEnv.sh
-  export EDK_TOOLS_PATH=$EDK2/BaseTools
-  export PACKAGES_PATH="$EDK2:$PKGS/common:$PKGS/board"
-  # shellcheck disable=SC1091
-  . ./edksetup.sh BaseTools >/dev/null
-  build -p Platform/Radxa/CubieA7APkg/CubieA7A.dsc -a AARCH64 -t GCC -b "$TARGET" \
-    -n "$JOBS" -D "FW_VERSION=$FW_VERSION" -D "BUILD_TAG=$TAG" "$@"
+    set +u
+    cd "$EDK2"
+    export GCC_AARCH64_PREFIX=aarch64-linux-gnu-
+    # Conf/BuildEnv.sh caches absolute paths of the host that last ran
+    # edksetup.sh (another checkout path or the build container).
+    rm -f Conf/BuildEnv.sh
+    export EDK_TOOLS_PATH=$EDK2/BaseTools
+    export PACKAGES_PATH="$EDK2:$PKGS/common:$PKGS/board"
+    # shellcheck disable=SC1091
+    . ./edksetup.sh BaseTools >/dev/null
+    build -p Platform/Radxa/CubieA7APkg/CubieA7A.dsc -a AARCH64 -t GCC -b "$TARGET" \
+        -n "$JOBS" -D "FW_VERSION=$FW_VERSION" -D "BUILD_TAG=$TAG" "$@"
 ) || die "EDK2 build failed"
 
 [[ -f $FD ]] || die "build reported success but $FD was not produced"
@@ -127,7 +130,7 @@ EOF
 # empty store, and with SD_VARSTORE_ENABLE the variable and FTW drivers must
 # wait for SdVarStoreFvbDxe (a blank region was an ASSERT on every boot).
 python3 -I "$TOP/scripts/check-nvstore.py" "$FD" "$(dirname "$FD")/FVMAIN.Fv" >/dev/null ||
-  die "NV variable store check failed (python3 scripts/check-nvstore.py $FD $(dirname "$FD")/FVMAIN.Fv)"
+    die "NV variable store check failed (python3 scripts/check-nvstore.py $FD $(dirname "$FD")/FVMAIN.Fv)"
 
 mkdir -p "$OUT"
 cp "$FD" "$OUT/CUBIEA7A_EFI.fd"
