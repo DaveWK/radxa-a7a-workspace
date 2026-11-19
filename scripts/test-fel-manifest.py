@@ -133,6 +133,12 @@ elif tool == "build":
         return hdr + payload
 
     def fv(files, size=None, boot=False):
+        ext = 0
+        if case == ("boot-ext-header" if boot else "inner-ext-header"):
+            # An FV name and a 20-byte extension header in a leading PAD file.
+            ext = 72 + 24
+            pad = file(str(UUID(int=0)), 0xf0, UUID(int=1).bytes_le + struct.pack("<I",20))
+            files = [pad, *files]
         content = bytearray()
         for item in files:
             content += item
@@ -147,7 +153,7 @@ elif tool == "build":
             hdr[16:32] = UUID("5473c07a-3dcb-4dca-bd6f-1e9689e7349a").bytes_le
         attrs = 0x800 if not boot and case == "no-read-status" else 0x804
         struct.pack_into("<Q4sIHHHBBIIII", hdr, 32, size, b"_FVH", attrs,
-                         72, 0, 0, 0, 2, size, 1, 0, 0)
+                         72, 0, ext, 0, 2, size, 1, 0, 0)
         if not boot and case == "one-short-block":
             struct.pack_into("<II", hdr, 56, 1, 32)
         elif boot and case == "short-map":
@@ -1031,6 +1037,15 @@ class GateTests(unittest.TestCase):
         ):
             with self.subTest(case=case):
                 self.refusal(self.make("fel-image", FAKE_EMBED=case), reason)
+                self.assertFalse((self.workspace / "out/fel/.records").exists())
+
+    def test_fv_extension_headers(self):
+        for case in ("boot-ext-header", "inner-ext-header"):
+            with self.subTest(case=case):
+                self.refusal(
+                    self.make("fel-image", FAKE_EMBED=case),
+                    "unsupported FV extension header",
+                )
                 self.assertFalse((self.workspace / "out/fel/.records").exists())
 
     def test_loader_refusals(self):

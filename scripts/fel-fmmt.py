@@ -43,6 +43,16 @@ def section_rule(node, fs):
         )
 
 
+def check_scan_start(data):
+    # EFI_FIRMWARE_VOLUME_HEADER.ExtHeaderOffset in PiFirmwareVolume.h.
+    require(len(data) >= 56, "truncated FV header")
+    require(
+        struct.unpack_from("<H", data, 52)[0] == 0,
+        "unsupported FV extension header: PrePiLib/FwVol.c:186-202 and "
+        "DXE FwVol.c:427-437 start scanning after the aligned extension",
+    )
+
+
 def files(volume, data, boot=False):
     fs = data[16:32]
     require(
@@ -129,6 +139,8 @@ def inspect(package, digest):
     with package.open("rb") as source:
         source.seek(fd_offset)
         fd = source.read(0x400000)
+    compact = fd[BOOT : BOOT + SIZE]
+    check_scan_start(compact)
     root = BIOSTREE("packaged.fd")
     root.type = "ROOT"
     parse(root, fd, 0)
@@ -141,7 +153,6 @@ def inspect(package, digest):
         "FVMAIN_COMPACT",
     )
     parse(boot, b"", 0)
-    compact = fd[BOOT : BOOT + SIZE]
     outer = list(files(boot, compact, boot=True))
     require(not any(n.Data.Name == BOARD for n in outer), "board file in outer FV")
     require(
@@ -174,9 +185,10 @@ def inspect(package, digest):
     for n in guided.Child:
         section_rule(n, compact[16:32])
     require(image.Data.Type == 0x17, "expected FV_IMAGE section")
+    main = image.Data.Data
+    check_scan_start(main)
     parse(image, b"", 0)
     inner = one(image.Child, "nested FV")
-    main = image.Data.Data
     # FwVolRead.c:134-144,299-312: lookup enumerates a readable FV.
     require(inner.Data.Header.Attributes & 4, "inner FV read status clear")
     parse(inner, b"", 0)
