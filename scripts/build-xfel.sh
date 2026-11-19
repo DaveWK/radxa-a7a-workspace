@@ -4,7 +4,7 @@
 # Build xfel (https://github.com/xboot/xfel, MIT) from source into
 # out/tools/xfel, with the USB bulk-transfer timeout raised from 10 s to 60 s:
 # bt0's FEL entry 1 (clocks, PMIC, DRAM training) keeps the mask ROM busy for
-# about 7 s, longer with DRAM tracing. Needs gcc, make, pkgconf and
+# about 7 s, longer with DRAM tracing. Needs cc, make, pkgconf and
 # libusb1-devel. No xfel binary is part of this repository.
 #
 # On the host that runs scripts/fel-boot.sh, either run xfel as root (the
@@ -31,11 +31,18 @@ git clone -q --no-local --no-checkout "$SRC" "$BUILD"
 SRC=$BUILD
 git -C "$SRC" checkout -q --detach "$XFEL_COMMIT"
 git -C "$SRC" apply --unidiff-zero "$TOP/scripts/xfel-port-select.patch"
-grep -c '&bytes, 10000);' "$SRC/fel.c" | grep -qx 2 || {
-    echo "build-xfel: fel.c does not have the two 10 s bulk transfers this script patches" >&2
+grep -c '&bytes, 10000);' "$SRC/fel.c" | grep -qx 3 || {
+    echo "build-xfel: fel.c does not have the expected 10 s bulk transfers" >&2
     exit 1
 }
 sed -i 's/&bytes, 10000);/\&bytes, 60000);/' "$SRC/fel.c"
-make -C "$SRC" -s "CFLAGS=-g -Wall -O3 -ffile-prefix-map=$SRC=/xfel"
-python3 -I "$TOP/scripts/fel-tools.py" record-xfel "$SRC" "$XFEL_COMMIT"
+cc=$(command -v cc)
+builder=$(command -v make)
+pkg_config=$(command -v pkg-config)
+clean=(env -i "PATH=$PATH" LC_ALL=C "TMPDIR=${TMPDIR:-$BUILD}")
+includes=$("${clean[@]}" "$pkg_config" --cflags libusb-1.0)
+libs=$("${clean[@]}" "$pkg_config" --libs libusb-1.0)
+"${clean[@]}" "$builder" -C "$SRC" -s "CC=$cc" "AS=$cc -x assembler-with-cpp" \
+    "CFLAGS=-g -Wall -O3 -ffile-prefix-map=$SRC=/xfel" "INCDIRS=-I . $includes" "LIBS=$libs"
+"${clean[@]}" python3 -I "$TOP/scripts/fel-tools.py" record-xfel "$SRC" "$XFEL_COMMIT" "$cc" "$builder" "$pkg_config"
 echo "build-xfel: $TOP/out/tools/xfel (xfel $XFEL_TAG, port selector, 60 s USB timeout)"

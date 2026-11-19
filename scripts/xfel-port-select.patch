@@ -1,14 +1,105 @@
+diff --git a/fel.c b/fel.c
+index f4bfd5b..c8f1ff9 100644
+--- a/fel.c
++++ b/fel.c
+@@ -100,0 +101,14 @@ struct fel_request_t {
++static void check_usb_transfer(int status, int bytes, size_t expected)
++{
++	if(status)
++	{
++		fprintf(stderr, "xfel: USB bulk transfer failed (%d)\n", status);
++		exit(status == LIBUSB_ERROR_NO_DEVICE ? 66 : 74);
++	}
++	if(bytes <= 0 || (size_t)bytes > expected)
++	{
++		fprintf(stderr, "xfel: invalid USB bulk transfer length\n");
++		exit(65);
++	}
++}
++
+@@ -105 +119 @@ static inline void usb_bulk_send(libusb_device_handle * hdl, int ep, const char
+-	int r, bytes;
++	int r, bytes = 0;
+@@ -111,5 +125 @@ static inline void usb_bulk_send(libusb_device_handle * hdl, int ep, const char
+-		if(r != 0)
+-		{
+-			printf("usb bulk send error\r\n");
+-			exit(-1);
+-		}
++		check_usb_transfer(r, bytes, chunk);
+@@ -123 +133 @@ static inline void usb_bulk_recv(libusb_device_handle * hdl, int ep, char * buf,
+-	int r, bytes;
++	int r, bytes = 0;
+@@ -128,5 +138 @@ static inline void usb_bulk_recv(libusb_device_handle * hdl, int ep, char * buf,
+-		if(r != 0)
+-		{
+-			printf("usb bulk recv error\r\n");
+-			exit(-1);
+-		}
++		check_usb_transfer(r, bytes, len);
+@@ -155 +161,5 @@ static inline void read_usb_response(struct xfel_ctx_t * ctx)
+-	assert(strcmp(buf, "AWUS") == 0);
++	if(memcmp(buf, "AWUS", 5))
++	{
++		fprintf(stderr, "xfel: malformed USB response\n");
++		exit(65);
++	}
+@@ -184,2 +194,18 @@ static inline void read_fel_status(struct xfel_ctx_t * ctx)
+-	char buf[8];
+-	usb_read(ctx, buf, sizeof(buf));
++	unsigned char buf[8];
++	int bytes = 0;
++	send_usb_request(ctx, 0x11, sizeof(buf));
++	/* A short status is malformed, not the start of a second status packet. */
++	int r = libusb_bulk_transfer(ctx->hdl, ctx->epin, buf, sizeof(buf), &bytes, 10000);
++	check_usb_transfer(r, bytes, sizeof(buf));
++	if(bytes != sizeof(buf) || buf[0] != 0xff || buf[1] != 0xff)
++	{
++		fprintf(stderr, "xfel: malformed FEL status\n");
++		exit(65);
++	}
++	read_usb_response(ctx);
++	if(buf[4])
++	{
++		fprintf(stderr, "xfel: FEL rejected subcommand 0x%04x (status 0x%02x)\n",
++			(unsigned)buf[2] | ((unsigned)buf[3] << 8), (unsigned)buf[4]);
++		exit(76);
++	}
+@@ -198,0 +225,2 @@ static inline int fel_version(struct xfel_ctx_t * ctx)
++	if(memcmp(ctx->version.magic, "AWUSBFEX", 8) || ctx->version.id != 0x00190300)
++		return 0;
+@@ -219,4 +247,9 @@ int fel_init(struct xfel_ctx_t * ctx)
+-		if(libusb_kernel_driver_active(ctx->hdl, 0))
+-			libusb_detach_kernel_driver(ctx->hdl, 0);
+-
+-		if(libusb_claim_interface(ctx->hdl, 0) == 0)
++		int status = libusb_kernel_driver_active(ctx->hdl, 0);
++		if(status == 1)
++			status = libusb_detach_kernel_driver(ctx->hdl, 0);
++		if(status == LIBUSB_ERROR_NO_DEVICE)
++			exit(66);
++		status = libusb_claim_interface(ctx->hdl, 0);
++		if(status == LIBUSB_ERROR_NO_DEVICE)
++			exit(66);
++		if(status == 0)
+@@ -224 +257,4 @@ int fel_init(struct xfel_ctx_t * ctx)
+-			if(libusb_get_active_config_descriptor(libusb_get_device(ctx->hdl), &config) == 0)
++			status = libusb_get_active_config_descriptor(libusb_get_device(ctx->hdl), &config);
++			if(status == LIBUSB_ERROR_NO_DEVICE)
++				exit(66);
++			if(status == 0)
 diff --git a/linux-fel-port.h b/linux-fel-port.h
 new file mode 100644
-index 0000000..2a4dde8
+index 0000000..42eaa87
 --- /dev/null
 +++ b/linux-fel-port.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,137 @@
 +/* SPDX-License-Identifier: MIT */
 +/* Linux only: select in sysfs, then attest and wrap the SAME open usbfs fd.
 + * Never ask libusb to rediscover a device by its recyclable address. */
 +#include <fcntl.h>
-+#include <glob.h>
++#include <sys/stat.h>
++#include <errno.h>
 +#include <limits.h>
 +#include <linux/usbdevice_fs.h>
 +#include <stddef.h>
@@ -43,59 +134,79 @@ index 0000000..2a4dde8
 +	return 1;
 +}
 +
-+static int discover(const char *port, unsigned expected, struct fel_identity *found)
++static int valid_port(const char *port)
 +{
-+	glob_t paths = {0};
-+	int matches = 0;
-+	if(glob("/sys/bus/usb/devices/[0-9]*-*", GLOB_ERR, NULL, &paths) != 0)
-+		goto done;
-+	for(size_t i = 0; i < paths.gl_pathc; ++i)
++	char component[4];
++	unsigned value;
++	const char *next = strchr(port, '-');
++	if(!next)
++		return 0;
++	for(unsigned i = 0; ; ++i)
 +	{
-+		const char *dir = paths.gl_pathv[i], *name = strrchr(dir, '/') + 1;
-+		if(strchr(name, ':')) /* USB interface, not a device. */
-+			continue;
-+		char bus[40], chain[40], address[40], vid[40], pid[40];
-+		struct fel_identity id = {0};
-+		if(!attribute(dir, "busnum", bus) || !number(bus, &id.bus, 255) ||
-+		   !attribute(dir, "devpath", chain) ||
-+		   snprintf(id.path, sizeof(id.path), "%u-%s", id.bus, chain) >= (int)sizeof(id.path) ||
-+		   strcmp(name, id.path))
-+			goto refuse;
-+		if(port && strcmp(port, id.path))
-+			continue;
-+		if(!attribute(dir, "idVendor", vid) || !attribute(dir, "idProduct", pid))
-+			goto refuse;
-+		if(strcmp(vid, "1f3a") || strcmp(pid, "efe8"))
-+		{
-+			if(port)
-+				goto refuse;
-+			continue;
-+		}
-+		if(!attribute(dir, "devnum", address) || !number(address, &id.address, 127) ||
-+		   (expected && expected != id.address))
-+			goto refuse;
-+		*found = id;
-+		++matches;
++		size_t len = next ? (size_t)(next - port) : strlen(port);
++		if(!len || len >= sizeof(component) || *port == '0' || i > 7)
++			return 0;
++		memcpy(component, port, len);
++		component[len] = '\0';
++		if(!number(component, &value, 255))
++			return 0;
++		if(!next)
++			return 1;
++		port = next + 1;
++		next = strchr(port, '.');
 +	}
-+done:
-+	globfree(&paths);
-+	return matches == 1;
-+refuse:
-+	globfree(&paths);
++}
++
++/* Only inspect the requested connector; peer activity is not admission input. */
++static int discover(const char *port, unsigned expected, struct fel_identity *id)
++{
++	char dir[PATH_MAX], bus[40], chain[40], address[40], vid[40], pid[40];
++	struct stat st;
++	if(!valid_port(port))
++		return 2;
++	if(stat("/sys/bus/usb/devices", &st) < 0 || !S_ISDIR(st.st_mode))
++		return 125;
++	snprintf(dir, sizeof(dir), "/sys/bus/usb/devices/%s", port);
++	if(stat(dir, &st) < 0)
++		return errno == ENOENT || errno == ENODEV ? 66 : 125;
++	if(!attribute(dir, "busnum", bus) || !number(bus, &id->bus, 255) ||
++	   !attribute(dir, "devpath", chain) ||
++	   snprintf(id->path, sizeof(id->path), "%u-%s", id->bus, chain) >= (int)sizeof(id->path) ||
++	   !attribute(dir, "idVendor", vid) || !attribute(dir, "idProduct", pid) ||
++	   !attribute(dir, "devnum", address) || !number(address, &id->address, 127))
++	{
++		if(stat(dir, &st) < 0 && (errno == ENOENT || errno == ENODEV))
++			return 66;
++		return 125;
++	}
++	if(strcmp(port, id->path) || strcmp(vid, "1f3a") || strcmp(pid, "efe8") || id->address != expected)
++		return 125;
 +	return 0;
 +}
 +
-+static int verified_fd(const struct fel_identity *id)
++static int verified_fd(const struct fel_identity *id, int *status)
 +{
 +	char node[40], path[40];
 +	struct usbdevfs_conninfo_ex info = {0};
 +	unsigned char desc[18];
 +	snprintf(node, sizeof(node), "/dev/bus/usb/%03u/%03u", id->bus, id->address);
 +	int fd = open(node, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
++	*status = 125;
 +	if(fd < 0)
++	{
++		if(errno == ENODEV || errno == ESHUTDOWN)
++			*status = 66;
++		else if(errno == ENOENT)
++		{
++			struct fel_identity check;
++			if(discover(id->path, id->address, &check) == 66)
++				*status = 66;
++		}
 +		return -1;
-+	if(ioctl(fd, USBDEVFS_CONNINFO_EX(sizeof(info)), &info) < 0 ||
-+	   info.busnum != id->bus || info.devnum != id->address ||
++	}
++	if(ioctl(fd, USBDEVFS_CONNINFO_EX(sizeof(info)), &info) < 0)
++		goto io_error;
++	if(info.busnum != id->bus || info.devnum != id->address ||
 +	   !info.num_ports || info.num_ports > sizeof(info.ports) ||
 +	   info.size < offsetof(struct usbdevfs_conninfo_ex, ports) + info.num_ports)
 +		goto refuse;
@@ -104,63 +215,125 @@ index 0000000..2a4dde8
 +		used += snprintf(path + used, sizeof(path) - used, "%c%u", i ? '.' : '-', (unsigned)info.ports[i]);
 +	/* usbfs read at offset 0 returns the cached device descriptor, not a
 +	 * control transfer. Supported hosts are little-endian Linux. */
-+	if(strcmp(path, id->path) || pread(fd, desc, sizeof(desc), 0) != sizeof(desc) ||
-+	   desc[0] != sizeof(desc) || desc[1] != LIBUSB_DT_DEVICE ||
++	if(strcmp(path, id->path))
++		goto refuse;
++	ssize_t n = pread(fd, desc, sizeof(desc), 0);
++	if(n < 0)
++		goto io_error;
++	if(n != sizeof(desc) || desc[0] != sizeof(desc) || desc[1] != LIBUSB_DT_DEVICE ||
 +	   desc[8] != 0x3a || desc[9] != 0x1f || desc[10] != 0xe8 || desc[11] != 0xef)
 +		goto refuse;
 +	return fd;
++io_error:
++	if(errno == ENODEV || errno == ESHUTDOWN)
++		*status = 66;
 +refuse:
 +	close(fd);
 +	return -1;
 +}
 diff --git a/main.c b/main.c
-index b23a8c9..2ec5127 100644
+index b23a8c9..d74da34 100644
 --- a/main.c
 +++ b/main.c
-@@ -6,0 +7 @@
+@@ -2,4 +1,0 @@
+-#include <sha256.h>
+-#include <ecdsa256.h>
+-#include <spinor.h>
+-#include <spinand.h>
+@@ -6,0 +3 @@
 +#include "linux-fel-port.h"
-@@ -14,0 +16 @@ static void usage(void)
-+	printf("    xfel [--port PATH --devnum N] COMMAND ...\r\n");
-@@ -61 +63 @@ int main(int argc, char * argv[])
+@@ -10,29 +7,5 @@ static void usage(void)
+-	printf("xfel(v1.4.0) - https://xfel.xboot.org\r\n");
+-	printf("copyright:\r\n");
+-	printf("    Copyright(c) Jianjun Jiang <8192542@qq.com>\r\n");
+-	printf("    Mobile phone: +86-18665388956\r\n");
+-	printf("    QQ: 8192542\r\n");
+-	printf("usage:\r\n");
+-	printf("    xfel version                                        - Show chip version\r\n");
+-	printf("    xfel hexdump <address> <length>                     - Dumps memory region in hex (payload)\r\n");
+-	printf("    xfel dump <address> <length>                        - Binary memory dump to stdout (payload)\r\n");
+-	printf("    xfel read32 <address>                               - Read 32-bits value from device memory (payload)\r\n");
+-	printf("    xfel write32 <address> <value>                      - Write 32-bits value to device memory (payload)\r\n");
+-	printf("    xfel read <address> <length> <file>                 - Read memory to file\r\n");
+-	printf("    xfel write <address> <file>                         - Write file to memory\r\n");
+-	printf("    xfel exec <address>                                 - Call function address\r\n");
+-	printf("    xfel reset                                          - Reset device using watchdog\r\n");
+-	printf("    xfel sid                                            - Show sid information\r\n");
+-	printf("    xfel jtag                                           - Enable jtag debug\r\n");
+-	printf("    xfel ddr [type]                                     - Initial ddr controller with optional type\r\n");
+-	printf("    xfel sign <public-key> <private-key> <file>         - Generate ecdsa256 signature file for sha256 of sid\r\n");
+-	printf("    xfel spinor                                         - Detect spi nor flash\r\n");
+-	printf("    xfel spinor erase <address> <length>                - Erase spi nor flash\r\n");
+-	printf("    xfel spinor read <address> <length> <file>          - Read spi nor flash to file\r\n");
+-	printf("    xfel spinor write <address> <file>                  - Write file to spi nor flash\r\n");
+-	printf("    xfel spinand                                        - Detect spi nand flash\r\n");
+-	printf("    xfel spinand erase <address> <length>               - Erase spi nand flash\r\n");
+-	printf("    xfel spinand read <address> <length> <file>         - Read spi nand flash to file\r\n");
+-	printf("    xfel spinand write <address> <file>                 - Write file to spi nand flash\r\n");
+-	printf("    xfel spinand splwrite <split-size> <address> <file> - Write file to spi nand flash with split support\r\n");
+-	printf("    xfel extra [...]                                    - The extra commands\r\n");
++	puts("xfel(v1.4.0) - https://xfel.xboot.org");
++	puts("Copyright(c) Jianjun Jiang <8192542@qq.com>");
++	puts("    xfel --port PATH --devnum N COMMAND ...");
++	puts("    version | read ADDRESS SIZE FILE | write ADDRESS FILE");
++	puts("    read32 ADDRESS | write32 ADDRESS VALUE | exec ADDRESS");
+@@ -41 +14 @@ static void usage(void)
+-static void fel_chip_read_buf(struct xfel_ctx_t * ctx, uint32_t addr, char * buf, size_t len)
++static int word(const char *text, uint32_t *out)
+@@ -43,12 +16,9 @@ static void fel_chip_read_buf(struct xfel_ctx_t * ctx, uint32_t addr, char * buf
+-	uint32_t start = addr & ~0x3;
+-	uint32_t end = (addr + len + 0x3) & ~0x3;
+-	for(uint32_t p = start; p < end; p += 4)
+-	{
+-		uint32_t val;
+-		if(!fel_chip_read32(ctx, p, &val))
+-			break;
+-		uint32_t s = (p > addr) ? p : addr;
+-		uint32_t e = (p + 4 < addr + len) ? p + 4 : addr + len;
+-		for(uint32_t q = s; q < e; q++)
+-			buf[q - addr] = (val >> ((q - p) * 8)) & 0xff;
+-	}
++	char *end;
++	if(*text < '0' || *text > '9')
++		return 0;
++	errno = 0;
++	unsigned long long n = strtoull(text, &end, 0);
++	if(errno || *end || n > UINT32_MAX)
++		return 0;
++	*out = n;
++	return 1;
+@@ -57 +27 @@ static void fel_chip_read_buf(struct xfel_ctx_t * ctx, uint32_t addr, char * buf
+-int main(int argc, char * argv[])
++int main(int argc, char *argv[])
+@@ -59,3 +29 @@ int main(int argc, char * argv[])
+-	struct xfel_ctx_t ctx = { 0 };
+-
 -	if(argc < 2)
-+	if(argc == 1 || (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))))
-@@ -66 +68,3 @@ int main(int argc, char * argv[])
++	if(argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")))
+@@ -66,8 +34,8 @@ int main(int argc, char * argv[])
 -	for(int i = 1; i < argc; i++)
-+	const char *port = NULL;
-+	unsigned expected = 0;
-+	if(!strcmp(argv[1], "--port"))
-@@ -68,5 +72,5 @@ int main(int argc, char * argv[])
+-	{
 -		if(!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
 -		{
 -			usage();
 -			return 0;
 -		}
-+		if(argc < 6 || !argv[2][0] || strcmp(argv[3], "--devnum") || !number(argv[4], &expected, 127))
+-	}
++	unsigned expected;
++	if(argc < 6 || strcmp(argv[1], "--port") || !argv[2][0] ||
++	   strcmp(argv[3], "--devnum") || !number(argv[4], &expected, 127))
++		return 2;
++	for(int i = 5; i < argc; ++i)
++		if(!strcmp(argv[i], "--port") || !strncmp(argv[i], "--port=", 7) ||
++		   !strcmp(argv[i], "--devnum") || !strncmp(argv[i], "--devnum=", 9))
 +			return 2;
-+		port = argv[2];
-+		argc -= 4;
-+		argv += 4;
-@@ -74,6 +78,13 @@ int main(int argc, char * argv[])
--
+@@ -75,17 +43,11 @@ int main(int argc, char * argv[])
 -	libusb_device ** list = NULL;
 -	libusb_context * context = NULL;
 -	libusb_init(&context);
 -	int count = libusb_get_device_list(context, &list);
 -	for(int i = 0; i < count; i++)
-+	if(argv[1][0] == '-')
-+		return 2;
-+	for(int i = 1; i < argc; ++i)
-+		if(!strcmp(argv[i], "--port") || !strncmp(argv[i], "--port=", 7) ||
-+		   !strcmp(argv[i], "--devnum") || !strncmp(argv[i], "--devnum=", 9))
-+			return 2;
-+	struct fel_identity id;
-+	int fd = -1;
-+	libusb_context *context = NULL;
-+	const struct libusb_init_option option = {.option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY};
-+	if(!discover(port, expected, &id) || (fd = verified_fd(&id)) < 0 ||
-+	   libusb_init_context(&context, &option, 1) != 0 ||
-+	   libusb_wrap_sys_device(context, fd, &ctx.hdl) != 0)
-@@ -81,10 +92,4 @@ int main(int argc, char * argv[])
+-	{
 -		libusb_device * device = list[i];
 -		struct libusb_device_descriptor desc;
 -		if(libusb_get_device_descriptor(device, &desc) != 0)
@@ -171,18 +344,447 @@ index b23a8c9..2ec5127 100644
 -				printf("ERROR: Can't connect to device\r\n");
 -			break;
 -		}
-+		fprintf(stderr, "xfel: cannot verify FEL identity before claim\n");
-+		if(context) libusb_exit(context);
-+		if(fd >= 0) close(fd);
-+		return 125;
-@@ -92 +97 @@ int main(int argc, char * argv[])
--
-+	fprintf(stderr, "xfel: selected bus=%u port=%s devnum=%u\n", id.bus, id.path, id.address);
-@@ -98 +103,2 @@ int main(int argc, char * argv[])
+-	}
++	const char *cmd = argv[5];
++	int version = !strcmp(cmd, "version"), exec = !strcmp(cmd, "exec");
++	int read32 = !strcmp(cmd, "read32"), write32 = !strcmp(cmd, "write32");
++	int read = !strcmp(cmd, "read"), write = !strcmp(cmd, "write");
++	uint32_t address, value;
++	if(!(version || exec || read32 || write32 || read || write) ||
++	   argc != (version ? 6 : read ? 9 : write || write32 ? 8 : 7) ||
++	   (!version && !word(argv[6], &address)) ||
++	   ((read || write32) && !word(argv[7], &value)) ||
++	   (read && (!value || (uint64_t)address + value > (1ULL << 32))))
++		return 2;
+@@ -93,11 +55,30 @@ int main(int argc, char * argv[])
+-	if(!fel_init(&ctx))
+-	{
+-		printf("ERROR: No FEL device found!\r\n");
+-		if(ctx.hdl)
+-			libusb_close(ctx.hdl);
 -		libusb_exit(NULL);
-+		libusb_exit(context);
-+		close(fd);
-@@ -460 +466,2 @@ int main(int argc, char * argv[])
+-		return -1;
+-	}
+-	if(!strcmp(argv[1], "version"))
+-	{
+-		printf("%.8s ID=0x%08x(%s) dflag=0x%02x dlength=0x%02x scratchpad=0x%08x\r\n",
++	struct fel_identity id;
++	int rc = discover(argv[2], expected, &id);
++	if(rc)
++		return rc;
++	int fd = verified_fd(&id, &rc);
++	if(fd < 0)
++	{
++		fprintf(stderr, "xfel: cannot verify FEL identity before claim (exit %d)\n", rc);
++		return rc;
++	}
++	struct xfel_ctx_t ctx = {0};
++	libusb_context *context = NULL;
++	const struct libusb_init_option option = {.option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY};
++	int status = libusb_init_context(&context, &option, 1);
++	if(!status)
++		status = libusb_wrap_sys_device(context, fd, &ctx.hdl);
++	if(status || !ctx.hdl)
++	{
++		rc = status == LIBUSB_ERROR_NO_DEVICE ? 66 : 125;
++		goto done;
++	}
++	fprintf(stderr, "xfel: selected bus=%u port=%s devnum=%u\n", id.bus, id.path, id.address);
++	if(!fel_init(&ctx) || ctx.version.id != 0x00190300)
++	{
++		rc = 125;
++		goto done;
++	}
++	rc = 0;
++	if(version)
++		printf("%.8s ID=0x%08x(%s) dflag=0x%02x dlength=0x%02x scratchpad=0x%08x\n",
+@@ -106,40 +87,3 @@ int main(int argc, char * argv[])
+-	}
+-	else if(!strcmp(argv[1], "hexdump"))
+-	{
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 2)
+-		{
+-			uint32_t addr = strtoul(argv[0], NULL, 0);
+-			size_t len = strtoul(argv[1], NULL, 0);
+-			char * buf = malloc(len);
+-			if(buf)
+-			{
+-				fel_chip_read_buf(&ctx, addr, buf, len);
+-				hexdump(addr, buf, len);
+-				free(buf);
+-			}
+-		}
+-		else
+-			usage();
+-	}
+-	else if(!strcmp(argv[1], "dump"))
+-	{
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 2)
+-		{
+-			uint32_t addr = strtoul(argv[0], NULL, 0);
+-			size_t len = strtoul(argv[1], NULL, 0);
+-			char * buf = malloc(len);
+-			if(buf)
+-			{
+-				fel_chip_read_buf(&ctx, addr, buf, len);
+-				fwrite(buf, len, 1, stdout);
+-				free(buf);
+-			}
+-		}
+-		else
+-			usage();
+-	}
+-	else if(!strcmp(argv[1], "read32"))
++	else if(exec)
++		fel_exec(&ctx, address);
++	else if(read32)
+@@ -147,9 +91,2 @@ int main(int argc, char * argv[])
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 1)
+-		{
+-			uint32_t addr = strtoul(argv[0], NULL, 0);
+-			uint32_t val = 0;
+-			fel_chip_read32(&ctx, addr, &val);
+-			printf("0x%08x\r\n", val);
+-		}
++		if(!fel_chip_read32(&ctx, address, &value))
++			rc = 74;
+@@ -157 +94 @@ int main(int argc, char * argv[])
+-			usage();
++			printf("0x%08x\n", value);
+@@ -159 +96 @@ int main(int argc, char * argv[])
+-	else if(!strcmp(argv[1], "write32"))
++	else if(write32)
+@@ -161,29 +98,2 @@ int main(int argc, char * argv[])
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 2)
+-		{
+-			uint32_t addr = strtoul(argv[0], NULL, 0);
+-			uint32_t val = strtoul(argv[1], NULL, 0);
+-			fel_chip_write32(&ctx, addr, val);
+-		}
+-		else
+-			usage();
+-	}
+-	else if(!strcmp(argv[1], "read"))
+-	{
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 3)
+-		{
+-			uint32_t addr = strtoul(argv[0], NULL, 0);
+-			size_t len = strtoul(argv[1], NULL, 0);
+-			char * buf = malloc(len);
+-			if(buf)
+-			{
+-				fel_read_progress(&ctx, addr, buf, len);
+-				file_save(argv[2], buf, len);
+-				free(buf);
+-			}
+-		}
+-		else
+-			usage();
++		if(!fel_chip_write32(&ctx, address, value))
++			rc = 74;
+@@ -191 +101 @@ int main(int argc, char * argv[])
+-	else if(!strcmp(argv[1], "write"))
++	else if(read)
+@@ -193,13 +103,3 @@ int main(int argc, char * argv[])
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 2)
+-		{
+-			uint32_t addr = strtoul(argv[0], NULL, 0);
+-			uint64_t len;
+-			void * buf = file_load(argv[1], &len);
+-			if(buf)
+-			{
+-				fel_write_progress(&ctx, addr, buf, len);
+-				free(buf);
+-			}
+-		}
++		void *buf = malloc(value);
++		if(!buf)
++			rc = 74;
+@@ -207,7 +106,0 @@ int main(int argc, char * argv[])
+-			usage();
+-	}
+-	else if(!strcmp(argv[1], "exec"))
+-	{
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 1)
+@@ -215,95 +108,4 @@ int main(int argc, char * argv[])
+-			uint32_t addr = strtoul(argv[0], NULL, 0);
+-			fel_exec(&ctx, addr);
+-		}
+-		else
+-			usage();
+-	}
+-	else if(!strcmp(argv[1], "reset"))
+-	{
+-		if(!fel_chip_reset(&ctx))
+-			printf("The '%s' chip don't support reset command\r\n", ctx.chip->name);
+-	}
+-	else if(!strcmp(argv[1], "sid"))
+-	{
+-		char sid[256];
+-		if(fel_chip_sid(&ctx, sid))
+-			printf("%s\r\n", sid);
+-		else
+-			printf("The '%s' chip don't support sid command\r\n", ctx.chip->name);
+-	}
+-	else if(!strcmp(argv[1], "jtag"))
+-	{
+-		if(!fel_chip_jtag(&ctx))
+-			printf("The '%s' chip don't support jtag command\r\n", ctx.chip->name);
+-	}
+-	else if(!strcmp(argv[1], "ddr"))
+-	{
+-		argc -= 2;
+-		argv += 2;
+-		if(!fel_chip_ddr(&ctx, (argc == 1) ? argv[0] : ""))
+-			printf("Failed to initial ddr controller\r\n");
+-	}
+-	else if(!strcmp(argv[1], "sign"))
+-	{
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 3)
+-		{
+-			uint8_t public_key[33] = {
+-				0x03, 0xcf, 0xd1, 0x8e, 0x4a, 0x4b, 0x40, 0xd6,
+-				0x52, 0x94, 0x48, 0xaa, 0x2d, 0xf8, 0xbb, 0xb6,
+-				0x77, 0x12, 0x82, 0x58, 0xb8, 0xfb, 0xfc, 0x5b,
+-				0x9e, 0x49, 0x2f, 0xbb, 0xba, 0x4e, 0x84, 0x83,
+-				0x2f,
+-			};
+-			uint8_t private_key[32] = {
+-				0xdc, 0x57, 0xb8, 0xa9, 0xe0, 0xe2, 0xb7, 0xf8,
+-				0xb4, 0xc9, 0x29, 0xbd, 0x8d, 0xb2, 0x84, 0x4e,
+-				0x53, 0xf0, 0x1f, 0x17, 0x1b, 0xbc, 0xdf, 0x6e,
+-				0x62, 0x89, 0x08, 0xdb, 0xf2, 0xb2, 0xe6, 0xa9,
+-			};
+-			char * p = argv[0];
+-			if(p && (strcmp(p, "") != 0) && (strlen(p) == sizeof(public_key) * 2))
+-			{
+-				for(int i = 0; i < sizeof(public_key); i++)
+-					public_key[i] = hex_string(p, i * 2);
+-			}
+-			char * q = argv[1];
+-			if(q && (strcmp(q, "") != 0) && (strlen(q) == sizeof(private_key) * 2))
+-			{
+-				for(int i = 0; i < sizeof(private_key); i++)
+-					private_key[i] = hex_string(q, i * 2);
+-			}
+-			char sid[256];
+-			uint8_t sha256[32];
+-			uint8_t signature[64];
+-			if(fel_chip_sid(&ctx, sid))
+-			{
+-				sha256_hash(sid, strlen(sid), sha256);
+-				ecdsa256_sign(private_key, sha256, signature);
+-				printf("Unique ID:\r\n\t");
+-				printf("%s\r\n", sid);
+-				printf("Sha256 digest:\r\n\t");
+-				for(int i = 0; i < sizeof(sha256); i++)
+-					printf("%02x", sha256[i]);
+-				printf("\r\n");
+-				printf("Ecdsa256 public key:\r\n\t");
+-				for(int i = 0; i < sizeof(public_key); i++)
+-					printf("%02x", public_key[i]);
+-				printf("\r\n");
+-				printf("Ecdsa256 private key:\r\n\t");
+-				for(int i = 0; i < sizeof(private_key); i++)
+-					printf("%02x", private_key[i]);
+-				printf("\r\n");
+-				printf("Ecdsa256 signature:\r\n\t");
+-				for(int i = 0; i < sizeof(signature); i++)
+-					printf("%02x", signature[i]);
+-				printf("\r\n");
+-				if(ecdsa256_verify(public_key, sha256, signature))
+-				{
+-					file_save(argv[2], signature, sizeof(signature));
+-					printf("Ecdsa256 signature verify successed and saved to '%s'.\r\n", argv[2]);
+-				}
+-				else
+-					printf("Ecdsa256 signature verify failed, please check the ecdsa256 public and private key.\r\n");
+-			}
++			fel_read_progress(&ctx, address, buf, value);
++			FILE *file = fopen(argv[8], "wb");
++			if(!file)
++				rc = 74;
+@@ -311,31 +112,0 @@ int main(int argc, char * argv[])
+-				printf("The '%s' chip don't support sid command\r\n", ctx.chip->name);
+-		}
+-		else
+-			usage();
+-	}
+-	else if(!strcmp(argv[1], "spinor"))
+-	{
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 0)
+-		{
+-			char name[128];
+-			uint64_t capacity;
+-
+-			if(spinor_detect(&ctx, name, &capacity))
+-				printf("Found spi nor flash '%s' with %lld bytes\r\n", name, (long long)capacity);
+-			else
+-				printf("Can't detect any spi nor flash\r\n");
+-		}
+-		else
+-		{
+-			if(!strcmp(argv[0], "erase") && (argc == 3))
+-			{
+-				argc -= 1;
+-				argv += 1;
+-				uint64_t addr = strtoull(argv[0], NULL, 0);
+-				uint64_t len = strtoull(argv[1], NULL, 0);
+-				if(!spinor_erase(&ctx, addr, len))
+-					printf("Can't erase spi nor flash\r\n");
+-			}
+-			else if(!strcmp(argv[0], "read") && (argc == 4))
+@@ -343,13 +114,4 @@ int main(int argc, char * argv[])
+-				argc -= 1;
+-				argv += 1;
+-				uint64_t addr = strtoull(argv[0], NULL, 0);
+-				uint64_t len = strtoull(argv[1], NULL, 0);
+-				char * buf = malloc(len);
+-				if(buf)
+-				{
+-					if(spinor_read(&ctx, addr, buf, len))
+-						file_save(argv[2], buf, len);
+-					else
+-						printf("Can't read spi nor flash\r\n");
+-					free(buf);
+-				}
++				if(fwrite(buf, 1, value, file) != value)
++					rc = 74;
++				if(fclose(file))
++					rc = 74;
+@@ -357,16 +119 @@ int main(int argc, char * argv[])
+-			else if(!strcmp(argv[0], "write") && (argc == 3))
+-			{
+-				argc -= 1;
+-				argv += 1;
+-				uint64_t addr = strtoull(argv[0], NULL, 0);
+-				uint64_t len;
+-				void * buf = file_load(argv[1], &len);
+-				if(buf)
+-				{
+-					if(!spinor_write(&ctx, addr, buf, len))
+-						printf("Can't write spi nor flash\r\n");
+-					free(buf);
+-				}
+-			}
+-			else
+-				usage();
++			free(buf);
+@@ -375 +122 @@ int main(int argc, char * argv[])
+-	else if(!strcmp(argv[1], "spinand"))
++	else if(write)
+@@ -377,12 +124,4 @@ int main(int argc, char * argv[])
+-		argc -= 2;
+-		argv += 2;
+-		if(argc == 0)
+-		{
+-			char name[128];
+-			uint64_t capacity;
+-
+-			if(spinand_detect(&ctx, name, &capacity))
+-				printf("Found spi nand flash '%s' with %lld bytes\r\n", name, (long long)capacity);
+-			else
+-				printf("Can't detect any spi nand flash\r\n");
+-		}
++		uint64_t len;
++		void *buf = file_load(argv[7], &len);
++		if(!buf || !len || len > (1ULL << 32) - address)
++			rc = 74;
+@@ -390,65 +129,2 @@ int main(int argc, char * argv[])
+-		{
+-			if(!strcmp(argv[0], "erase") && (argc == 3))
+-			{
+-				argc -= 1;
+-				argv += 1;
+-				uint64_t addr = strtoull(argv[0], NULL, 0);
+-				uint64_t len = strtoull(argv[1], NULL, 0);
+-				if(!spinand_erase(&ctx, addr, len))
+-					printf("Can't erase spi nand flash\r\n");
+-			}
+-			else if(!strcmp(argv[0], "read") && (argc == 4))
+-			{
+-				argc -= 1;
+-				argv += 1;
+-				uint64_t addr = strtoull(argv[0], NULL, 0);
+-				uint64_t len = strtoull(argv[1], NULL, 0);
+-				char * buf = malloc(len);
+-				if(buf)
+-				{
+-					if(spinand_read(&ctx, addr, buf, len))
+-						file_save(argv[2], buf, len);
+-					else
+-						printf("Can't read spi nand flash\r\n");
+-					free(buf);
+-				}
+-			}
+-			else if(!strcmp(argv[0], "write") && (argc == 3))
+-			{
+-				argc -= 1;
+-				argv += 1;
+-				uint64_t addr = strtoull(argv[0], NULL, 0);
+-				uint64_t len;
+-				void * buf = file_load(argv[1], &len);
+-				if(buf)
+-				{
+-					if(!spinand_write(&ctx, addr, buf, len))
+-						printf("Can't write spi nand flash\r\n");
+-					free(buf);
+-				}
+-			}
+-			else if(!strcmp(argv[0], "splwrite") && (argc == 4))
+-			{
+-				argc -= 1;
+-				argv += 1;
+-				uint32_t splitsz = strtoul(argv[0], NULL, 0);
+-				uint64_t addr = strtoull(argv[1], NULL, 0);
+-				uint64_t len;
+-				void * buf = file_load(argv[2], &len);
+-				if(buf)
+-				{
+-					if(!spinand_splwrite(&ctx, splitsz, addr, buf, len))
+-						printf("Can't write spi nand flash with split support\r\n");
+-					free(buf);
+-				}
+-			}
+-			else
+-				usage();
+-		}
+-	}
+-	else if(!strcmp(argv[1], "extra"))
+-	{
+-		argc -= 2;
+-		argv += 2;
+-		if(!fel_chip_extra(&ctx, argc, argv))
+-			printf("Not support any extra commands\r\n");
++			fel_write_progress(&ctx, address, buf, len);
++		free(buf);
+@@ -456,2 +132 @@ int main(int argc, char * argv[])
+-	else
+-		usage();
++done:
+@@ -460,3 +135,4 @@ int main(int argc, char * argv[])
 -	libusb_exit(NULL);
-+	libusb_exit(context);
+-
+-	return 0;
++	if(context)
++		libusb_exit(context);
 +	close(fd);
++	return rc;

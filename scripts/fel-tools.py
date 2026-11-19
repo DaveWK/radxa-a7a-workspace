@@ -59,7 +59,7 @@ def stage_xfel(args):
     if actual != want:
         raise ValueError(f"xfel sha256 mismatch: {actual}")
     args.dest.chmod(0o700)
-    print(f"fel-boot: staged xfel sha256 {actual}")
+    print(f"fel-tools: staged xfel sha256 {actual}")
 
 
 def tool_stamp(edk2):
@@ -137,6 +137,9 @@ def main():
     record = sub.add_parser("record-xfel")
     record.add_argument("source", type=Path)
     record.add_argument("commit")
+    record.add_argument("compiler", type=Path)
+    record.add_argument("make", type=Path)
+    record.add_argument("pkg_config", type=Path)
     stage = sub.add_parser("stage-xfel")
     stage.add_argument("--override", action="store_true")
     stage.add_argument("source", type=Path)
@@ -171,11 +174,21 @@ def main():
             XFEL_RECORD,
             dict(
                 **sources,
-                compiler=subprocess.check_output(
-                    ["gcc", "--version"], text=True
-                ).splitlines()[0],
+                **{
+                    name: dict(
+                        path=str(tool),
+                        version=subprocess.check_output(
+                            [tool, "--version"], text=True
+                        ).splitlines()[0],
+                    )
+                    for name, tool in (
+                        ("compiler", args.compiler),
+                        ("make", args.make),
+                        ("pkg_config", args.pkg_config),
+                    )
+                },
                 libusb_version=subprocess.check_output(
-                    ["pkg-config", "--modversion", "libusb-1.0"], text=True
+                    [args.pkg_config, "--modversion", "libusb-1.0"], text=True
                 ).strip(),
                 binary_sha256=binary_digest,
             ),

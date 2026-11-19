@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Replacement library inside the fixture mount namespace. No USB backend. */
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <libusb.h>
 #include <linux/usbdevice_fs.h>
 #include <stdarg.h>
@@ -9,10 +11,37 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 static int verified_fd = -1;
-static int fixture(const char *name) { return !strcmp(getenv("USB_CASE"), name); }
+static int ack_count;
+static int fixture(const char *name)
+{
+	const char *test = getenv("USB_CASE");
+	return test && !strcmp(test, name);
+}
+
+int open(const char *path, int flags, ...)
+{
+	assert(!strncmp(path, "/dev/bus/usb/", 13) && !(flags & O_CREAT));
+	if(fixture("open-gone"))
+	{
+		errno = ENODEV;
+		return -1;
+	}
+	return syscall(SYS_openat, AT_FDCWD, path, flags, 0);
+}
+
+ssize_t pread(int fd, void *buf, size_t size, off_t offset)
+{
+	if(fixture("descriptor-gone"))
+	{
+		errno = ENODEV;
+		return -1;
+	}
+	return syscall(SYS_pread64, fd, buf, size, offset);
+}
 
 int ioctl(int fd, unsigned long cmd, ...)
 {
@@ -36,12 +65,18 @@ int ioctl(int fd, unsigned long cmd, ...)
 	info->ports[0] = number == 14 ? 3 : fixture("fd-port") ? 7 : 6;
 	info->ports[1] = 4;
 	verified_fd = fd;
-	return fixture("no-conninfo") ? -1 : 0;
+	if(fixture("no-conninfo"))
+	{
+		errno = ENOTTY;
+		return -1;
+	}
+	return 0;
 }
 
 int libusb_init_context(libusb_context **ctx, const struct libusb_init_option opt[], int n)
 {
 	assert(n == 1 && opt[0].option == LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+	fprintf(stderr, "mock init\n");
 	*ctx = (libusb_context *)(intptr_t)1;
 	return 0;
 }
@@ -95,14 +130,31 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
 {
 	check_handle(h);
 	assert(timeout == 60000);
+	*actual = len;
 	if(ep == 0x81) {
+		if(fixture("read-gone") && len == 28)
+			return LIBUSB_ERROR_NO_DEVICE;
+		if(fixture("read-timeout") && len == 28)
+			return LIBUSB_ERROR_TIMEOUT;
 		memset(buf, 0, len);
 		if(len == 13) memcpy(buf, "AWUS", 4);
 		else if(len == 32) {
 			memcpy(buf, "AWUSBFEX", 8);
 			buf[9] = 3; buf[10] = 0x19;
-		} else assert(len == 8);
+		} else if(len == 8) {
+			++ack_count;
+			buf[0] = buf[1] = 0xff;
+			if((ack_count == 1 && fixture("version-malformed")) ||
+			   (ack_count == 2 && fixture("entry2-malformed")) ||
+			   (ack_count == 4 && fixture("wdt-malformed")))
+				buf[0] = 0x55;
+			if((ack_count == 1 && fixture("version-rejected")) ||
+			   (ack_count == 2 && fixture("entry2-rejected")) ||
+			   (ack_count == 4 && fixture("wdt-rejected")))
+				buf[4] = 1;
+			if(ack_count == 1 && fixture("version-short"))
+				*actual = 7;
+		} else assert(len == 28);
 	} else assert(ep == 2);
-	*actual = len;
 	return 0;
 }

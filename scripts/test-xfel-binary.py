@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 
-def main(binary):
+def main(binary, red=False):
     scripts = Path(__file__).resolve().parent
     (scripts.parent / "out").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=scripts.parent / "out") as tmp:
@@ -90,9 +90,25 @@ def main(binary):
         assert "libusb-1.0.so.0 => /fixture/libusb-1.0.so.0" in links
         selected = ["--port", "3-6", "--devnum", "12", "version"]
 
-        def run(name, args, rc, opened=None, claim=False):
+        def run(name, args, rc, opened=None, claim=False, shell=None, version=False):
             proc = subprocess.run(
-                [*jail, "/fixture/xfel", *args],
+                [
+                    *jail,
+                    "--setenv",
+                    "PATH",
+                    "/fixture:/usr/bin",
+                    "--setenv",
+                    "FEL_TOOL",
+                    "xfel",
+                    "--setenv",
+                    "XFEL",
+                    "xfel",
+                    *(
+                        ["/fixture/xfel", *args]
+                        if shell is None
+                        else ["/usr/bin/bash", "-c", shell]
+                    ),
+                ],
                 capture_output=True,
                 text=True,
                 env=os.environ | dict(USB_CASE=name),
@@ -108,26 +124,79 @@ def main(binary):
                 [] if opened is None else [f"mock fd {opened}"]
             ), (name, lines)
             assert ("mock wrap" in lines) == claim and ("mock claim" in lines) == claim
-            if claim:
+            assert ("mock init" in lines) == claim
+            if version:
                 assert (
                     "ID=0x00190300" in proc.stdout and f"devnum={opened}" in proc.stderr
                 )
             print(f"PASS {name} exit={rc} fd={opened} claim={claim}")
 
+        prefix = selected[:-1]
+        ack_cases = (
+            ("version", ["version"]),
+            ("entry2", ["exec", "0x90044"]),
+            ("wdt", ["write32", "0x0205000c", "0x000014af"]),
+        )
+        if red:
+            add("3-6", 12)
+            for name, command in ack_cases:
+                for kind in ("malformed", "rejected"):
+                    run(f"{name}-{kind}", [*prefix, *command], 0, 12, True)
+            run("sole-without-selector", ["version"], 0, 12, True)
+            return
         run("help", ["--help"], 0)
-        run("empty", ["version"], 125)
+        run("no-args", [], 2)
+        run("empty", ["version"], 2)
         add("3-3.4", 14)
-        run("sole", ["version"], 0, 14, True)
+        run("sole", ["version"], 2)
         run("misplaced", ["version", "--port", "3-6"], 2)
         add("3-6", 12)
-        run("ambiguous", ["version"], 125)
+        run("ambiguous", ["version"], 2)
+        for name, shell in (
+            ("raw-direct", "xfel version"),
+            ("raw-fel-tool", '"$FEL_TOOL" version'),
+            ("raw-xfel", '"$XFEL" version'),
+            ("raw-variable", 'selected=$(command -v xfel); "$selected" version'),
+        ):
+            run(name, [], 2, shell=shell)
         run("duplicate-option", [*selected, "--port", "3-6"], 2)
         run("missing-devnum", ["--port", "3-6", "version"], 2)
-        run("selected-6", selected, 0, 12, True)
-        run("selected-4", ["--port", "3-3.4", "--devnum", "14", "version"], 0, 14, True)
-        run("wrong-chain", ["--port", "3-3", "--devnum", "14", "version"], 125)
+        run("missing-port", ["--devnum", "12", "version"], 2)
+        run("unknown-command", [*prefix, "bogus"], 2)
+        run("selected-6", selected, 0, 12, True, version=True)
+        run(
+            "selected-4",
+            ["--port", "3-3.4", "--devnum", "14", "version"],
+            0,
+            14,
+            True,
+            version=True,
+        )
+        run("missing-connector", ["--port", "3-3", "--devnum", "14", "version"], 66)
         for name in ("fd-port", "fd-bus", "fd-address", "no-conninfo"):
             run(name, selected, 125, 12)
+        run("open-gone", selected, 66)
+        run("descriptor-gone", selected, 66, 12)
+        run(
+            "read-gone",
+            [*prefix, "read", "0xdf000", "28", "/never-written"],
+            66,
+            12,
+            True,
+        )
+        run(
+            "read-timeout",
+            [*prefix, "read", "0xdf000", "28", "/never-written"],
+            74,
+            12,
+            True,
+        )
+        for name, command in ack_cases:
+            for kind, rc in (("malformed", 65), ("rejected", 76)):
+                run(f"{name}-{kind}", [*prefix, *command], rc, 12, True)
+        run("version-short", selected, 65, 12, True)
+        for name, command in ack_cases[1:]:
+            run(f"{name}-ack", [*prefix, *command], 0, 12, True)
         (devices / "3-6/devnum").write_text("19")
         run("changed-before-open", selected, 125)
         (devices / "3-6/devnum").write_text("12")
@@ -135,11 +204,11 @@ def main(binary):
         run("wrong-vid", selected, 125)
         (devices / "3-6/idVendor").write_text("1f3a")
         add("3-7", 19, "ffff", chain="6")
-        run("inconsistent-other-descriptor", selected, 125)
+        run("unrelated-port-is-not-input", selected, 0, 12, True, version=True)
         shutil.rmtree(devices / "3-7")
         (nodes / "012").write_bytes(bytes(18))
         run("wrong-fd-descriptor", selected, 125, 12)
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]).resolve(strict=True))
+    main(Path(sys.argv[1]).resolve(strict=True), red=sys.argv[2:] == ["--red"])
