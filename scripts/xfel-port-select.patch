@@ -114,10 +114,10 @@ index f4bfd5b..ff948eb 100644
 +			if(status == 0)
 diff --git a/linux-fel-port.h b/linux-fel-port.h
 new file mode 100644
-index 0000000..42eaa87
+index 0000000..3ede45f
 --- /dev/null
 +++ b/linux-fel-port.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,141 @@
 +/* SPDX-License-Identifier: MIT */
 +/* Linux only: select in sysfs, then attest and wrap the SAME open usbfs fd.
 + * Never ask libusb to rediscover a device by its recyclable address. */
@@ -218,7 +218,11 @@ index 0000000..42eaa87
 +	*status = 125;
 +	if(fd < 0)
 +	{
-+		if(errno == ENODEV || errno == ESHUTDOWN)
++		if(errno == EACCES)
++			fprintf(stderr, "xfel: permission denied: the runner must be in dialout and "
++				"/etc/udev/rules.d/99-a7a-fel.rules must match 1f3a:efe8 "
++				"with MODE 0660, GROUP dialout\n");
++		else if(errno == ENODEV || errno == ESHUTDOWN)
 +			*status = 66;
 +		else if(errno == ENOENT)
 +		{

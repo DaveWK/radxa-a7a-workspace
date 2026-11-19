@@ -20,8 +20,10 @@ or reset a board. `make fel-boot`, `scripts/fel-boot.sh` and
   `libusb_bulk_transfer` raised from 10000 to 60000 ms in `fel.c`, into
   `out/tools/xfel` and its build receipt. It needs `cc`, `make`, `pkgconf` and `libusb1-devel`.
   No xfel binary is part of this repository.
-- USB device permissions for the runner account, e.g. through the host's
-  reviewed udev rule. The selector does not elevate privileges.
+- The runner account must be in `dialout`, and
+  `/etc/udev/rules.d/99-a7a-fel.rules` must match `1f3a:efe8` with
+  `MODE="0660"` and `GROUP="dialout"`. Installing the host rule is a separate
+  approved action. The selector runs directly without elevating privileges.
 - Optional: a 3.3 V USB-UART adapter on UART0 (115200 8N1), with
   `make serial`.
 
@@ -74,7 +76,7 @@ USB; a local file or output error is not an ACK.
 | 66 | Selected connector absent from sysfs, or an explicit device-loss error at open, verification or transfer. Not a submission ACK. |
 | 74 | Other transport or local I/O failure (including timeout). Do not infer device loss. |
 | 76 | Well-formed FEL status with a nonzero device status. |
-| 125 | Identity, tool or setup refusal (including changed devnum, wrong VID:PID/topology, unavailable verification, or an absent usbfs node whose matching sysfs identity remains). Never interpret as device loss. |
+| 125 | Identity, tool or setup refusal (including permission denied, changed devnum, wrong VID:PID/topology, unavailable verification, or an absent usbfs node whose matching sysfs identity remains). Never interpret as device loss. |
 | Other | Wrapper passes the child exit through, mapping a signal to `128 + signal`. An unrecognized status is a failure. |
 
 `make test` includes the compiled selector suite; it requires bubblewrap.

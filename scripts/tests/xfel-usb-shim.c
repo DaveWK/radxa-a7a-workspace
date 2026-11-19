@@ -28,6 +28,11 @@ static int fixture(const char *name)
 int open(const char *path, int flags, ...)
 {
 	assert(!(flags & O_CREAT));
+	if(!strncmp(path, "/dev/bus/usb/", 13) && fixture("open-eacces"))
+	{
+		errno = EACCES;
+		return -1;
+	}
 	if(!strncmp(path, "/dev/bus/usb/", 13) && fixture("open-gone"))
 	{
 		errno = ENODEV;

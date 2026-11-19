@@ -105,6 +105,7 @@ def main(binary, red=False, round4_base=False):
             closed_pipe=False,
             writes=None,
             partial=False,
+            permission_hint=None,
         ):
             if output_error:
                 shell = shlex.join(["/fixture/xfel", *args]) + " >/dev/full"
@@ -155,11 +156,23 @@ def main(binary, red=False, round4_base=False):
                 assert lines.count("mock FEL write request") == writes, (name, lines)
             if partial:
                 assert "mock input prefix" in lines and "mock input EIO" in lines
+            if permission_hint is not None:
+                has_hint = all(
+                    text in proc.stderr
+                    for text in (
+                        "dialout",
+                        "/etc/udev/rules.d/99-a7a-fel.rules",
+                        "1f3a:efe8",
+                        "0660",
+                    )
+                )
+                assert has_hint == permission_hint, proc.stderr
             if version:
                 assert (
                     "ID=0x00190300" in proc.stdout and f"devnum={opened}" in proc.stderr
                 )
-            print(f"PASS {name} exit={rc} fd={opened} claim={claim}")
+            details = "" if permission_hint is None else f" permission_hint={has_hint}"
+            print(f"PASS {name} exit={rc} fd={opened} claim={claim}{details}")
 
         prefix = selected[:-1]
         ack_cases = (
@@ -238,6 +251,7 @@ def main(binary, red=False, round4_base=False):
         if round4_base:
             add("3-6", 12)
             framing_and_io(True)
+            run("open-eacces", selected, 125, permission_hint=False)
             return
         run("help", ["--help"], 0)
         run("no-args", [], 2)
@@ -272,6 +286,7 @@ def main(binary, red=False, round4_base=False):
         for name in ("fd-port", "fd-bus", "fd-address", "no-conninfo"):
             run(name, selected, 125, 12)
         run("open-gone", selected, 66)
+        run("open-eacces", selected, 125, permission_hint=True)
         run("descriptor-gone", selected, 66, 12)
         run(
             "read-gone",
