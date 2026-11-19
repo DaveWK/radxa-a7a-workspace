@@ -8,13 +8,16 @@ import os
 from pathlib import Path
 import runpy
 import shutil
+import socket
 import struct
 import subprocess
 import tempfile
+import time
 import unittest
 
 SCRIPTS = Path(__file__).resolve().parent
 cached = runpy.run_path(str(SCRIPTS / "lib/cached_set.py"))
+session = runpy.run_path(str(SCRIPTS / "fel_session.py"))
 image = runpy.run_path(str(SCRIPTS / "mkimage.py"))
 ORDER = """# Set A — 2400 MHz — cached memtest
 1. From FEL, clear SRAM mailbox and upload bt0-fel.bin into SRAM (0x90000).
@@ -27,11 +30,19 @@ import os, shutil, struct, sys, time
 from pathlib import Path
 
 ports = Path(os.environ["FEL_SYSFS_ROOT"])
+fixture = Path(os.environ["FIXTURE"])
 if sys.argv[1:3] == ["--discover", "--port"]:
-    device = ports / sys.argv[3]
+    port = sys.argv[3]
+    device = ports / port
     try:
         print((device / "devnum").read_text())
     except FileNotFoundError:
+        peer = "3-6" if port == "3-3.4" else "3-3.4"
+        state = "present" if (ports / peer).exists() else "absent"
+        marker = fixture / port / ("poll-peer-" + state)
+        if marker.exists():
+            marker.with_suffix(".observed").touch()
+        marker.touch()
         sys.exit(66)
     sys.exit(0)
 flag, port, number_flag, number, separator, cmd, *args = sys.argv[1:]
@@ -42,10 +53,14 @@ try:
         sys.exit(125)
 except FileNotFoundError:
     sys.exit(66)
-root = Path(os.environ["FIXTURE"]) / port
+root = fixture / port
 mb, name = {"3-3.4": (4096, "CXMT 4GB"), "3-6": (6144, "CXMT 6GB")}[port]
 
 if cmd == "version":
+    if int(number) >= 22 and (rc := os.getenv("RECONNECT_RC")):
+        if rc == "hang":
+            time.sleep(10)
+        sys.exit(int(rc))
     print("AWUC ID=0x00190300(A733)")
 elif cmd == "write":
     shutil.copyfile(args[1], root / args[0])
@@ -67,12 +82,11 @@ elif (cmd, args) == ("exec", ["0x90044"]):
         (root / "entry-two").touch()
         peer = "3-6" if port == "3-3.4" else "3-3.4"
         deadline = time.monotonic() + 10
-        while not (root.parent / peer / "entry-two").exists():
+        wait = root.parent / peer / ("entry-two" if port == "3-3.4" else "poll-peer-present.observed")
+        while not wait.exists():
             if time.monotonic() >= deadline:
                 sys.exit(32)
             time.sleep(0.02)
-        if port == "3-6":
-            time.sleep(0.6)
     device.rename(reset)
     (reset / "devnum").write_text(str(int(number) + 10))
     # Return the acknowledgement while the port is absent; fixture controller
@@ -221,32 +235,31 @@ class RunnerTests(unittest.TestCase):
         for name in (
             "a7a-cached-run",
             "fel_session.py",
+            "fel-wdt-reset.sh",
             "fel-check.py",
             "fel-manifest.py",
             "mkimage.py",
         ):
             shutil.copy2(SCRIPTS / name, scripts)
         shutil.copytree(SCRIPTS / "lib", scripts / "lib")
-        module = scripts / "fel_session.py"
-        source = module.read_text()
-        host_home = "Path(pwd.getpwuid(os.geteuid()).pw_dir)"
-        self.assertEqual(
-            source.count(host_home), 1, "fixture must redirect the host lease path"
-        )
-        module.write_text(source.replace(host_home, "Path.home()"))
-        self.runner = scripts / "a7a-cached-run"
+        self.runner = scripts / "fel_session.py"
+        self.python = self.root / "python3"
+        shutil.copy2(SCRIPTS / "tests/fel-session-python", self.python)
+        self.python.chmod(0o700)
         fake = scripts / "xfel-port"
         fake.write_text(FAKE)
         fake.chmod(0o700)
         self.env = os.environ | dict(
             HOME=str(self.home),
+            PATH=f"{self.root}:{os.environ['PATH']}",
+            FEL_FIXTURE_HOME=str(self.home),
             FEL_SYSFS_ROOT=str(self.sysfs),
             FIXTURE=str(self.root),
         )
 
     def launch(self, stage, *args):
         return subprocess.Popen(
-            [self.runner, "--stage", stage, *args],
+            [self.python, "-I", self.runner, "--stage", stage, *args],
             env=self.env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -314,15 +327,19 @@ class RunnerTests(unittest.TestCase):
         for addr in cached["ADDRESSES"].values():
             self.assertFalse((self.root / port / addr).exists(), addr)
 
-    def wait_offline(self, port):
+    def wait_path(self, path):
         # Bounded fixture synchronization, not a real USB wait.
         from time import monotonic, sleep
 
-        target = self.sysfs / (port + ".offline")
         deadline = monotonic() + 10
-        while not (target / "devnum").exists():
-            self.assertLess(monotonic(), deadline, f"fixture never reset {port}")
+        while not path.exists():
+            self.assertLess(monotonic(), deadline, f"fixture did not reach {path.name}")
             sleep(0.02)
+        return path
+
+    def wait_offline(self, port):
+        target = self.sysfs / (port + ".offline")
+        self.wait_path(target / "devnum")
         return target
 
     def test_happy_path_ack_disappears_and_reconnects(self):
@@ -350,8 +367,6 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(json.loads(self.paths("3-3.4")[1].read_text())["pending"])
 
     def test_two_staged_runners_and_peer_loss_during_reconnect(self):
-        from time import sleep
-
         self.setup_runner()
         self.env["CONCURRENT"] = "yes"
         for port in self.logs:
@@ -359,11 +374,11 @@ class RunnerTests(unittest.TestCase):
         with self.resume("3-3.4") as first, self.resume("3-6") as second:
             one = self.wait_offline("3-3.4")
             two = self.wait_offline("3-6")
-            sleep(
-                0.35
-            )  # First is selecting on complete snapshots as its peer is absent.
+            self.wait_path(self.root / "3-3.4" / "poll-peer-absent.observed")
+            (self.root / "3-3.4" / "poll-peer-present").unlink()
+            (self.root / "3-3.4" / "poll-peer-present.observed").unlink()
             two.rename(self.sysfs / "3-6")
-            sleep(0.35)  # First observes the peer's return before it can reconnect.
+            self.wait_path(self.root / "3-3.4" / "poll-peer-present.observed")
             one.rename(self.sysfs / "3-3.4")
             self.finish(first, 3)
             self.finish(second, 3)
@@ -405,6 +420,10 @@ class RunnerTests(unittest.TestCase):
             "wrong board": "one matching strap and size",
             "two straps": "one matching strap and size",
             "wrong log": "invalid identity clearance path",
+            "mid-line": "complete serial line boundaries",
+            "size first": "strap and size identity in order",
+            "skipped failure": "reset or failure in Entry 1",
+            "late failure": "reset or failure in Entry 1",
         }
         for case, expect in cases.items():
             with self.subTest(case=case):
@@ -439,6 +458,29 @@ class RunnerTests(unittest.TestCase):
                         )
                 elif case == "wrong log":
                     clearance = self.range(port, path=self.logs["3-6"])
+                elif case in (
+                    "mid-line",
+                    "size first",
+                    "skipped failure",
+                    "late failure",
+                ):
+                    start = self.receipt(port)["identity_window_start"]
+                    prefix, data = log.read_bytes()[:start], log.read_bytes()[start:]
+                    if case == "mid-line":
+                        log.write_bytes(prefix + b"untrusted prefix " + data)
+                        clearance = self.range(
+                            port, start=start + len(b"untrusted prefix ")
+                        )
+                    elif case == "size first":
+                        lines = data.splitlines(keepends=True)
+                        log.write_bytes(prefix + b"".join(reversed(lines)))
+                    elif case == "skipped failure":
+                        failure = b"[bt0] halted; resetting\n"
+                        log.write_bytes(prefix + failure + data)
+                        clearance = self.range(port, start=start + len(failure))
+                    else:
+                        clearance = self.range(port)
+                        log.write_bytes(prefix + data + b"[bt0] halted; resetting\n")
                 self.assertIn(
                     expect,
                     self.finish(
@@ -481,22 +523,85 @@ class RunnerTests(unittest.TestCase):
                 9,
             )
             self.assertIn("already leased", error)
+        reset = self.root / "independent-wdt-state"
+        proc = subprocess.Popen(
+            [self.runner.with_name("fel-wdt-reset.sh")],
+            env=dict(self.env, FEL_PORT="3-3.4", FEL_STATE_FILE=str(reset)),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertIn("already leased", self.finish(proc, 9))
+        self.assertFalse(reset.exists())
         self.finish(self.resume(board="6g"), 2)
 
-    def test_expired_preflight_refused(self):
-        self.setup_runner()
-        module = self.runner.with_name("fel_session.py")
-        module.write_text(
-            module.read_text().replace(
-                "IDENTITY_LIFETIME = 120", "IDENTITY_LIFETIME = 0.3"
-            )
-        )
-        self.preflight()
-        from time import sleep
+    def await_expiry(self, port):
+        deadline = time.monotonic() + 5
+        while self.receipt(port)["status"] != "resume-expired":
+            self.assertLess(time.monotonic(), deadline, "guardian failed to expire")
+            time.sleep(0.01)
+        self.assert_no_dram(port)
 
-        sleep(0.4)
-        self.assertIn("expired", self.finish(self.resume(), 2))
-        self.assert_no_dram("3-3.4")
+    def test_absent_or_incomplete_resume_cannot_extend_guardian_deadline(self):
+        port = "3-3.4"
+        for case in ("absent", "incomplete"):
+            with self.subTest(case=case):
+                self.setUp()
+                self.setup_runner()
+                self.env["FEL_FIXTURE_LIFETIME"] = "0.7"
+                self.preflight()
+                if case == "incomplete":
+                    with socket.socket(socket.AF_UNIX) as client:
+                        client.connect(session["socket_address"](self.paths(port)[0]))
+                        client.sendall(b'{"clearance":')
+                        self.await_expiry(port)
+                else:
+                    self.await_expiry(port)
+                self.assertIn("expired", self.finish(self.resume(), 2))
+
+    def test_actual_offline_verifier_requires_reconnect_disposition(self):
+        port = "3-3.4"
+        for outcome, code, verify_code in (
+            ("", 3, 0),
+            ("66", 5, 0),
+            ("125", 8, 3),
+            ("65", 6, 3),
+            ("74", 10, 3),
+            ("hang", 7, 3),
+        ):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                self.setup_runner()
+                self.env.update(RECONNECT_RC=outcome, FEL_FIXTURE_TIMEOUT="1")
+                self.preflight()
+                with self.resume(port) as proc:
+                    offline = self.wait_offline(port)
+                    self.wait_path(self.root / port / "poll-peer-present")
+                    with self.logs[port].open("ab") as stream:
+                        stream.write(b"[bt0] RVBAR 00000000:40000000, fixture\nmain>")
+                    offline.rename(self.sysfs / port)
+                    self.finish(proc, code)
+                expected = (
+                    "verified" if code == 3 else "lost" if code == 5 else "refused"
+                )
+                self.assertEqual(self.receipt(port)["reconnect"]["outcome"], expected)
+                verified = subprocess.run(
+                    [
+                        self.python,
+                        "-I",
+                        self.runner,
+                        "verify-handover",
+                        "--receipt",
+                        self.paths(port)[0],
+                    ],
+                    env=self.env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    verified.returncode, verify_code, verified.stdout + verified.stderr
+                )
 
 
 if __name__ == "__main__":

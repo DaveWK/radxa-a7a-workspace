@@ -10,7 +10,7 @@
 #                      dramlib-2400, phyfw-2400). Private build and packaging
 #                      directories, and a build record under out/fel/.records/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
-#   make fel-boot      refuses until the task-000141 FEL session runner lands
+#   make fel-boot      workspace maintenance boot; requires FEL_PORT, FEL_SERIAL_LOG
 #   make rpms          the cubie-a7a-* SRPMs and RPMs -> out/fedora/rpmbuild/
 #   make fedora-image  Fedora 45 image with the firmware at LBA 256 -> out/image/
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
@@ -30,10 +30,10 @@
 #                        Linux yet. The vendor paths run 2400.
 #   VENDOR_DRAM=yes      measurement build: DRAM through Allwinner's DRAM
 #                        library instead (run `make vendor` first), at
-#                        2400 MHz; measurement booting is held on task-000141.
+#                        2400 MHz; measurement booting requires authorization.
 #   VENDOR_DRAM=phyfw    measurement build: our driver with the PHY's own
 #                        training firmware read from that library's object as
-#                        data (`make vendor` too). Booting is held on task-000141.
+#                        data (`make vendor` too). Booting requires authorization.
 #   Earlier spellings: BLOBLESS=yes and FEL_DRAM=open are the default now;
 #   FEL_DRAM=dramlib builds only the FEL bt0 with the library (measurement only).
 #   fel-image refuses inherited or Cargo-configured A7A_* and A733_* knobs.
@@ -252,7 +252,8 @@ $(TOP)/out/tools/xfel $(TOP)/out/tools/xfel.record.json &: scripts/build-xfel.sh
 	scripts/build-xfel.sh
 
 fel-boot:
-	scripts/fel-boot.sh
+	$(fel-profile-check)
+	EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh "$(FEL_OUT)"
 
 rpms: check-sources
 	FWREPO=$(FWREPO) FEDORA_RELEASE=$(FEDORA_RELEASE) $(if $(AIC8800_SRC),AIC8800_SRC=$(abspath $(AIC8800_SRC))) \
@@ -293,7 +294,7 @@ test: check-sources xfel
 	bash -n scripts/fel-boot.sh scripts/build-edk2.sh scripts/serial-log.sh scripts/fetch-vendor.sh scripts/build-xfel.sh scripts/binfmt-aarch64.sh
 	shellcheck scripts/*.sh
 	shfmt -d scripts/*.sh
-	black --check scripts/*.py scripts/xfel-port scripts/a7a-cached-run scripts/lib/cached_set.py
+	black --check scripts/*.py scripts/xfel-port scripts/a7a-cached-run scripts/lib/cached_set.py scripts/tests/fel-session-python
 
 clean:
 	rm -rf $(OUT)

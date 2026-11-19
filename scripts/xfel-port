@@ -174,6 +174,16 @@ def main():
             stdout=subprocess.DEVNULL,
             check=True,
         )
+        # The session owns the lease, but the transfer must retain the same
+        # open file description if both its Python parents disappear.
+        lease = os.environ.get("FEL_SESSION_LEASE_FD")
+        lease_fds = ()
+        if lease is not None:
+            fd = number(lease, 2**31 - 1)
+            if fd < 3:
+                raise ValueError("invalid inherited session lease descriptor")
+            os.fstat(fd)
+            lease_fds = (fd,)
         status = subprocess.run(
             [
                 tool,
@@ -182,7 +192,8 @@ def main():
                 "--devnum",
                 str(expected),
                 *args.command[1:],
-            ]
+            ],
+            pass_fds=lease_fds,
         ).returncode
         return 128 - status if status < 0 else status
 

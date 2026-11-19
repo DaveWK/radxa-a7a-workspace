@@ -19,9 +19,11 @@ pending -- failed or wrong-identity probe --> still pending, abort transaction
 live epoch -- ACKed workspace Entry 2 --> check mailbox/disconnect and serial
 ```
 
-Attempt, ACK and verified epoch events are separate. Once the command timeout
-expires, the session waits for the selector child to exit before releasing the
-lease; a late exit does not count as an ACK. Do not resubmit Entry 2 to recover
+Attempt, ACK and verified epoch events are separate. On a command timeout
+the session terminates and reaps the selector process group; a late exit
+does not count as an ACK. The transfer inherits the lease, preserving it
+if both its parents die or the kernel cannot terminate it immediately.
+Do not resubmit Entry 2 to recover
 from uncertain handover. Only the authorized watchdog helper sends WDT0 writes.
 
 ## Cached memtest
@@ -45,11 +47,15 @@ the byte range containing the complete strap and size lines, and hash
 `[start,end)`. Use `4g` (`CXMT 4GB` / `4096 MiB`) or `6g` (`CXMT 6GB` /
 `6144 MiB`). Resume within 120 seconds of the ready mailbox using the same
 receipt and its `.sha256` sidecar. The runner checks the sealed receipt,
-capture generation, identity, epoch and mailbox before loading the payload.
+capture generation, the uninterrupted Entry 1 log window, identity, epoch
+and mailbox before loading the payload. The range must begin and end on
+line boundaries, and the strap must precede the size.
 Failure, expiry and completion all end the transaction; a receipt is not
 replayable.
 
 Resume records the Entry 2 ACK separately from its watchdog reconnect.
+Only a verified reconnect or explicit post-ACK device loss permits serial
+confirmation; reconnect refusal, ACK failure, timeout and generic I/O do not.
 Reconnect alone does not confirm handover. To verify the closed serial
 window offline, without another FEL command:
 
@@ -63,8 +69,9 @@ The registered log for `3-3.4` is `2026-11-18-1725-4g-luckfox.log`; for
 `3-6` it is `2026-11-18-1725-6g-luckfox.log`, both under
 `~/src/radxa-a7a/serial-logs/`. No tty or pty is opened. Each cursor records
 device, inode, offset and SHA256 of the last 4 KiB before that offset (all
-available earlier bytes if shorter). Reads reject a changed inode, a size
-below the cursor or a changed prefix, including detectable copytruncate and
+available earlier bytes if shorter). Reads preserve the original anchor and
+advance a second anchor at each observed EOF. A changed inode, shrink below
+either cursor, or changed prefix invalidates the attempt, including detectable copytruncate and
 regrowth. Entry 2 begins its serial window at the first host cursor captured
 after the ACK. Only bytes before that window's recorded end count. One RVBAR
 for `00000000:40000000` must precede `main>`. Reset/failure/refusal markers,
@@ -79,6 +86,20 @@ observable from these long-lived regular files. This is not a producer
 generation or a firmware attempt token; a separate per-boot identity gate
 still applies to all cached runs.
 
+## Recovery
+
+A failed reconnect's pending state is evidence, not a restart token.
+Preserve the state, receipt and original logs. Do not replay Entry 2 or
+reuse that state. After the failed operation has ended, establish the
+board's current state through the bench's authorized recovery procedure;
+begin a new run on the same physical port with a fresh state and receipt.
+Use the WDT helper only for an authorized recovery, not as an automatic retry.
+
+If a serial log was replaced or renamed during the attempt, do not redirect
+the old receipt or move the file back to splice evidence. Preserve the old
+capture; reestablish the board's registered capture path and start a fresh
+preflight once authorized.
+
 ## Exit classes
 
 The receipt retains the selector's original exit. A nonzero selector exit
@@ -92,9 +113,9 @@ window; no other selector failure is treated as handover.
 | 2 | Invalid input or unready receipt or mailbox | `2` usage |
 | 3 | Serial handover unconfirmed | An ACK or reconnect alone is insufficient |
 | 4 | Device lost before a submission was ACKed | `66` |
-| 5 | Device lost after an ACKed submission; no successful reconnect | `66`, or no new enumeration |
+| 5 | Explicit device loss after an ACKed submission | `66` |
 | 6 | ACK failure | `65` malformed or `76` rejected |
-| 7 | Timeout with a live child; child reaped before return | Host deadline |
-| 8 | Identity refusal | `125`, or invalid A733 identity/epoch |
+| 7 | Timeout with a live child; process group canceled and reaped, or a kernel-stuck transfer retains the lease | Host deadline |
+| 8 | Identity refusal | `125`, invalid A733 identity/epoch, or old devnum never changed |
 | 9 | Port already leased | Local lease refusal |
 | 10 | Transfer/setup I/O or unexpected selector exit | `74`, signal, or unrecognized exit |

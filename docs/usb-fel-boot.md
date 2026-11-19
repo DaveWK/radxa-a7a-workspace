@@ -130,8 +130,17 @@ not a build record.
 
 ### Boot protocol reference for the session runner
 
-These describe the workspace boot protocol. Use `make fel-boot` or the
-reviewed session launcher rather than running the selector by hand.
+This is a separate workspace **maintenance** path for a freshly built
+bundle with a local build manifest. It uses the port, verified build record
+and the board-sized mailbox, not an operator-cleared Entry 1 identity
+range. Keep it out of cached-board briefs: cached sets must always use
+the two-stage runner with their per-boot serial identity gate.
+
+Build the receipt-verified selector with `make xfel` and the selected bundle
+with `make fel-image` first. Use the same mode and profile for `make fel-boot`,
+and set `FEL_PORT` plus `FEL_SERIAL_LOG` (the registered regular capture
+file named in [the session guide](fel-session.md#capture-boundaries)).
+For example, `FEL_PORT="$port" FEL_SERIAL_LOG="$log" make fel-boot DRAM_MHZ=1200`.
 
 1. **Stage and validate**: copy the bundle into a private directory (mode
    0700). Hash the staged bt0 and use that digest to look up the local build
@@ -208,13 +217,14 @@ vary by board and build). With the default DRAM driver the init line names
 
 ## Recovery
 
-- Anything stuck: **unplug and replug USB-C** (a power cycle). With no
+- If recovery requires a power cycle, ask the bench operator. With no
   bootable SD card the board comes back in FEL.
 - If bt0 prints `no warm reset 1 s after the request`, its watchdog resets
   the board back into FEL about 16 s later.
 - A refusal at entry 2 leaves the board in FEL: fix the images and run
   the reviewed session runner again (entry 1 has to run again after a power
-  cycle; the runner is held on task-000141).
+  cycle). [Session recovery](fel-session.md#recovery) also covers failed
+  reconnects and a replaced capture log.
 - Nothing in this flow writes the SD card, the SPI NOR flash or the eFuses.
 
 ## Images

@@ -142,17 +142,40 @@ class SessionTests(Fixture):
         with self.assertRaisesRegex(ValueError, "expired"):
             M["bounded_identity_time"](100, 221)
 
-    def test_timed_out_live_child_retains_lease(self):
+    def test_byte_drip_does_not_extend_absolute_deadline(self):
+        class Drip:
+            now = 100
+            timeouts = []
+
+            def settimeout(self, seconds):
+                self.timeouts.append(seconds)
+
+            def recv(self, _):
+                self.now += 1
+                return b"x"
+
+        conn = Drip()
+        with patch("time.monotonic", side_effect=lambda: conn.now):
+            with self.assertRaises(TimeoutError):
+                M["receive_request"](conn, 103)
+        self.assertEqual(conn.timeouts, [3, 2, 1])
+
+    def test_hung_grandchild_is_terminated_and_reaped_before_release(self):
         child = self.root / "selector"
         alive, done = self.root / "alive", self.root / "done"
         child.write_text(
             "#!/usr/bin/python3 -I\n"
+            "import os, signal\n"
             "from pathlib import Path\n"
-            "from time import monotonic, sleep\n"
-            f"Path({str(alive)!r}).touch()\n"
-            "deadline = monotonic() + 5\n"
-            f"while not Path({str(done)!r}).exists() and monotonic() < deadline:\n"
-            "    sleep(0.01)\n"
+            "from time import sleep\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            f"    Path({str(alive)!r}).write_text(str(os.getpid()))\n"
+            f"    while not Path({str(done)!r}).exists():\n"
+            "        sleep(0.02)\n"
+            "else:\n"
+            "    os.waitpid(pid, 0)\n"
         )
         child.chmod(0o700)
         exit_codes = []
@@ -163,7 +186,7 @@ class SessionTests(Fixture):
                     PORT, self.root / "state", {}, fd, M["Selector"](child)
                 )
                 try:
-                    session.run("unused", timeout=0.02)
+                    session.run("unused", timeout=0.8)
                 except M["SessionError"] as exc:
                     exit_codes.append(exc.code)
 
@@ -174,7 +197,6 @@ class SessionTests(Fixture):
             while not alive.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(alive.exists())
-            time.sleep(0.05)
             self.assertTrue(worker.is_alive())
             with self.assertRaises(M["SessionError"]) as caught:
                 with M["lease"](PORT):
@@ -182,6 +204,11 @@ class SessionTests(Fixture):
             self.assertEqual(caught.exception.code, EXIT.LEASE)
             with M["lease"]("3-6"):
                 pass
+            pid = int(alive.read_text())
+            worker.join(timeout=4)
+            self.assertFalse(worker.is_alive())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
         finally:
             done.touch()
             worker.join(timeout=6)
@@ -227,24 +254,61 @@ class SerialTests(Fixture):
         with self.assertRaisesRegex(ValueError, "generation changed"):
             self.serial.interval(cursor)
 
+    def test_rolling_eof_detects_rewrite_and_stepped_shrink(self):
+        cursor = self.serial.capture()
+        self.append(RVBAR)
+        first, _, _ = self.serial.observe(cursor)
+        self.append(RESET)
+        second, _, _ = self.serial.observe(cursor, rolling=first)
+        self.log.write_bytes(self.prefix + RVBAR)
+        self.assertGreater(self.log.stat().st_size, cursor["start"])
+        with self.assertRaisesRegex(ValueError, "generation changed"):
+            self.serial.observe(cursor, rolling=second)
+        self.append(b"x" * len(RESET))
+        with self.assertRaisesRegex(ValueError, "generation changed"):
+            self.serial.observe(cursor, rolling=second)
+
+    def test_fstat_after_read_detects_shrink_above_start(self):
+        cursor = self.serial.capture()
+        self.append(RVBAR + PROMPT)
+        original = os.pread
+
+        def shrink(fd, size, offset):
+            data = original(fd, size, offset)
+            if offset == cursor["start"]:
+                self.log.write_bytes(self.prefix + RVBAR)
+            return data
+
+        with patch("os.pread", side_effect=shrink):
+            with self.assertRaisesRegex(ValueError, "generation changed"):
+                self.serial.observe(cursor)
+
     def test_marked_reset_and_split_attempts(self):
         first = self.serial.capture()
         self.append(RVBAR)
         first_end = self.log.stat().st_size
         second = self.serial.capture()
         self.append(PROMPT)
-        for cursor, end in ((first, first_end), (second, None)):
-            _, data = self.serial.interval(cursor, end=end)
-            self.assertFalse(M["handover_markers"](data))
+        _, data = self.serial.interval(first, end=first_end)
+        self.assertFalse(M["handover_markers"](data))
+        _, data = self.serial.interval(second)
+        with self.assertRaisesRegex(ValueError, "main> appeared before"):
+            M["handover_markers"](data)
         for data in (
             RVBAR + RESET + PROMPT,
             RVBAR + RVBAR + PROMPT,
+            PROMPT + b"\n" + RVBAR + PROMPT,
+            RVBAR + PROMPT + b"\n[bt0] RVBAR 00000000:50000000",
+            b"[bt0] RVBAR 00000000:50000000\n" + RVBAR + PROMPT,
+            RVBAR + PROMPT + b"\n[bt0] RVBAR 00000000:40000000",
             # Reuse the actual marker sequence from 139's red-serial fixture.
             b"[bt0] RVBAR 00000000:40000000\n"
             b"[bt0] FEL: halted; back to FEL (state 0xe2)\nmain>\n",
         ):
             with self.assertRaises(ValueError):
                 M["handover_markers"](data)
+        announcement = b"[bt0] done in 8 ms, warm reset into AArch64 at 0x40000000\n"
+        self.assertTrue(M["handover_markers"](announcement + RVBAR + PROMPT))
 
     def test_offline_markers_without_ack_are_unconfirmed(self):
         cursor = self.serial.capture()
@@ -255,6 +319,7 @@ class SerialTests(Fixture):
             handover_cursor=cursor,
             handover_end_cursor=self.serial.capture(cursor),
             events=[],
+            reconnect=dict(outcome="verified", exit=0),
         )
         with self.assertRaises(M["SessionError"]) as caught:
             M["verify_attempt"](record)

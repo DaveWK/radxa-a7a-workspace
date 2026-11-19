@@ -2,14 +2,19 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Exercise the stateless selector with fake sysfs and a fake transport."""
 
+import ctypes
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -38,12 +43,17 @@ class SelectorTests(unittest.TestCase):
         self.tool.parent.mkdir(parents=True)
         self.tool.write_text(
             "#!/usr/bin/python3 -I\n"
-            "import json, os, signal, sys\n"
+            "import json, os, signal, socket, sys\n"
             "if sys.argv[1:] == ['--help']:\n"
             "    print('xfel --port PATH --devnum N COMMAND ...')\n"
             "    sys.exit(0)\n"
             "with open(os.environ['COMMANDS'], 'a') as log:\n"
             "    print(json.dumps(sys.argv[1:]), file=log)\n"
+            "if sync := os.getenv('LEASE_SYNC'):\n"
+            "    with socket.socket(socket.AF_UNIX) as control:\n"
+            "        control.connect('\\0' + sync)\n"
+            "        control.sendall(f'{os.getpid()} {os.getppid()}\\n'.encode())\n"
+            "        control.recv(1)\n"
             "rc = int(os.environ.get('STATUS', '0'))\n"
             "if rc < 0: os.kill(os.getpid(), -rc)\n"
             "sys.exit(rc)\n"
@@ -62,7 +72,8 @@ class SelectorTests(unittest.TestCase):
             {
                 k: v
                 for k, v in os.environ.items()
-                if k not in ("XFEL", "EXPECT_XFEL_SHA256", "SUDO")
+                if k
+                not in ("XFEL", "EXPECT_XFEL_SHA256", "SUDO", "FEL_SESSION_LEASE_FD")
             },
             FEL_SYSFS_ROOT=str(self.sysfs),
             COMMANDS=str(self.log),
@@ -105,11 +116,10 @@ class SelectorTests(unittest.TestCase):
         )
 
     def test_discover_without_transport(self):
+        self.tool.rename(self.root / "offline-transport")
         for port, expected in (("3-6", "12\n"), ("3-3.4", "14\n")):
             self.assertEqual(
-                self.run_selector(
-                    "--discover", "--port", port, XFEL="nonexistent"
-                ).stdout,
+                self.run_selector("--discover", "--port", port).stdout,
                 expected,
             )
         self.assertFalse(self.log.exists())
@@ -225,6 +235,66 @@ class SelectorTests(unittest.TestCase):
                 self.dispatch(
                     rc=status if status >= 0 else 128 - status, STATUS=str(status)
                 )
+
+    def test_live_transfer_retains_lease_after_both_parents_die(self):
+        # Adopt the two synthetic descendants after killing their parents,
+        # so the fixture reaps them rather than leaving them to system init.
+        libc = ctypes.CDLL(None)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        self.addCleanup(libc.prctl, 36, 0, 0, 0, 0)
+        lock = self.root / "port.lock"
+        address = hashlib.sha256(os.fsencode(self.root)).hexdigest()
+        owner = (
+            "import fcntl, os, subprocess, sys\n"
+            "with open(sys.argv[1], 'a') as lock:\n"
+            "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+            "    fd = lock.fileno()\n"
+            "    with subprocess.Popen(sys.argv[2:], stdout=subprocess.DEVNULL,\n"
+            "        stderr=subprocess.DEVNULL, pass_fds=(fd,),\n"
+            "        env=os.environ | {'FEL_SESSION_LEASE_FD': str(fd)}) as selector:\n"
+            "        print(selector.pid, flush=True)\n"
+            "        selector.wait()\n"
+        )
+        command = [
+            self.scripts / "xfel-port",
+            "--port",
+            "3-6",
+            "--devnum",
+            "12",
+            "--",
+            "version",
+        ]
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind("\0" + address)
+            listener.listen()
+            listener.settimeout(5)
+            with subprocess.Popen(
+                [sys.executable, "-I", "-c", owner, lock, *command],
+                env=dict(self.env, LEASE_SYNC=address),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ) as proc:
+                control, _ = listener.accept()
+                with control, lock.open("a") as probe:
+                    control.settimeout(5)
+                    transfer, parent = map(int, control.recv(64).split())
+                    selector = int(proc.stdout.readline())
+                    self.assertEqual(parent, selector)
+                    proc.kill()
+                    proc.wait(timeout=5)
+                    os.kill(selector, signal.SIGKILL)
+                    self.assertEqual(os.waitpid(selector, 0)[0], selector)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        control.sendall(b"x")
+                        deadline = time.monotonic() + 5
+                        while not os.waitpid(transfer, os.WNOHANG)[0]:
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.01)
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_noop_prefix_refused(self):
         self.dispatch(rc=125, SUDO="/usr/bin/true")

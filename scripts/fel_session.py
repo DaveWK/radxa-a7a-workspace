@@ -4,6 +4,7 @@
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 from enum import IntEnum
 import fcntl
 import hashlib
@@ -14,6 +15,7 @@ import pwd
 import re
 import runpy
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -29,14 +31,14 @@ LOGS = {
 }
 PORT = re.compile(r"[1-9][0-9]*-[1-9][0-9]*(?:\.[1-9][0-9]*)*")
 EXACT_ID = re.compile(r"\bID=(0x[0-9a-fA-F]+)(?=\s|\(|$)")
-RVBAR = re.compile(rb"\[bt0\] RVBAR 00000000:40000000(?:[ \t,].*)?")
+RVBAR = re.compile(rb"\[bt0\] RVBAR(?:[ \t]|$)")
+EXPECTED_RVBAR = re.compile(rb"\[bt0\] RVBAR 00000000:40000000(?:[ \t,].*)?")
 MAIN = re.compile(rb"main>.*")
-BOUNDARY = re.compile(
-    rb"(?:\[bt0\].*\b(?:reset|failed|failure|refused|halted|panic)\b|"
-    rb"\[bt0\] DRAM: strap\b|\[bt0\] DRAM: [0-9]+ MiB|"
-    rb"oreboot .* bt0 \| Radxa Cubie A7A|panic:)",
+FAILURE = re.compile(
+    rb"(?:\[bt0\].*\b(?:reset|failed|failure|refused|halted|panic)\b|panic:)",
     re.I,
 )
+BOOT_BANNER = re.compile(rb"oreboot .* bt0 \| Radxa Cubie A7A")
 NORMAL_RESET = re.compile(
     rb"\[bt0\] done in [0-9]+ ms, warm reset into AArch64 at 0x40000000"
 )
@@ -157,26 +159,37 @@ class Serial:
         ):
             raise ValueError("serial capture generation changed")
 
-    def capture(self, prior=None):
-        with self.read_file() as (fd, st):
-            if prior is not None:
-                self.validate(fd, st, prior)
-            prefix = self.prefix(fd, st.st_size)
-            return dict(
-                port=self.port,
-                log=str(self.path),
-                device=st.st_dev,
-                inode=st.st_ino,
-                start=st.st_size,
-                prefix_sha256=sha(prefix),
-                starts_line=not prefix or prefix.endswith(b"\n"),
-            )
+    def anchor(self, fd, st):
+        prefix = self.prefix(fd, st.st_size)
+        return dict(
+            port=self.port,
+            log=str(self.path),
+            device=st.st_dev,
+            inode=st.st_ino,
+            start=st.st_size,
+            prefix_sha256=sha(prefix),
+            starts_line=not prefix or prefix.endswith(b"\n"),
+        )
 
-    def interval(self, cursor, start=None, end=None, *, closed=None):
+    def capture(self, prior=None, *, rolling=None):
         with self.read_file() as (fd, st):
-            self.validate(fd, st, cursor)
+            anchors = [anchor for anchor in (prior, rolling) if anchor is not None]
+            for anchor in anchors:
+                self.validate(fd, st, anchor)
+            eof = self.anchor(fd, st)
+            current = os.fstat(fd)
+            for anchor in (*anchors, eof):
+                self.validate(fd, current, anchor)
+            return eof
+
+    def observe(self, cursor, *, rolling=None, start=None, end=None, closed=None):
+        with self.read_file() as (fd, st):
+            anchors = [
+                anchor for anchor in (cursor, rolling, closed) if anchor is not None
+            ]
+            for anchor in anchors:
+                self.validate(fd, st, anchor)
             if closed is not None:
-                self.validate(fd, st, closed)
                 end = closed["start"]
             start = cursor["start"] if start is None else start
             end = st.st_size if end is None else end
@@ -184,27 +197,32 @@ class Serial:
                 raise ValueError("serial range outside the fresh capture window")
             if end - start > MAX_SERIAL:
                 raise ValueError("oversized serial range")
+            eof = self.anchor(fd, st)
             data = os.pread(fd, end - start, start)
             if len(data) != end - start:
                 raise ValueError("short serial read")
             current = os.fstat(fd)
-            self.validate(fd, current, cursor)
-            if closed is not None:
-                self.validate(fd, current, closed)
+            for anchor in (*anchors, eof):
+                self.validate(fd, current, anchor)
+        return eof, end, data
+
+    def interval(self, cursor, start=None, end=None, *, closed=None):
+        _, end, data = self.observe(cursor, start=start, end=end, closed=closed)
         return end, data
 
 
 def handover_markers(data):
     """Require one RVBAR then main>, with no intervening attempt boundary."""
     lines = [line.removesuffix(b"\r") for line in data.split(b"\n")]
-    rvbars = [i for i, line in enumerate(lines[:-1]) if RVBAR.fullmatch(line)]
+    rvbars = [i for i, line in enumerate(lines) if RVBAR.match(line)]
     if len(rvbars) > 1:
         raise ValueError("multiple RVBAR markers in one serial attempt")
     start = rvbars[0] if rvbars else len(lines)
-    end = next(
-        (i for i in range(start + 1, len(lines)) if MAIN.fullmatch(lines[i])),
-        len(lines),
-    )
+    if rvbars and not EXPECTED_RVBAR.fullmatch(lines[start]):
+        raise ValueError("unexpected RVBAR address or syntax in handover window")
+    end = next((i for i, line in enumerate(lines) if MAIN.fullmatch(line)), len(lines))
+    if end < len(lines) and end <= start:
+        raise ValueError("main> appeared before the RVBAR marker")
     earlier = lines[:end]
     planned = [i for i, line in enumerate(earlier) if NORMAL_RESET.fullmatch(line)]
     submits = [i for i, line in enumerate(earlier) if line == ENTRY_TWO]
@@ -213,7 +231,11 @@ def handover_markers(data):
         or len(submits) > 1
         or any(i >= start for i in planned + submits)
         or any(
-            BOUNDARY.search(line) and i not in planned for i, line in enumerate(earlier)
+            (FAILURE.search(line) and i not in planned)
+            or BOOT_BANNER.match(line)
+            or STRAP.fullmatch(line)
+            or SIZE.fullmatch(line)
+            for i, line in enumerate(earlier)
         )
     ):
         raise ValueError("serial reset or failure marker in the handover window")
@@ -229,29 +251,77 @@ class Selector:
         self.path = path or SCRIPTS / "xfel-port"
 
     def invoke(self, args, timeout, lease_fd):
-        env = os.environ
-        with subprocess.Popen(
+        # Orphaned descendants in the selector's process group are reparented
+        # here so cancellation can reap them as well as the direct child.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0):  # PR_SET_CHILD_SUBREAPER
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code))
+        child = subprocess.Popen(
             [self.path, *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             errors="replace",
-            env=env,
+            env=os.environ | {"FEL_SESSION_LEASE_FD": str(lease_fd)},
             pass_fds=(lease_fd,),
             start_new_session=True,
-        ) as child:
+        )
+        try:
+            out, err = child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            out, err = self.cancel(child)
+            return child.returncode, out, err, True
+        except BaseException:
+            self.cancel(child)
+            raise
+        else:
             try:
-                out, err = child.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                # The selector reaps its transfer child. Do not terminate just
-                # the selector and then release the lease under a live transfer.
-                out, err = child.communicate()
+                os.killpg(child.pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                out, err = self.cancel(child)
                 return child.returncode, out, err, True
-            except BaseException:
-                child.communicate()
-                raise
+        finally:
+            for stream in (child.stdout, child.stderr):
+                stream.close()
         return child.returncode, out, err, False
+
+    @staticmethod
+    def cancel(child):
+        out = err = ""
+        for sig, grace in ((signal.SIGTERM, 0.25), (signal.SIGKILL, 2.0)):
+            try:
+                os.killpg(child.pid, sig)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + grace
+            try:
+                out, err = child.communicate(timeout=grace)
+            except subprocess.TimeoutExpired:
+                continue
+            while True:
+                try:
+                    while os.waitpid(-child.pid, os.WNOHANG)[0]:
+                        pass
+                except ChildProcessError:
+                    pass
+                try:
+                    os.killpg(child.pid, 0)
+                except ProcessLookupError:
+                    return out, err
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.01, remaining))
+        # An uninterruptible kernel task may survive SIGKILL. The transfer
+        # inherits our lease and therefore still fences the port in this case.
+        raise SessionError(
+            Exit.LIVE_TIMEOUT,
+            "selector group did not drain after SIGKILL; any surviving transfer retains the port lease",
+        )
 
     def peers(self, target):
         # Purely telemetry. Nothing from this scan can authorize (or refuse)
@@ -319,13 +389,19 @@ class Session:
         self.record["calls"].append(event)
         try:
             rc, out, err, timed_out = self.selector.invoke(args, timeout, self.lease_fd)
+        except SessionError as exc:
+            event.update(
+                exit=None, error=str(exc), ended_ns=time.time_ns(), timed_out=True
+            )
+            raise
         except OSError as exc:
             event.update(exit=None, error=str(exc), ended_ns=time.time_ns())
             raise SessionError(Exit.TRANSPORT, f"cannot run selector: {exc}") from exc
         event.update(exit=rc, stderr=err, ended_ns=time.time_ns(), timed_out=timed_out)
         if timed_out:
             raise SessionError(
-                Exit.LIVE_TIMEOUT, "selector timed out; child reaped before returning"
+                Exit.LIVE_TIMEOUT,
+                "selector timed out; its process group was terminated and reaped",
             )
         if rc == SelectorExit.LOST:
             raise SessionError(
@@ -343,7 +419,9 @@ class Session:
         if rc == SelectorExit.IDENTITY:
             raise SessionError(Exit.IDENTITY, f"FEL identity refused: {err.strip()}")
         if rc == SelectorExit.USAGE:
-            raise SessionError(Exit.INPUT, f"selector usage: {err.strip()}")
+            raise SessionError(
+                Exit.INPUT, f"invalid selector invocation (caller bug): {err.strip()}"
+            )
         if rc == SelectorExit.IO:
             raise SessionError(
                 Exit.TRANSPORT, f"selector transfer or local I/O: {err.strip()}"
@@ -425,12 +503,14 @@ class Session:
                 devnum=self.state["devnum"], epoch=self.state["epoch"], pending=command
             )
 
-    def reconnect(self, seconds=60):
+    def reconnect(self, seconds=60, *, observe=None):
         if self.state is None or not self.state["pending"]:
             raise SessionError(Exit.IDENTITY, "no acknowledged reset is pending")
         deadline = time.monotonic() + seconds
         self.event("reconnect-attempt", devnum=self.state["devnum"])
         while True:
+            if observe is not None:
+                observe()
             try:
                 number = self.discover()
             except SessionError as exc:
@@ -446,7 +526,7 @@ class Session:
                     return
                 if time.monotonic() >= deadline:
                     raise SessionError(
-                        Exit.LOST_AFTER, "no fresh enumeration after submission"
+                        Exit.IDENTITY, "no fresh enumeration after submission"
                     )
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
@@ -470,21 +550,53 @@ def clear_identity(serial, cursor, clearance, board, expected_mb):
     if path != str(serial.path) or not match or not SHA256.fullmatch(want):
         raise ValueError("invalid identity clearance path, offsets or digest")
     start, end = map(int, match.groups())
-    _, data = serial.interval(cursor, start, end)
-    if sha(data) != want:
+    eof, _, window = serial.observe(cursor)
+    base = cursor["start"]
+    if not base <= start < end <= eof["start"]:
+        raise ValueError("identity range outside the fresh capture window")
+    lo, hi = start - base, end - base
+    if (
+        (lo and window[lo - 1] != 10)
+        or (not lo and not cursor["starts_line"])
+        or window[hi - 1] != 10
+    ):
+        raise ValueError("identity clearance requires complete serial line boundaries")
+    if sha(window[lo:hi]) != want:
         raise ValueError("identity clearance digest mismatch")
-    straps, sizes = [], []
-    for line in data.split(b"\n")[:-1]:
-        line = line.removesuffix(b"\r")
+    markers = []
+    banners = 0
+    offset = 0
+    for part in window.split(b"\n"):
+        line = part.removesuffix(b"\r")
+        line_end = offset + len(part) + 1
+        if (
+            FAILURE.search(line)
+            or RVBAR.match(line)
+            or MAIN.fullmatch(line)
+            or line == ENTRY_TWO
+        ):
+            raise ValueError("reset or failure in Entry 1 capture window")
+        if BOOT_BANNER.match(line):
+            banners += 1
+            if banners > 1 or markers:
+                raise ValueError("another boot in Entry 1 capture window")
         if line.startswith(b"[bt0] DRAM: strap"):
             match = STRAP.fullmatch(line)
-            straps.append(match[1] if match else None)
+            markers.append(("strap", match[1] if match else None, offset, line_end))
         if re.match(rb"\[bt0\] DRAM: [0-9]+ .*MiB", line):
             match = SIZE.fullmatch(line)
-            sizes.append(match[1] if match else None)
+            markers.append(("size", match[1] if match else None, offset, line_end))
+        offset = line_end
     name, size = BOARDS[board]
-    if straps != [name] or sizes != [size] or int(size) != expected_mb:
-        raise ValueError("serial does not contain one matching strap and size identity")
+    if (
+        [(kind, value) for kind, value, _, _ in markers]
+        != [("strap", name), ("size", size)]
+        or any(not lo <= first < last <= hi for _, _, first, last in markers)
+        or int(size) != expected_mb
+    ):
+        raise ValueError(
+            "serial does not contain one matching strap and size identity in order"
+        )
     return dict(board=board, start=start, end=end, sha256=want)
 
 
@@ -536,6 +648,30 @@ def send(stream, code, text):
     stream.flush()
 
 
+def remaining(deadline):
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise TimeoutError("preflight receipt expired (120 seconds)")
+    return seconds
+
+
+def receive_request(conn, deadline):
+    data = bytearray()
+    while len(data) < 16384:
+        conn.settimeout(remaining(deadline))
+        chunk = conn.recv(16384 - len(data))
+        if not chunk:
+            raise ValueError("incomplete resume request")
+        data.extend(chunk)
+        if b"\n" in data:
+            request, _, extra = data.partition(b"\n")
+            if extra:
+                raise ValueError("expected one resume request")
+            remaining(deadline)
+            return json.loads(request)
+    raise ValueError("oversized resume request")
+
+
 def state_hash(session):
     try:
         data = session.path.read_bytes()
@@ -582,17 +718,31 @@ def cached_resume(request, receipt, session, serial, cached, work):
         record["handover_cursor"] = serial.capture(cursor)
     except (OSError, ValueError) as exc:
         raise SessionError(Exit.SERIAL_UNCONFIRMED, str(exc)) from exc
-    try:
-        session.reconnect()
-    except SessionError:
-        # Keep the reconnect exit even if the serial capture also fails.
+    rolling = record["handover_cursor"]
+
+    def observe():
+        nonlocal rolling
         try:
-            close_handover(serial, record)
+            rolling = serial.capture(record["handover_cursor"], rolling=rolling)
         except (OSError, ValueError) as exc:
-            record["handover_capture_error"] = str(exc)
-        raise
+            raise SessionError(Exit.SERIAL_UNCONFIRMED, str(exc)) from exc
+
     try:
-        close_handover(serial, record)
+        session.reconnect(observe=observe)
+    except SessionError as problem:
+        record["reconnect"] = dict(
+            outcome="lost" if problem.code == Exit.LOST_AFTER else "refused",
+            exit=int(problem.code),
+        )
+        if problem.code == Exit.LOST_AFTER:
+            try:
+                close_handover(serial, record, rolling)
+            except (OSError, ValueError) as exc:
+                record["handover_capture_error"] = str(exc)
+        raise
+    record["reconnect"] = dict(outcome="verified", exit=int(Exit.SUCCESS))
+    try:
+        close_handover(serial, record, rolling)
     except (OSError, ValueError) as exc:
         raise SessionError(Exit.SERIAL_UNCONFIRMED, str(exc)) from exc
     record["reconnect_epoch"] = session.state
@@ -600,8 +750,8 @@ def cached_resume(request, receipt, session, serial, cached, work):
     return Exit.SERIAL_UNCONFIRMED, record["handover"]
 
 
-def close_handover(serial, record):
-    end = serial.capture(record["handover_cursor"])
+def close_handover(serial, record, rolling):
+    end = serial.capture(record["handover_cursor"], rolling=rolling)
     record["handover_end"] = end["start"]
     record["handover_end_cursor"] = end
 
@@ -666,8 +816,8 @@ def guardian(args, reply):
             reply.close()
             deadline = record["entry_one_monotonic"] + IDENTITY_LIFETIME
             while True:
-                listener.settimeout(max(0.01, deadline - time.monotonic()))
                 try:
+                    listener.settimeout(remaining(deadline))
                     conn, _ = listener.accept()
                 except TimeoutError:
                     record.update(
@@ -682,22 +832,32 @@ def guardian(args, reply):
                     )
                     if uid != os.geteuid():
                         continue
-                    conn.settimeout(max(0.01, min(5, deadline - time.monotonic())))
-                    with conn.makefile("rwb") as stream:
-                        try:
-                            request = json.loads(stream.readline(16384))
-                            code, message = cached_resume(
-                                request, receipt, session, serial, cached, work
-                            )
-                        except (OSError, ValueError, KeyError, TypeError) as exc:
-                            code, message = getattr(exc, "code", Exit.INPUT), str(exc)
-                            if record["status"] == "resume-started":
-                                record.update(status="resume-refused", error=message)
-                        if record["status"] != "preflight-ready":
-                            record["resume_ended_ns"] = time.time_ns()
-                            receipt.save()
-                        send(stream, code, message)
-                        return
+                    request_received = False
+                    try:
+                        request = receive_request(conn, deadline)
+                        request_received = True
+                        code, message = cached_resume(
+                            request, receipt, session, serial, cached, work
+                        )
+                    except TimeoutError:
+                        code, message = (
+                            Exit.INPUT,
+                            "preflight receipt expired (120 seconds)",
+                        )
+                        record.update(status="resume-expired", error=message)
+                    except (OSError, ValueError, KeyError, TypeError) as exc:
+                        code, message = getattr(exc, "code", Exit.INPUT), str(exc)
+                        if record["status"] == "resume-started" or not request_received:
+                            record.update(status="resume-refused", error=message)
+                    if record["status"] != "preflight-ready":
+                        record["resume_ended_ns"] = time.time_ns()
+                        receipt.save()
+                    try:
+                        conn.settimeout(0.25)
+                        conn.sendall((json.dumps([int(code), message]) + "\n").encode())
+                    except OSError:
+                        pass
+                    return
 
 
 def start_guardian(args):
@@ -802,6 +962,14 @@ def verify_attempt(record):
         raise SessionError(
             Exit.SERIAL_UNCONFIRMED, "no matching Entry 2 submission ACK"
         )
+    if record.get("reconnect") not in (
+        dict(outcome="verified", exit=int(Exit.SUCCESS)),
+        dict(outcome="lost", exit=int(Exit.LOST_AFTER)),
+    ):
+        raise SessionError(
+            Exit.SERIAL_UNCONFIRMED,
+            "reconnect outcome does not permit serial confirmation",
+        )
     try:
         cursor = record["handover_cursor"]
         serial = Serial(record["port"], cursor["log"])
@@ -829,8 +997,9 @@ def cli(entrypoint):
 
 def wait_for_handover(serial, cursor, record, seconds=10):
     deadline = time.monotonic() + seconds
+    rolling = None
     while True:
-        end, data = serial.interval(cursor)
+        rolling, end, data = serial.observe(cursor, rolling=rolling)
         record["handover_end"] = end
         if handover_markers(attempt_lines(cursor, data)):
             record["handover_sha256"] = sha(data)

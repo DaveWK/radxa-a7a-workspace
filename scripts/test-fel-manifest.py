@@ -1199,6 +1199,7 @@ class GateTests(unittest.TestCase):
         runner = self.root / "session-fixture"
         scripts = runner / "scripts"
         scripts.mkdir(parents=True)
+        shutil.copy2(SOURCE / "Makefile", runner)
         for name in (
             "fel_session.py",
             "fel-boot.sh",
@@ -1209,23 +1210,22 @@ class GateTests(unittest.TestCase):
         ):
             shutil.copy2(SOURCE / "scripts" / name, scripts)
         shutil.copytree(SOURCE / "scripts/lib", scripts / "lib")
-        module = scripts / "fel_session.py"
-        source = module.read_text()
-        host_home = "Path(pwd.getpwuid(os.geteuid()).pw_dir)"
-        self.assertEqual(source.count(host_home), 1)
-        module.write_text(
-            source.replace(host_home, "Path.home()").replace(
-                "cursor, record, seconds=10", "cursor, record, seconds=0.1"
-            )
-        )
+        python = runner / "python3"
+        shutil.copy2(SOURCE / "scripts/tests/fel-session-python", python)
+        python.chmod(0o700)
         selector = scripts / "xfel-port"
         selector.write_text(SESSION_SELECTOR)
         selector.chmod(0o700)
         serial = self.root / "src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
         serial.parent.mkdir(parents=True)
+        lease_home = runner / "lease-home"
+        lease_home.mkdir()
         env = dict(
             self.env,
+            PATH=f"{runner}:{self.env['PATH']}",
             HOME=str(self.root),
+            FEL_FIXTURE_HOME=str(lease_home),
+            FEL_FIXTURE_SHORT_SERIAL="1",
             FEL_SERIAL_LOG=str(serial),
             EXPECT_WORKSPACE=str(self.workspace),
             EXPECT_OREBOOT=str(self.oreboot),
@@ -1238,6 +1238,7 @@ class GateTests(unittest.TestCase):
         shutil.copytree(
             self.workspace / "out/fel/.records", runner / "out/fel/.records"
         )
+        shutil.copytree(bundle, runner / "out/fel/blobfree-1200")
         for case, expected in (
             ("normal", 0),
             ("offline", 0),
@@ -1255,13 +1256,19 @@ class GateTests(unittest.TestCase):
                 )
                 serial.write_text("[bt0] RVBAR 00000000:40000000, stale\nmain>\n")
                 proc = subprocess.run(
-                    [scripts / "fel-boot.sh", bundle],
+                    ["make", "--no-print-directory", "fel-boot", "DRAM_MHZ=1200"],
+                    cwd=runner,
                     env=dict(env, SESSION_CASE=case, SESSION_MEMORY=str(memory)),
                     capture_output=True,
                     text=True,
                     timeout=20,
                 )
-                self.assertEqual(proc.returncode, expected, self.process_result(proc))
+                self.assertEqual(
+                    proc.returncode, 2 if expected else 0, self.process_result(proc)
+                )
+                if expected:
+                    self.assertIn(f"Error {expected}", proc.stderr)
+                self.assertIn("EXPECT_MODE=blobfree EXPECT_PROFILE=1200", proc.stdout)
                 self.assertEqual(
                     "confirmed by fresh serial" in proc.stdout, expected == 0
                 )

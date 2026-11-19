@@ -1,0 +1,39 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-only
+"""Fixture Python launcher. Run unmodified session code in a synthetic home."""
+
+from functools import partial
+import os
+from pathlib import Path
+import runpy
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+
+flag, module, *args = sys.argv[1:]
+assert flag == "-I"
+path = Path(module)
+if path.name != "fel_session.py":
+    os.execv(sys.executable, [sys.executable, flag, module, *args])
+sys.argv = [module, *args]
+home = Path(os.environ["FEL_FIXTURE_HOME"]).resolve(strict=True)
+assert home.is_relative_to(path.resolve().parents[1])
+with patch("pwd.getpwuid", return_value=SimpleNamespace(pw_dir=str(home))):
+    entry = runpy.run_path(module)
+    namespace = entry["main"].__globals__
+    if os.getenv("FEL_FIXTURE_SHORT_SERIAL"):
+        namespace["wait_for_handover"] = partial(
+            entry["wait_for_handover"], seconds=0.1
+        )
+    if lifetime := os.getenv("FEL_FIXTURE_LIFETIME"):
+        namespace["IDENTITY_LIFETIME"] = float(lifetime)
+    if os.getenv("FEL_FIXTURE_TIMEOUT"):
+        invoke = entry["Selector"].invoke
+
+        def shorter(self, argv, timeout, lease_fd):
+            if argv[-1] == "version" and argv[3] == "22":
+                timeout = 0.35
+            return invoke(self, argv, timeout, lease_fd)
+
+        entry["Selector"].invoke = shorter
+    entry["cli"](entry["cached_main"] if args[:1] == ["--stage"] else entry["main"])

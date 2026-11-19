@@ -98,7 +98,7 @@ Fedora 45 host with the packages in `Containerfile`; there
 | `make firmware` | `out/firmware/firmware.bin` + `firmware.seek`: bt0, layout table, main, EDK2 (with the DTB), for the SD card or the eMMC at sector 256 |
 | `make fel-image` | `out/fel/<mode>-<mhz>/` (`blobfree-1200`, `blobfree-2400`, `dramlib-2400`, `phyfw-2400`): `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and `build-manifest.json`; intermediates and the cargo target under `build/` |
 | `make xfel` | `out/tools/xfel`: xfel v1.4.0 built from source with a 60 s USB timeout |
-| `make fel-boot` | refuses until task-000141 supplies the FEL session runner |
+| `make fel-boot` | workspace maintenance boot of the selected bundle; requires `FEL_PORT` and `FEL_SERIAL_LOG` |
 | `make rpms` | `out/fedora/rpmbuild/`: the `cubie-a7a-*` SRPMs and RPMs |
 | `make fedora-image` | `out/image/a7a-fedora45.img`: GPT, `firmware.bin` at sector 256, ESP, Fedora 45 root (grows to the card on first boot) |
 | `make serial` | UART0 logger: picocom in a detached screen session, logs in `serial-logs/` |
@@ -117,9 +117,11 @@ are generated on first boot). Change the password on first login.
 
 ## Boot it
 
-**USB FEL boot** is held until task-000141. The host selector API and exit
-codes are in [docs/usb-fel-boot.md](docs/usb-fel-boot.md). You can build the
-selector with `make xfel` without a board.
+**USB FEL boot:** use the two-stage runner for cached-board briefs. For
+workspace maintenance, build with `make xfel` and `make fel-image` before
+using `make fel-boot` with `FEL_PORT` and the registered `FEL_SERIAL_LOG`.
+The selector and maintenance procedure are in
+[docs/usb-fel-boot.md](docs/usb-fel-boot.md).
 
 **SD card**: write `out/image/a7a-fedora45.img` to a microSD card, or write
 only `out/firmware/firmware.bin` at sector 256 of an existing card. See
