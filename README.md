@@ -98,7 +98,7 @@ Fedora 45 host with the packages in `Containerfile`; there
 | `make firmware` | `out/firmware/firmware.bin` + `firmware.seek`: bt0, layout table, main, EDK2 (with the DTB), for the SD card or the eMMC at sector 256 |
 | `make fel-image` | `out/fel/<mode>-<mhz>/` (`blobfree-1200`, `blobfree-2400`, `dramlib-2400`, `phyfw-2400`): `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and `build-manifest.json`; intermediates and the cargo target under `build/` |
 | `make xfel` | `out/tools/xfel`: xfel v1.4.0 built from source with a 60 s USB timeout |
-| `make fel-boot` | workspace maintenance boot of the selected bundle; requires `FEL_PORT` and `FEL_SERIAL_LOG` |
+| `make fel-boot` | workspace maintenance boot of the selected bundle; requires `FEL_PORT`, `FEL_SERIAL_LOG`, and `A7A_SERIAL_LOG_DIR` (an absolute, canonical, existing directory; no default) |
 | `make rpms` | `out/fedora/rpmbuild/`: the `cubie-a7a-*` SRPMs and RPMs |
 | `make fedora-image` | `out/image/a7a-fedora45.img`: GPT, `firmware.bin` at sector 256, ESP, Fedora 45 root (grows to the card on first boot) |
 | `make serial` | UART0 logger: picocom in a detached screen session, logs in `serial-logs/` |
@@ -130,7 +130,11 @@ are generated on first boot). Change the password on first login.
 
 **USB FEL boot:** use the two-stage runner for cached-board briefs. For
 workspace maintenance, build with `make xfel` and `make fel-image` before
-using `make fel-boot` with `FEL_PORT` and the registered `FEL_SERIAL_LOG`.
+using `make fel-boot` with `FEL_PORT`, `A7A_SERIAL_LOG_DIR`, and
+`FEL_SERIAL_LOG`. Set `A7A_SERIAL_LOG_DIR` to the absolute, canonical path
+of the existing serial-log directory. There is no default; the runner
+refuses if the directory is unset or invalid. Set `FEL_SERIAL_LOG` to the
+full path to the port's fixed log filename in that directory.
 The selector and maintenance procedure are in
 [docs/usb-fel-boot.md](docs/usb-fel-boot.md).
 
