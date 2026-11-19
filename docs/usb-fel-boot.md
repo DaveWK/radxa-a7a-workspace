@@ -43,20 +43,43 @@ Check with `lsusb -d 1f3a:efe8`.
 
 `make fel-image` builds one bundle for the current DRAM mode and profile into
 `out/fel/<mode>-<mhz>/` (`blobfree-1200` by default, `blobfree-2400` with
-`DRAM_MHZ=2400`, `dramlib-2400` with `VENDOR_DRAM=yes`). The intermediates
-and the cargo target stay under `out/fel/<mode>-<mhz>/build/`; the bundle
-holds `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and
-`build-manifest.json`.
+`DRAM_MHZ=2400`, `dramlib-2400` with `VENDOR_DRAM=yes` and `phyfw-2400`
+with `VENDOR_DRAM=phyfw`). The bundle holds `bt0-fel.bin`, `firmware.bin`,
+`firmware.seek` and `build-manifest.json`.
+
+**Threat model:** the gate protects against accidents on a single-user
+bench host: stale, mixed, mislabelled or env-contaminated builds being
+booted as blob-free, and measurement builds being booted without a
+recorded human authorization. It does not defend against a malicious
+local user who can edit the scripts or the local records.
+
+`make fel-image` captures the full, clean workspace and oreboot commit
+identities before compiling and rechecks both after. It rejects inherited
+`A7A_*` and `A733_*` variables in all modes; use the separate lab tooling
+for knob experiments. In a blob-free build the same `DRAM_MHZ` (default
+1200) selects the slot, Cargo's `A7A_PROFILE` and the reported profile.
+Measurement builds require `DRAM_MHZ` to be unset and do not pass
+`A7A_PROFILE` to Cargo; the mode fixes the profile at 2400.
+
+Compilation and the packaging snapshot use private directories under the
+slot's `build/` directory. EDK2 embeds the private copy of the DTB. EDK2
+builds serialize access to the shared checkout with `out/.edk2-build.lock`.
+Only the verified build publishes a record at
+`out/fel/.records/<bt0_fel_sha256>.json`, separate from the bundle. It
+records the mode, profile, features, sources, effective build knobs and
+the intermediate and packaged digests. Rebuild old bundles: a manifest
+alone is not a build record.
 
 `make fel-boot` runs `scripts/fel-boot.sh out/fel/<mode>-<mhz>` with
 `XFEL=out/tools/xfel` and `EXPECT_PROFILE=<mhz>`. The steps:
 
-1. **Stage and validate**: copy the bundle into a private directory under
-   `out/` (mode 0700), then check the copies with `scripts/fel-check.py`
-   before any USB access. The manifest must say `blobfree`, carry 40-hex
-   workspace and oreboot SHAs equal to the current `HEAD`s, a clean flag, the
-   requested profile, and SHA-256 values matching the staged files. The
-   staging directory is removed on exit; xfel sees only the staged paths.
+1. **Stage and validate**: copy the bundle into a private directory (mode
+   0700). Hash the staged bt0 and use that digest to look up the local build
+   record. The record, not the manifest, determines the mode and profile.
+   The current `HEAD`s, requested profile, bundle manifest and staged file
+   digests must agree with the record. Check the layout table, payload CRCs
+   and FEL window before probing USB. Staging is removed on exit; xfel sees
+   only the staged bytes.
 2. **Check** that the FEL device is an A733 (`xfel version`, ID `0x00190300`).
 3. **Load bt0**: clear the mailbox at `0xdf000`, write the staged
    `bt0-fel.bin` (bt0 built with feature `fel`, linked at `0x90000`) and read
@@ -80,16 +103,17 @@ holds `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and
 
 A `dramlib` or `phyfw` bundle is a measurement build. A plain `make fel-boot`
 refuses it. To boot one, write an authorization file naming the exact
-`bt0_fel_sha256` from the bundle's `build-manifest.json` and a human
-authorization reference (a DECISIONS date and a queue key), then:
+`bt0_fel_sha256` from the local build record and a human authorization
+reference (a DECISIONS date and a queue key), then use the same measurement
+mode as the build; for example:
 
-    make fel-boot FEL_MEASUREMENT_AUTH=/path/to/auth.json
+    make fel-boot VENDOR_DRAM=yes FEL_MEASUREMENT_AUTH=/path/to/auth.json
 
 The file records a human authorization; it grants nothing by itself. The
 script checks that the staged bt0's digest matches the file and prints the
 reference. `EXPECT_SOURCE_SHA`/`EXPECT_OREBOOT_SHA` override the SHAs the
-manifest must match (for example to replay an older bundle); they do not
-authorize a measurement build.
+record must match (for example to replay an older bundle with its retained
+local record); they do not authorize a measurement build.
 
 Build options: `DRAM_MHZ=1200|2400` (the DRAM clock of our own DRAM driver,
 which is the default; 1200 unless set), `VENDOR_DRAM=yes` (the vendor DRAM
