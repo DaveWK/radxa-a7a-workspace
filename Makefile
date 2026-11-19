@@ -51,7 +51,14 @@ FWREPO      ?= none
 
 CARGO   := env -u RUSTUP_TOOLCHAIN -u RUSTFLAGS cargo
 OBJCOPY ?= llvm-objcopy
-BT0_MAX_BYTES := 262144
+# The longest bt0 the image tool wraps: 0x4a000 bytes, the length of the
+# vendor boot0 the mask ROM loads from this board's cards (scripts/mkimage.py
+# EGON_MAX). An earlier limit of 0x40000 belonged to bt0's hand-over to a
+# vendor SPL after a failed boot (larger images had not come back through
+# it); bt0 has no such hand-over any more, and with the vendor DRAM library
+# it is larger than 0x40000. Image, bss and stack are bounded separately by
+# bt0's linker script.
+BT0_MAX_BYTES := 303104
 DRAM_LIB_OVERRIDES := dwc_ddrphy_phyinit_G_execFW mctl_com_set_controller_after_phy \
 	lp5_sw_mr_wr lp5_sw_mr_rd \
 	lpddr4_phyinit_D_loadIMEM lpddr4_phyinit_F_loadDMEM lpddr4_phyinit_I_loadPIEImage
@@ -80,7 +87,7 @@ LIBDRAM_DEP = $(if $(filter yes,$(BLOBLESS)),,$(LIBDRAM_A))
 
 define check-bt0-size
 	@s=$$(stat -c %s $(1)); if [ $$s -gt $(BT0_MAX_BYTES) ]; then \
-		echo "$(1): $$s bytes, above the 0x40000 limit"; exit 1; fi; \
+		echo "$(1): $$s bytes, above the $(BT0_MAX_BYTES) byte limit"; exit 1; fi; \
 	echo "$(1): $$s bytes (limit $(BT0_MAX_BYTES))"
 endef
 

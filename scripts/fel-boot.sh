@@ -115,7 +115,7 @@ open(f"{work}/table.bin", "wb").write(frame)
 names = {1: "main", 2: "edk2-fd", 3: "dtb"}
 for i in range(count):
     kind, flags, off, n, load, crc32, _ = struct.unpack_from("<IIIIQII", frame, 24 + 32 * i)
-    if kind not in names:      # 4: vendor SPL, recovery only; never loaded
+    if kind not in names:      # 4: a vendor SPL in older images; never loaded
         continue
     data = fw[off - base:off - base + n]
     if len(data) != n:
