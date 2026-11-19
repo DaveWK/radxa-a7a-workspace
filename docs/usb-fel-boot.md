@@ -305,7 +305,7 @@ tracked files are refused. Initialized nested submodules must pass the same
 checks at their parent's gitlink. Optional uninitialized gitlinks must be
 empty; the record distinguishes them from verified checkouts.
 
-At the pinned `439613accf` oreboot has no gitlinks. EDK2's
+The workspace's pinned oreboot tree contains no gitlinks. EDK2's
 `BaseTools/Source/C/GNUmakefile` builds BrotliCompress from its `brotli`
 submodule; `build-edk2.sh` requires BaseFdtLib's `libfdt`. The board DSC
 maps BaseFdtLib and ArmTransferListLib, whose INFs use `libfdt` and `libtl`,
