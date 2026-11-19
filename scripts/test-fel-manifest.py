@@ -1137,8 +1137,8 @@ class GateTests(unittest.TestCase):
                 self.refusal(self.boots(EXPECT_XFEL_SHA256=expectation))
 
     def test_mailbox_port_refusal_is_not_handover_evidence(self):
-        self.build()
-        proc = self.boots(FAKE_UNPLUG_AFTER_ENTRY2="1")
+        bundle = self.build()
+        proc = self.run_boot("script", bundle, FAKE_UNPLUG_AFTER_ENTRY2="1")
         self.assertEqual(proc.returncode, 125, self.process_result(proc))
         self.assertNotIn("bt0 is past the checks", proc.stdout)
 
