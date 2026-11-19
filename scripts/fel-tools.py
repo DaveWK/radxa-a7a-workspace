@@ -87,11 +87,21 @@ def verify_tools(edk2):
 
 def config_receipt(edk2):
     conf = edk2 / "Conf"
-    target = (conf / "target.txt").read_bytes()
     names = {"TOOL_CHAIN_CONF": "tools_def.txt", "BUILD_RULE_CONF": "build_rule.txt"}
+    files = {
+        name: (conf / name).read_bytes() for name in ("target.txt", *names.values())
+    }
+    # edk2 556dcfb, BaseTools/Source/Python/Common/ToolDefClassObject.py:
+    # 106-117,122-150 strips lines, expands !include macros and recursively
+    # searches the workspace, package paths and including directory. A gated
+    # build admits only the three direct Conf files; check the bytes we hash.
+    for name, data in files.items():
+        for line in data.decode().splitlines():
+            if line.lstrip().lower().startswith("!include"):
+                raise ValueError(f"{name}: !include is not allowed in gated Conf files")
     # Pin the effective files. EDK2 first looks for Conf/Conf/foo and then
     # falls back to Conf/foo for the stock Conf/foo target.txt setting.
-    for line in target.decode().splitlines():
+    for line in files["target.txt"].decode().splitlines():
         key, sep, value = line.strip().partition("=")
         if sep and (name := names.get(key.strip())):
             value = value.strip().replace("\\", "/")
@@ -104,8 +114,7 @@ def config_receipt(edk2):
     return {
         "basetools_stamp_sha256": verify_tools(edk2),
         "conf_sha256": {
-            "target.txt": hashlib.sha256(target).hexdigest(),
-            **{name: digest(conf / name) for name in names.values()},
+            name: hashlib.sha256(data).hexdigest() for name, data in files.items()
         },
     }
 

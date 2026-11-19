@@ -1032,6 +1032,21 @@ class GateTests(unittest.TestCase):
         self.refusal(self.make("fel-image"), "BaseTools stamp mismatch")
         self.assertEqual(self.edk2_log.read_text(), "")
 
+    def test_edk2_conf_include_refused(self):
+        conf = self.edk2 / "Conf"
+        (conf / "local.txt").write_text("# local tool overrides\n")
+        for name in ("tools_def.txt", "target.txt", "build_rule.txt"):
+            with self.subTest(name=name):
+                path = conf / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"  \t!include local.txt\n")
+                try:
+                    self.refusal(self.make("fel-image"), f"{name}: !include")
+                    self.assertEqual(self.edk2_log.read_text(), "")
+                    self.assertFalse((self.workspace / "out/fel/.records").exists())
+                finally:
+                    path.write_bytes(original)
+
     def test_edk2_tool_and_conf_receipt(self):
         bundle = self.build()
         record = read_json(self.record(sha(bundle / "bt0-fel.bin")))
