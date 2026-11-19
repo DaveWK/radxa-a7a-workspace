@@ -25,6 +25,13 @@ static int fixture(const char *name)
 	return test && !strcmp(test, name);
 }
 
+static void mark_transfer_fault(void)
+{
+	static const char marker[] = "mock transfer fault\n";
+	if(getenv("USB_CASE_WITNESS"))
+		assert(write(STDOUT_FILENO, marker, sizeof(marker) - 1) == (ssize_t)(sizeof(marker) - 1));
+}
+
 int open(const char *path, int flags, ...)
 {
 	assert(!(flags & O_CREAT));
@@ -188,9 +195,15 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
 	*actual = len;
 	if(ep == 0x81) {
 		if(fixture("read-gone") && len == 28)
+		{
+			mark_transfer_fault();
 			return LIBUSB_ERROR_NO_DEVICE;
+		}
 		if(fixture("read-timeout") && len == 28)
+		{
+			mark_transfer_fault();
 			return LIBUSB_ERROR_TIMEOUT;
+		}
 		memset(buf, 0, len);
 		if(fixture("read-rejection-in-data") && len == 28)
 		{
@@ -205,7 +218,11 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
 				if(fixture("awus-short")) *actual = 12;
 				if(fixture("awus-long")) *actual = 14;
 				if(fixture("awus-overflow")) return LIBUSB_ERROR_OVERFLOW;
-				if(fixture("awus-bad-tail")) buf[12] = 1;
+				if(fixture("awus-bad-tail"))
+				{
+					mark_transfer_fault();
+					buf[12] = 1;
+				}
 			}
 		}
 		else if(len == 32) {
@@ -223,7 +240,10 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
 			   (ack_count == 2 && fixture("entry2-rejected")) ||
 			   (ack_count == 4 && fixture("wdt-rejected")) ||
 			   (ack_count == 2 && (fixture("read-rejected") || fixture("write-rejected"))))
+			{
+				mark_transfer_fault();
 				buf[4] = 1;
+			}
 			if(ack_count == 1 && fixture("version-short"))
 				*actual = 7;
 		} else assert(len == 28 || len == 4 || (len == 1 && fixture("awus-short")));

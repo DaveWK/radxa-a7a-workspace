@@ -108,6 +108,7 @@ def main(binary, red=False, round4_base=False, round5_base=False):
             permission_hint=None,
             quiet=None,
             output_opened=None,
+            broken_stderr=False,
         ):
             if output_error:
                 shell = shlex.join(["/fixture/xfel", *args]) + " >/dev/full"
@@ -128,16 +129,22 @@ def main(binary, red=False, round4_base=False, round5_base=False):
                     else ["/usr/bin/bash", "-c", shell]
                 ),
             ]
-            reader, writer = os.pipe() if closed_pipe else (None, None)
+            assert not (closed_pipe and broken_stderr)
+            reader, writer = os.pipe() if closed_pipe or broken_stderr else (None, None)
             if reader is not None:
                 os.close(reader)
+            env = os.environ | dict(USB_CASE=name)
+            if broken_stderr:
+                env["USB_CASE_WITNESS"] = "1"
+            else:
+                env.pop("USB_CASE_WITNESS", None)
             try:
                 proc = subprocess.run(
                     argv,
                     stdout=writer if closed_pipe else subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=writer if broken_stderr else subprocess.PIPE,
                     text=True,
-                    env=os.environ | dict(USB_CASE=name),
+                    env=env,
                 )
             finally:
                 if writer is not None:
@@ -148,6 +155,10 @@ def main(binary, red=False, round4_base=False, round5_base=False):
                 proc.stdout,
                 proc.stderr,
             )
+            if broken_stderr:
+                assert proc.stdout == "mock transfer fault\n", (name, proc.stdout)
+                print(f"PASS broken-stderr/{name} exit={rc} transfer_fault=True")
+                return
             lines = proc.stderr.splitlines()
             assert [s for s in lines if s.startswith("mock fd ")] == (
                 [] if opened is None else [f"mock fd {opened}"]
@@ -337,6 +348,14 @@ def main(binary, red=False, round4_base=False, round5_base=False):
         run("selected-6", selected, 0, 12, True, version=True)
         framing_and_io(False)
         quiet_bulk_and_output(False)
+        read = [*prefix, "read", "0xdf000", "28", "/dev/null"]
+        for name, args, status in (
+            ("awus-bad-tail", selected, 65),
+            ("read-gone", read, 66),
+            ("read-timeout", read, 74),
+            ("read-rejected", read, 76),
+        ):
+            run(name, args, status, broken_stderr=True)
         run(
             "selected-4",
             ["--port", "3-3.4", "--devnum", "14", "version"],

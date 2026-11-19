@@ -82,6 +82,8 @@ USB; a local file or output error is not an ACK.
 If an 8-byte rejection arrives instead of longer read data, the selector
 classifies the short data completion as `65`. It does not reassemble short
 transfers or interpret payload bytes as a status frame.
+Diagnostics on stderr are best effort; a failed diagnostic write does not
+replace the transfer's exit status.
 
 `make test` includes the compiled selector suite; it requires bubblewrap.
 To run that suite alone without hardware:

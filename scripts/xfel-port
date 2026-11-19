@@ -79,16 +79,18 @@ def discover(root, port):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser = argparse.ArgumentParser(
+        description=__doc__, allow_abbrev=False, add_help=False
+    )
     parser.add_argument("--discover", action="store_true")
     parser.add_argument("--port", required=True)
     parser.add_argument("--devnum")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     argv = sys.argv[1:]
-    if any(arg in ("-h", "--help") for arg in argv) and argv not in (
-        ["-h"],
-        ["--help"],
-    ):
+    if argv in (["-h"], ["--help"]):
+        parser.print_help()
+        return 0
+    if any(arg in ("-h", "--help") for arg in argv):
         parser.error("help must be requested on its own")
     args = parser.parse_args()
     opts = sys.argv[1 : sys.argv.index("--")] if "--" in sys.argv else sys.argv[1:]
@@ -136,6 +138,8 @@ def main():
             return 66
         raise
     if args.discover:
+        if sys.stdout is None:
+            return 74
         try:
             print(current, flush=True)
         except OSError:

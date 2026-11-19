@@ -82,9 +82,14 @@ class SelectorTests(unittest.TestCase):
         ).items():
             (path / key).write_text(str(value) + "\n")
 
-    def run_selector(self, *args, rc=0, stdout=subprocess.PIPE, **overrides):
+    def run_selector(
+        self, *args, rc=0, stdout=subprocess.PIPE, closed_stdout=False, **overrides
+    ):
+        command = [self.scripts / "xfel-port", *args]
+        if closed_stdout:
+            command = ["/bin/sh", "-c", 'exec "$@" 1>&-', "fixture", *command]
         proc = subprocess.run(
-            [self.scripts / "xfel-port", *args],
+            command,
             env=dict(self.env, **overrides),
             text=True,
             stdout=stdout,
@@ -119,12 +124,16 @@ class SelectorTests(unittest.TestCase):
             self.run_selector(*args, rc=74, stdout=writer)
         finally:
             os.close(writer)
+        self.run_selector(*args, rc=74, closed_stdout=True)
         self.assertFalse(self.log.exists())
 
     def test_help_is_only_standalone(self):
         self.run_selector("--help")
+        self.run_selector("-h")
         for args in (
             ("--port", "3-6", "--devnum", "12", "--help", "--", "version"),
+            ("--port", "3-6", "--devnum", "12", "-hh", "--", "version"),
+            ("--port", "3-6", "--devnum", "12", "-hfoo", "--", "version"),
             ("--port", "3-6", "--devnum", "12", "--", "write", "0", "--help"),
             ("--discover", "--port", "3-6", "-h"),
         ):
