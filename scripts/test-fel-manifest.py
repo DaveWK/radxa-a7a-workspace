@@ -39,6 +39,7 @@ import shutil
 import struct
 import subprocess
 import sys
+from uuid import UUID
 from pathlib import Path
 
 tool = Path(sys.argv[0]).name
@@ -98,7 +99,6 @@ elif tool == "build":
     data = bytearray(4 * 1024 * 1024)
     struct.pack_into("<I", data, 4, 0x14000000 + ((0x40000 - 4) // 4))
     data[0x38:0x3c] = b"ARMd"
-    struct.pack_into("<I", data, 0x40000, 0x14000001)
     fdf = args[args.index("-f") + 1] if "-f" in args else "Platform/Radxa/CubieA7APkg/CubieA7A.fdf"
     (dest.parent / "BuildOptions").write_text("Flash Image Definition: " + fdf + "\n")
     tree = Path(dtb).read_bytes()
@@ -111,17 +111,60 @@ elif tool == "build":
         tree = bytes(40)
     elif case == "oversize":
         tree = tree[:4] + b"\xff" * 4 + tree[8:]
-    fv = bytes(40) + b"_FVH" + bytes(28) + tree
-    stream = (4+len(fv)).to_bytes(3, "little") + b"\x17" + fv
+    # Model CubieA7A.fdf:50-52,131-133,256-257 and PI file/section headers
+    # (MdePkg/Include/Pi/PiFirmwareFile.h:61,71,108-133,208,220-224).
+    def sec(kind, payload):
+        return (4+len(payload)).to_bytes(3, "little") + bytes([kind]) + payload
+
+    def file(name, kind, payload):
+        hdr = bytearray(UUID(name).bytes_le + bytes([0, 0xaa, kind, 0])
+                        + (24+len(payload)).to_bytes(3, "little") + b"\xf8")
+        hdr[16] = -(sum(hdr)-hdr[17]-hdr[23]) & 255
+        return hdr + payload
+
+    def fv(files, size=None, boot=False):
+        content = bytearray()
+        for item in files:
+            content += item
+            content += b"\xff" * (-len(content) % 8)
+        size = size or (72+len(content))
+        hdr = bytearray(72)
+        if boot:
+            struct.pack_into("<I", hdr, 0, 0x14000001)
+        # MdePkg/Include/Guid/FirmwareFileSystem2.h:18-19.
+        hdr[16:32] = UUID("8c8ce578-8a3d-4f1c-9935-896185c32dd3").bytes_le
+        struct.pack_into("<Q4sIHHHBBIIII", hdr, 32, size, b"_FVH", 0x800,
+                         72, 0, 0, 0, 2, size, 1, 0, 0)
+        struct.pack_into("<H", hdr, 50, -sum(struct.unpack("<36H",hdr)) & 0xffff)
+        return (hdr + content).ljust(size, b"\xff")
+
+    board = "5c3f8a19-2e64-4b0d-8f71-9a2c6e13d458"
+    container = "9e21fd93-9c72-4c15-8c4b-e77f1db2d792"
+    files = [file(container if case == "wrong-guid" else board, 2,
+                  sec(0x15 if case == "wrong-type" else 0x19, tree))]
+    if case == "two-files":
+        # Only the second file has the magic/digest: counting FDTs is not
+        # counting files, and the driver requests instance zero.
+        files.insert(0, file(board, 2, sec(0x19, bytes(40))))
+    if case == "unrelated-magic":
+        # A magic constant in an unrelated file cannot make the board file
+        # ambiguous. This is not a second board file or a second tree.
+        files.insert(0, file(container, 2, sec(0x19, tree[:4])))
+    stream = sec(0x17, fv(files))
     packed = lzma.compress(stream, format=lzma.FORMAT_ALONE)
     if case == "corrupt":
         packed = packed[:-5]
-    section = ((24+len(packed)).to_bytes(3,"little") + b"\x02"
-               + bytes.fromhex("98584eee143959429d6edc7bd79403cf")
-               + struct.pack("<HH",24,1) + packed)
+    section = sec(2, UUID("ee4e5898-3914-4259-9d6e-dc7bd79403cf").bytes_le
+                  + struct.pack("<HH",24,1) + packed)
     if case == "two-sections":
+        section += bytes(-len(section) % 4)
         section += section
-    data[0x50000:0x50000+len(section)] = section
+    carrier = file(container, 0x0b, section)
+    outside = case == "outside-boot"
+    data[0x40000:0x2c0000] = fv([] if outside else [carrier], 0x280000, True)
+    if outside:
+        decoy = fv([carrier])
+        data[0x300000:0x300000+len(decoy)] = decoy
     (dest / "CUBIEA7A_EFI.fd").write_bytes(data)
 elif tool == "cp":
     subprocess.run([env["REAL_CP"], *args], check=True)
@@ -875,8 +918,8 @@ class GateTests(unittest.TestCase):
 
     def test_packaged_dtb_refusals(self):
         for case, msg in (
-            ("zero", "found 0"),
-            ("two", "multiple FDT"),
+            ("zero", "FDT header"),
+            ("two", "totalsize"),
             ("mismatch", "digest differs"),
             ("two-sections", "found 2"),
             ("oversize", "totalsize"),
@@ -889,7 +932,9 @@ class GateTests(unittest.TestCase):
                 self.assertFalse((root / "blobfree-1200/firmware.bin").exists())
 
     def test_packaged_dtb_identity(self):
-        slot = self.build("blobfree-1200", "EDK2_ARGS=-f Local.fdf")
+        slot = self.build(
+            "blobfree-1200", "EDK2_ARGS=-f Local.fdf", FAKE_EMBED="unrelated-magic"
+        )
         record = read_json(self.record(sha(slot / "bt0-fel.bin")))
         self.assertEqual(record.get("edk2_fdf"), "Local.fdf")
         head = git(self.fedora, "rev-parse", "HEAD")
@@ -906,6 +951,21 @@ class GateTests(unittest.TestCase):
             stream[evidence["decoded_dtb_offset"] :][: evidence["dtb_size"]], DTB
         )
         self.assertEqual(evidence["sha256"], record["dtb_sha256"])
+        self.assertEqual(evidence["boot_fv_fd_offset"], 0x40000)
+        self.assertEqual(
+            evidence["dtb_file_guid"], "5c3f8a19-2e64-4b0d-8f71-9a2c6e13d458"
+        )
+
+    def test_boot_fv_dtb_path_refusals(self):
+        for case, reason in (
+            ("wrong-guid", "board DTB file, found 0"),
+            ("wrong-type", "board DTB section is not RAW"),
+            ("outside-boot", "FVMAIN container, found 0"),
+            ("two-files", "board DTB file, found 2"),
+        ):
+            with self.subTest(case=case):
+                self.refusal(self.make("fel-image", FAKE_EMBED=case), reason)
+                self.assertFalse((self.workspace / "out/fel/.records").exists())
 
     def test_xfel_override_needs_digest(self):
         self.build()

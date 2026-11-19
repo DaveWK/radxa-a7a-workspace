@@ -21,6 +21,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
+from uuid import UUID
 
 MODES = ("blobfree", "dramlib", "phyfw")
 PROFILES = (1200, 2400)
@@ -254,89 +256,210 @@ def check_mode_profile_features(mode, profile, features):
         die(f"features {features!r} do not match {mode} (expected {expected})")
 
 
+# Platform/Radxa/CubieA7APkg/CubieA7A.fdf:50-52,131-133,255-257.
+# OreEdk2Boot/OreEdk2BootPkg/OreEdk2BootPkg.dec:25 and
+# Drivers/FdtPlatformDxe/FdtPlatformDxe.c:259-263: this GUID, RAW instance 0.
+BOOT_FV_OFFSET, BOOT_FV_SIZE = 0x40000, 0x280000
+FVMAIN_FILE = UUID("9e21fd93-9c72-4c15-8c4b-e77f1db2d792")
+LZMA_GUID = UUID("ee4e5898-3914-4259-9d6e-dc7bd79403cf")
+DTB_FILE = UUID("5c3f8a19-2e64-4b0d-8f71-9a2c6e13d458")
+# edk2 MdePkg/Include/Guid/FirmwareFileSystem{2,3}.h:18-19.
+FFS2 = UUID("8c8ce578-8a3d-4f1c-9935-896185c32dd3")
+FFS3 = UUID("5473c07a-3dcb-4dca-bd6f-1e9689e7349a")
+# MdePkg/Include/Pi/PiFirmwareFile.h:61,71,208,222,224.
+FREEFORM, FV_IMAGE_FILE = 0x02, 0x0B
+GUID_DEFINED, FV_IMAGE_SECTION, RAW = 0x02, 0x17, 0x19
+
+
+class Entry(NamedTuple):
+    kind: int
+    start: int
+    body: int
+    end: int
+
+
+def ffs_files(fv):
+    """Yield (name, entry) at FV-relative offsets, rejecting malformed volumes."""
+    # PiFirmwareVolume.h:101-157: fixed header, checksum and block map.
+    if len(fv) < 72:
+        die("truncated boot-path FV")
+    fs = UUID(bytes_le=fv[16:32])
+    size, sig, attrs, header, _, ext, reserved, rev = struct.unpack_from(
+        "<Q4sIHHHBB", fv, 32
+    )
+    if (
+        fs not in (FFS2, FFS3)
+        or size != len(fv)
+        or sig != b"_FVH"
+        or rev != 2
+        or reserved
+        or not 72 <= header <= size
+        or header % 2
+        or sum(struct.unpack_from(f"<{header // 2}H", fv)) & 0xFFFF
+    ):
+        die("invalid boot-path FV header")
+    blocks = 0
+    for pos in range(56, header - 7, 8):
+        count, length = struct.unpack_from("<II", fv, pos)
+        if not count and not length:
+            break
+        if not count or not length:
+            die("invalid FV block map entry")
+        blocks += count * length
+    else:
+        die("unterminated FV block map")
+    if blocks != size:
+        die("FV block map does not cover volume")
+    first = header
+    if ext:
+        # MdeModulePkg/Core/Dxe/FwVol/FwVol.c:427-437.
+        if not pos + 8 <= ext <= size - 20:
+            die("invalid FV extension offset")
+        ext_size = struct.unpack_from("<I", fv, ext + 16)[0]
+        if not 20 <= ext_size <= size - ext:
+            die("invalid FV extension length")
+        first = ext + ext_size
+    erased = 0xFF if attrs & 0x800 else 0  # PiFirmwareVolume.h:47
+    pos = (first + 7) & ~7
+    while pos < size:
+        h = fv[pos : pos + 24]
+        if h == bytes([erased]) * len(h):
+            if fv.count(erased, pos) != size - pos:
+                die("non-erased bytes after free space in FV")
+            break
+        if len(h) != 24:
+            die("truncated FFS header")
+        # PiFirmwareFile.h:23-36,88-102,108-177 (large files use UINT64).
+        kind, attr = h[18:20]
+        n = int.from_bytes(h[20:23], "little")
+        hdr = 24
+        if attr & 1:
+            if fs != FFS3 or n or pos + 32 > size:
+                die("invalid large FFS header")
+            hdr = 32
+            n = struct.unpack_from("<Q", fv, pos + 24)[0]
+        end = pos + n
+        body = pos + hdr
+        if not body <= end <= size:
+            die("invalid FFS length")
+        if (h[23] ^ erased) != 7 or (sum(fv[pos:body]) - h[23] - h[17]) & 255:
+            die("invalid FFS file state or header checksum")
+        checksum = -sum(fv[body:end]) & 255 if attr & 0x40 else 0xAA
+        if h[17] != checksum:
+            die("invalid FFS data checksum")
+        yield UUID(bytes_le=h[:16]), Entry(kind, pos, body, end)
+        pos = (end + 7) & ~7
+
+
+def sections(data, start, end):
+    """Walk common (including extended) section headers within one parent."""
+    pos = start
+    while pos < end:
+        if end - pos < 4:
+            die("truncated section header")
+        size = int.from_bytes(data[pos : pos + 3], "little")
+        header = 4
+        if size == 0xFFFFFF:
+            if end - pos < 8:
+                die("truncated extended section header")
+            size = struct.unpack_from("<I", data, pos + 4)[0]
+            header = 8
+        if not header <= size <= end - pos:
+            die("invalid section length")
+        yield Entry(data[pos + 3], pos, pos + header, pos + size)
+        pos += (size + 3) & ~3
+
+
+def unique(entries, label):
+    count = 0
+    for count, item in enumerate(entries, 1):
+        if count == 1:
+            first = item
+    if count != 1:
+        die(f"expected exactly one {label}, found {count}")
+    return first
+
+
 def embedded_dtb(package, digest):
-    """Verify PI GUID-defined LZMA sections in the *published layout*."""
-    guid = bytes.fromhex("98584eee143959429d6edc7bd79403cf")
-    magic = bytes.fromhex("d00dfeed")
-    data = package.read_bytes()
-    found = []
-    pos = 0
-    while (pos := data.find(guid, pos)) >= 0:
-        guid_offset = pos
-        pos += len(guid)
-        # The decoder executable also contains this GUID as a constant;
-        # require an EFI_COMMON_SECTION_HEADER of type GUID_DEFINED.
-        start = guid_offset - 4
-        if start >= 0 and data[start + 3] == 2:
-            length = int.from_bytes(data[start : start + 3], "little")
-        elif start >= 4 and data[start - 4 : start] == b"\xff\xff\xff\x02":
-            length = struct.unpack_from("<I", data, start)[0]
-            start -= 4
-        else:
-            continue
-        if pos + 4 > len(data):
-            die("truncated LZMA guided section")
-        offset, flags = struct.unpack_from("<HH", data, pos)
-        if not flags & 1 or not pos + 4 - start <= offset < length <= len(data) - start:
-            die("invalid LZMA guided section bounds")
-        decoder = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE, memlimit=128 << 20)
-        try:
-            stream = decoder.decompress(
-                data[start + offset : start + length], max_length=64 << 20
-            )
-        except lzma.LZMAError as exc:
-            die(f"cannot decode packaged LZMA section: {exc}")
-        if not decoder.eof or decoder.unused_data:
-            die("incomplete or oversized packaged LZMA section")
-        if magic not in stream:
-            continue
-        if stream.count(magic) != 1:
-            die("multiple FDT magic matches in decoded stream")
-        dtb = stream.index(magic)
-        if len(stream) - dtb < 40:
-            die("truncated embedded FDT header")
-        size = struct.unpack_from(">I", stream, dtb + 4)[0]
-        if not 40 <= size <= len(stream) - dtb:
-            die("embedded FDT totalsize outside decoded stream")
-        # FV_IMAGE sections contain an EFI_FIRMWARE_VOLUME_HEADER; don't
-        # mistake a copy of the tree in an unrelated compressed file for it.
-        cursor = 0
-        while cursor + 4 <= len(stream):
-            n = int.from_bytes(stream[cursor : cursor + 3], "little")
-            kind = stream[cursor + 3]
-            header = 4
-            if n == 0xFFFFFF and cursor + 8 <= len(stream):
-                n = struct.unpack_from("<I", stream, cursor + 4)[0]
-                header = 8
-            fv = cursor + header
-            if n < header or n > len(stream) - cursor:
-                die("invalid section length in decoded FV stream")
-            if (
-                kind == 0x17
-                and stream[fv + 40 : fv + 44] == b"_FVH"
-                and fv <= dtb
-                and dtb + size <= cursor + n
-            ):
-                break
-            cursor += (n + 3) & ~3
-        else:
-            die("embedded FDT is not inside a decoded FV_IMAGE")
-        actual = hashlib.sha256(stream[dtb : dtb + size]).hexdigest()
-        if actual != digest:
-            die("embedded FDT digest differs from supplied DTB")
-        found.append(
-            dict(
-                section_offset=start,
-                section_length=length,
-                compression="LZMA",
-                decoded_dtb_offset=dtb,
-                dtb_size=size,
-                sha256=actual,
-            )
-        )
-    if len(found) != 1:
-        die(f"expected exactly one compressed FV containing an FDT, found {len(found)}")
-    return found[0]
+    """Follow the pinned FDF from the packaged FD, never search for byte patterns."""
+    # scripts/mkimage.py:62-65,84,130-133,213-216. fel-check also enforces
+    # this fixed medium offset for the payload's layout-table entry at boot.
+    fd_offset = 0x300000 - 512 * int(package.with_suffix(".seek").read_text())
+    fv_offset = fd_offset + BOOT_FV_OFFSET
+    with package.open("rb") as f:
+        f.seek(fv_offset)
+        compact = f.read(BOOT_FV_SIZE)
+    if len(compact) != BOOT_FV_SIZE:
+        die("truncated FVMAIN_COMPACT region")
+    files = list(ffs_files(compact))
+    if any(name == DTB_FILE for name, _ in files):
+        die("board DTB file in unexpected outer FV")
+    # ArmVirtPkg/PrePi/PrePi.c:94 calls DecompressFirstFv; an earlier,
+    # differently named FV_IMAGE is not interchangeable with the FDF carrier.
+    if any(e.kind == FV_IMAGE_FILE and name != FVMAIN_FILE for name, e in files):
+        die("unexpected FV_IMAGE file in FVMAIN_COMPACT")
+    carrier = unique(
+        (e for name, e in files if name == FVMAIN_FILE), "FVMAIN container"
+    )
+    if carrier.kind != FV_IMAGE_FILE:
+        die("FVMAIN container is not an FV_IMAGE file")
+    guided = unique(sections(compact, carrier.body, carrier.end), "guided section")
+    if (
+        guided.kind != GUID_DEFINED
+        or guided.body + 20 > guided.end
+        or compact[guided.body : guided.body + 16] != LZMA_GUID.bytes_le
+    ):
+        die("expected LZMA guided section")
+    offset, flags = struct.unpack_from("<HH", compact, guided.body + 16)
+    start = guided.start + offset
+    # PiFirmwareFile.h:358,365-378: DataOffset is section-relative.
+    if not flags & 1 or not guided.body + 20 <= start < guided.end:
+        die("invalid LZMA guided section bounds")
+    decoder = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE, memlimit=128 << 20)
+    try:
+        stream = decoder.decompress(compact[start : guided.end], max_length=64 << 20)
+    except lzma.LZMAError as exc:
+        die(f"cannot decode packaged LZMA section: {exc}")
+    if not decoder.eof or decoder.unused_data:
+        die("incomplete or oversized packaged LZMA section")
+    # GenFv can insert a RAW alignment section before the nested volume.
+    image = unique(
+        (s for s in sections(stream, 0, len(stream)) if s.kind != RAW),
+        "decoded FV_IMAGE section",
+    )
+    if image.kind != FV_IMAGE_SECTION:
+        die("unexpected section in decoded FVMAIN stream")
+    main = stream[image.body : image.end]
+    board = unique(
+        (e for name, e in ffs_files(main) if name == DTB_FILE), "board DTB file"
+    )
+    if board.kind != FREEFORM:
+        die("board DTB file is not FREEFORM")
+    raw = unique(sections(main, board.body, board.end), "board DTB section")
+    if raw.kind != RAW:
+        die("board DTB section is not RAW")
+    tree = main[raw.body : raw.end]
+    if len(tree) < 40 or tree[:4] != b"\xd0\x0d\xfe\xed":
+        die("invalid embedded FDT header")
+    if struct.unpack_from(">I", tree, 4)[0] != len(tree):
+        die("embedded FDT totalsize differs from RAW section payload size")
+    if hashlib.sha256(tree).hexdigest() != digest:
+        die("embedded FDT digest differs from supplied DTB")
+    return dict(
+        boot_fv_fd_offset=BOOT_FV_OFFSET,
+        fv_file_guid=str(FVMAIN_FILE),
+        fv_file_offset=carrier.start,
+        section_offset=fv_offset + guided.start,
+        section_length=guided.end - guided.start,
+        compression="LZMA",
+        guided_section_guid=str(LZMA_GUID),
+        decoded_fv_offset=image.body,
+        dtb_file_guid=str(DTB_FILE),
+        dtb_file_offset=board.start,
+        decoded_dtb_offset=image.body + raw.body,
+        dtb_size=len(tree),
+        sha256=digest,
+    )
 
 
 def knob(name):
