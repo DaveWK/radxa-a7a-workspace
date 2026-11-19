@@ -253,13 +253,12 @@ class FakeHarness(verify.Harness):
     def check_digests(self):
         return self._digests
 
-    def check_tooling(self):
+    def check_tooling(self, tmp):
         # Neither the fake build stages nor the external Python gate need Cargo.
         return []
 
-    def prepare_output(self, staged):
-        self.args.out.mkdir(mode=0o700)
-        (staged / "inputs").rename(self.args.out / "inputs")
+    def stage_cargo_cache(self, destination):
+        destination.mkdir()
 
 
 class DirtyHarness(FakeHarness):
@@ -432,14 +431,7 @@ class HarnessRegressionTest(unittest.TestCase):
             "#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n", encoding="utf-8"
         )
         harness = FakeHarness(self.args(gate=gate), real_gate=True)
-        self.assertEqual(harness.check_paths(), [])
-        staged = self.tmp / "staged"
-        staged.mkdir()
-        harness.snapshot_inputs(staged / "inputs")
-        harness.prepare_output(staged)
-        result = harness.run_gate()
-        self.assertFalse(result.ok)
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(harness.run(), 1)
 
     def test_gate_receives_the_resolved_source_head(self):
         gate = self.tmp / "recording-gate.py"

@@ -645,7 +645,7 @@ class CliTest(unittest.TestCase):
 
     def assert_identity_refused_without_build(self, name):
         self.check(1, f"{name} SHA256")
-        self.assertEqual(self.tools.cargo_envs, [])
+        self.assertEqual(self.tools.cargo_invocations, [])
         self.assertEqual(self.tools.gate_launches, [])
         self.assertFalse(self.out.exists())
 
@@ -850,6 +850,29 @@ class CliTest(unittest.TestCase):
         self.out.mkdir(mode=0o700)
         self.check(1, "output path already exists")
         self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_cache_symlink_refusal_leaves_no_job_directory(self):
+        target = self.root / "archive.crate"
+        target.write_bytes(b"fixture cache content")
+        cache = self.home / ".cargo" / "registry" / "cache"
+        cache.mkdir(parents=True)
+        link = cache / target.name
+        link.symlink_to(target)
+        self.check(1, f"offline Cargo cache contains a symlink: {link}")
+        self.assertEqual(self.tools.cargo_envs, [])
+        self.assertFalse(self.out.exists())
+        self.assertEqual(list(self.root.glob(".verify-a7a-*")), [])
+
+    def test_symlinked_cache_root_refusal_leaves_no_job_directory(self):
+        target = self.root / "archive-cache"
+        target.mkdir()
+        cache = self.home / ".cargo" / "registry"
+        cache.mkdir(parents=True)
+        link = cache / "cache"
+        link.symlink_to(target, target_is_directory=True)
+        self.check(1, f"offline Cargo cache contains a symlink: {link}")
+        self.assertEqual(self.tools.cargo_envs, [])
+        self.assertFalse(self.out.exists())
 
 
 if __name__ == "__main__":

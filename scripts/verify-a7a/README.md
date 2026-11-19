@@ -98,15 +98,17 @@ that runs the harness must be clean, full Git worktrees. Sparse checkout,
 skip-worktree and assume-unchanged entries, and missing or wrong-type tracked
 paths are refused. Both checkouts are rechecked before PASS. Input checks
 finish before creating the output directory exclusively (0700); even an
-existing empty output is refused. The
-output, `TMPDIR` and both Cargo output locations must not overlap any input.
+existing empty output is refused. The output, `TMPDIR` and both Cargo output
+locations must not overlap any input.
 
 Git runs with only `PATH`, `HOME` and the harness's isolation settings: no
 inherited Git variables, no system or global config, and optional locks
 disabled. Cargo runs offline and locked in a clean environment with both
 `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` set explicitly. It seeds a
 private Cargo home from the local offline caches under `~/.cargo` without
-sharing configuration, credentials or write locations. The executable paths
+sharing configuration, credentials or write locations. The cache is prepared
+in private staging before the job exists; a symlink in a cache tree or its
+root path is refused, leaving no job directory. The executable paths
 resolved by `rustup which` in the source must match the exact channel in
 `rust-toolchain.toml`; the installed targets are checked and the actual
 `rustc -vV` and `cargo -V` recorded. Toolchain auto-install is disabled.
@@ -118,8 +120,8 @@ Exit status is `0` only when every stage passes; `1` for a verification failure;
 ## Job output
 
 `<job-output-dir>` receives `matrix/logs/`, `matrix/out/` (with `SHA256SUMS`),
-`target/`, `build/`, `cargo-home/`, `inputs/`, `tests/`, `tmp/` and `gate.log`. The source
-checkout is never written to.
+`target/`, `build/`, `cargo-home/`, `inputs/`, `tests/`, `tmp/` and `gate.log`.
+The source checkout is never written to.
 
 The job output is private: it contains vendor-library variants and PHY
 extraction, so it is never published or committed. Keep it under the job
@@ -130,7 +132,7 @@ directory (or another private scratch area), not in Git.
     python3 -I -B scripts/verify-a7a/tests/test_verify.py
     python3 -I -B scripts/verify-a7a/tests/test_h2.py
 
-The suite is quick and needs no cargo: it drives the fail-closed orchestration
+The suites are quick and need no Cargo: they drive the fail-closed orchestration
 with controlled stage results and real path checks (matrix failure, failing,
 empty or missing suite, inventory reconciliation, failing or missing gate, a
 gate given the wrong SHA, missing baseline, digest mismatch, stale output,
@@ -138,4 +140,8 @@ output overlap, wrong source SHA, a non-ancestor base, a dirty tree after the
 build, image size/extension/header validation, all-green). The H2 tests drive
 the real CLI entry point with controlled build and inventory outputs and
 exercise hash-time replacements, ambient configuration, section inventory and
-per-binary completion. The tests use a HOME-scoped `TMPDIR`, never `/tmp`.
+per-binary completion. H3 adds checkout and cache refusals and exercises the
+verified archive with a real host `cc` and `ar`. Set `VERIFY_A7A_OREBOOT` to a
+clean oreboot clone to run the source cases on copies of that clone; otherwise
+they use a miniature Git fixture. The tests use a HOME-scoped `TMPDIR`, never
+`/tmp`.

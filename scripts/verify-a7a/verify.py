@@ -519,12 +519,8 @@ def read_cap(path: Path, pattern: re.Pattern[str]) -> int:
     return value
 
 
-def reject_cache_links(directory: str, names: list[str]) -> list[str]:
-    for name in names:
-        path = Path(directory) / name
-        if path.is_symlink():
-            raise ValueError(f"offline Cargo cache contains a symlink: {path}")
-    return []
+def raise_walk_error(error: OSError) -> None:
+    raise error
 
 
 def check_egon_header(data: bytes) -> str | None:
@@ -649,8 +645,6 @@ class Harness:
             errors.append(f"baseline directory not found: {a.baseline}")
         else:
             errors.extend(self._check_baseline_sums())
-        if not errors:
-            errors.extend(self.check_tooling())
         return errors
 
     def snapshot_inputs(self, destination: Path) -> None:
@@ -728,32 +722,45 @@ class Harness:
     def prepare_output(self, staged: Path) -> None:
         out = self.args.out
         out.mkdir(mode=0o700)
-        (staged / "inputs").rename(out / "inputs")
-        for sub in ("matrix/out", "matrix/logs", "tests", "tmp/images", "cargo-home"):
-            (out / sub).mkdir(parents=True)
+        for path in list(staged.iterdir()):
+            path.rename(out / path.name)
+
+    def stage_cargo_cache(self, destination: Path) -> None:
         # Cargo's offline cache can still be written to while building. Use
         # copies of the archives, indexes and Git databases, not the host cache
         # or its config, credentials, extracted sources or checked-out trees.
+        cache = Path.home() / ".cargo"
+        destination.mkdir()
         for rel in ("registry/cache", "registry/index", "git/db"):
-            source = Path.home() / ".cargo" / rel
-            if source.is_dir():
-                shutil.copytree(
-                    source, out / "cargo-home" / rel, ignore=reject_cache_links
-                )
+            source = cache / rel
+            for path in (cache, source.parent, source):
+                if path.is_symlink():
+                    raise ValueError(f"offline Cargo cache contains a symlink: {path}")
+            if source.exists():
+                if not source.is_dir():
+                    raise ValueError(
+                        f"offline Cargo cache is not a directory: {source}"
+                    )
+                # Copy links as links, never follow them. Reject any link
+                # found in the copy before making a job directory visible.
+                shutil.copytree(source, destination / rel, symlinks=True)
+        for directory, dirs, files in os.walk(destination, onerror=raise_walk_error):
+            for name in dirs + files:
+                path = Path(directory) / name
+                if path.is_symlink():
+                    original = cache / path.relative_to(destination)
+                    raise ValueError(
+                        f"offline Cargo cache contains a symlink: {original}"
+                    )
 
     def cargo_env(self, group: str) -> dict[str, str]:
-        env = dict(self.env)
-        for key, directory in (
-            ("CARGO_TARGET_DIR", "target"),
-            ("CARGO_BUILD_BUILD_DIR", "build"),
-        ):
-            path = (self.args.out / directory / group).resolve()
-            if not path.is_relative_to(self.args.out) or any(
-                paths_overlap(path, protected) for _label, protected in self.protected
-            ):
-                raise ValueError(f"{key} is not private to the job: {path}")
-            env[key] = str(path)
-        return env
+        # These fixed subpaths are private by construction: check_paths
+        # validates output overlap, then prepare_output creates it exclusively.
+        return {
+            **self.env,
+            "CARGO_TARGET_DIR": str(self.args.out / "target" / group),
+            "CARGO_BUILD_BUILD_DIR": str(self.args.out / "build" / group),
+        }
 
     def git(self, *argv: str) -> CommandResult:
         return self.tree_git(self.args.source, *argv)
@@ -919,7 +926,7 @@ class Harness:
             self.baseline_digests = manifest
         return errors
 
-    def check_tooling(self) -> list[str]:
+    def check_tooling(self, tmp: Path) -> list[str]:
         """Fail clearly when the pinned toolchain or a target is missing."""
         errors: list[str] = []
         for tool in ("rustup", "llvm-readelf", "llvm-objcopy"):
@@ -942,7 +949,11 @@ class Harness:
             return errors
         # Resolve in the source, not in the caller's directory. An accidental
         # rustup directory override must not change what will be invoked.
-        probe_env = {**self.git_env, "RUSTUP_AUTO_INSTALL": "0"}
+        probe_env = {
+            **self.git_env,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "TMPDIR": str(tmp),
+        }
         for tool in ("rustc", "cargo", "rustdoc"):
             resolved = self.runner.run(
                 ["rustup", "which", tool], self.args.source, probe_env
@@ -1572,7 +1583,8 @@ class Harness:
             self.gate_head or "",
         ]
         log = self.args.out / "gate.log"
-        res = self.runner.run(argv, self.args.source, self.git_env, log)
+        env = {**self.git_env, "TMPDIR": self.env["TMPDIR"]}
+        res = self.runner.run(argv, self.args.source, env, log)
         return GateResult(res.returncode == 0, res.returncode, res.output)
 
     # -- retained default digests -----------------------------------------
@@ -1724,6 +1736,11 @@ class Harness:
         ) as temp:
             staged = Path(temp)
             self.snapshot_inputs(staged / "inputs")
+            for sub in ("matrix/out", "matrix/logs", "tests", "tmp/images"):
+                (staged / sub).mkdir(parents=True)
+            if errors := self.check_tooling(staged / "tmp"):
+                raise ValueError("\n".join(errors))
+            self.stage_cargo_cache(staged / "cargo-home")
             self.prepare_output(staged)
         matrix = self.run_matrix()
         negative = self.run_negative()
