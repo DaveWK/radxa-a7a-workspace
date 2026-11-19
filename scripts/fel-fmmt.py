@@ -258,4 +258,15 @@ if __name__ == "__main__":
         PATH=str(Path(source) / "C/bin"), FmmtConfPath=str(python / "FMMT"), tmp="."
     )
     resource.setrlimit(resource.RLIMIT_AS, (512 << 20, 512 << 20))
-    Path(output).write_text(json.dumps(inspect(Path(package), digest)))
+    # Record the helper actually running the FMMT factories, not a
+    # reconstructed FMMT.py CLI. -I ignores PYTHONPATH; the imports above
+    # use the two explicitly prepended directories.
+    invocation = dict(
+        argv=sys.orig_argv,
+        cwd=os.getcwd(),
+        PYTHONPATH=os.environ.get("PYTHONPATH"),
+        import_roots=sys.path[:2],
+        tool_root=source,
+    )
+    result = inspect(Path(package), digest)
+    Path(output).write_text(json.dumps(dict(result, fmmt_invocation=invocation)))

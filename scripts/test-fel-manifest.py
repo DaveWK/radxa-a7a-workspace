@@ -1002,6 +1002,24 @@ class GateTests(unittest.TestCase):
         self.assertEqual(record["dtb_source"], "fedora@" + head)
         self.assertEqual(record["dts_dir"], str(self.fedora / "fedora/dts"))
         evidence = record["embedded_dtb"]
+        invocation = evidence["fmmt_invocation"]
+        exe, flags, helper, source, package, digest, receipt = invocation["argv"]
+        source = Path(source)
+        self.assertEqual((flags, digest), ("-IB", record["dtb_sha256"]))
+        self.assertEqual(Path(helper), self.workspace / "scripts/fel-fmmt.py")
+        self.assertEqual(source, self.edk2 / "BaseTools/Source")
+        self.assertEqual(invocation["tool_root"], str(source))
+        self.assertEqual(Path(package).name, "firmware.bin")
+        self.assertEqual(Path(receipt), Path(invocation["cwd"]) / "verified.json")
+        self.assertIsNone(invocation["PYTHONPATH"])
+        self.assertEqual(
+            invocation["import_roots"],
+            [str(source / "Python/FMMT"), str(source / "Python")],
+        )
+        for tool, value in evidence["fmmt_tools_sha256"].items():
+            self.assertEqual(value, sha(source / tool))
+        self.assertIn(exe, evidence["fmmt_tools_sha256"])
+        self.assertIn(helper, evidence["fmmt_tools_sha256"])
         section = (slot / "firmware.bin").read_bytes()[evidence["section_offset"] :][
             : evidence["section_length"]
         ]

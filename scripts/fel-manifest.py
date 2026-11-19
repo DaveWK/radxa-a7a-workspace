@@ -264,7 +264,10 @@ def embedded_dtb(package, digest, stamp_digest):
     )
 
     def identities():
-        return {str(p.relative_to(source)): sha256(p) for p in tools}
+        hashes = {str(p.relative_to(source)): sha256(p) for p in tools}
+        for path in (Path(sys.executable), helper):
+            hashes[str(path)] = sha256(path)
+        return hashes
 
     hashes = identities()
     if (
