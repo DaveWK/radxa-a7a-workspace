@@ -584,9 +584,9 @@ class Harness:
             A733_DRAM_LIB=str(self.input_paths["dram-lib"]),
             A733_PHY_FW_OBJ=str(self.input_paths["phyfw-obj"]),
         )
+        self.workspace = MKIMAGE.parents[1]
         self.protected = self.protected_inputs()
         self.source_head: str | None = None
-        self.workspace = MKIMAGE.parents[1]
         self.workspace_head: str | None = None
         self.gate_base: str | None = None
         self.gate_head: str | None = None
@@ -606,6 +606,7 @@ class Harness:
     def protected_inputs(self) -> tuple[tuple[str, Path], ...]:
         a = self.args
         return (
+            ("workspace", self.workspace),
             ("source", a.source),
             ("baseline", a.baseline),
             ("dram-lib", a.dram_lib),
@@ -619,8 +620,9 @@ class Harness:
         errors: list[str] = []
         # Overlap first: nothing is created when the job would write into a
         # protected input.
+        out = a.out.resolve()
         for label, path in self.protected:
-            if paths_overlap(a.out.resolve(), path):
+            if paths_overlap(out, path):
                 errors.append(f"output directory overlaps the {label}: {path}")
         if errors:
             return errors

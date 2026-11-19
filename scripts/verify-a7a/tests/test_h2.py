@@ -892,6 +892,48 @@ class CliTest(unittest.TestCase):
         self.check(1, "output path already exists")
         self.assertEqual(list(self.out.iterdir()), [])
 
+    def test_output_inside_workspace_refused_before_creation(self):
+        self.out = self.workspace / "job"
+        code, output = self.invoke()
+        self.assertEqual(code, 1, output)
+        self.assertFalse(self.out.exists(), output)
+        self.assertEqual(self.git(self.workspace, "status", "--porcelain"), "")
+        self.assertEqual(self.tools.cargo_invocations, [])
+        self.assertIn("output directory overlaps the workspace", output)
+
+    def test_output_resolving_inside_workspace_refused_before_staging(self):
+        alias = self.root / "workspace-alias"
+        alias.symlink_to(self.workspace, target_is_directory=True)
+        self.out = alias / "job"
+        with patch.object(
+            verify.tempfile, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory
+        ) as stage:
+            code, output = self.invoke()
+            stage.assert_not_called()
+        self.assertEqual(code, 1, output)
+        self.assertIn("output directory overlaps the workspace", output)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.git(self.workspace, "status", "--porcelain"), "")
+        self.assertEqual(self.tools.cargo_invocations, [])
+
+    def test_output_overlapping_other_inputs_refused_before_staging(self):
+        for label, path in (
+            ("source", self.source),
+            ("baseline", self.baseline),
+            ("dram-lib", self.dram_lib),
+            ("phyfw-obj", self.phyfw),
+            ("gate", self.gate),
+        ):
+            with self.subTest(label=label):
+                self.out = path / "job"
+                with patch.object(
+                    verify.tempfile, "TemporaryDirectory", autospec=True
+                ) as stage:
+                    self.check(1, f"output directory overlaps the {label}")
+                    stage.assert_not_called()
+                self.assertFalse(self.out.exists())
+                self.assertEqual(self.tools.cargo_invocations, [])
+
     def test_cache_symlink_refusal_leaves_no_job_directory(self):
         target = self.root / "archive.crate"
         target.write_bytes(b"fixture cache content")

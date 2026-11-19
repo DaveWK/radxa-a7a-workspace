@@ -101,8 +101,10 @@ that runs the harness must be clean, full Git worktrees. Sparse checkout,
 skip-worktree and assume-unchanged entries, and missing or wrong-type tracked
 paths are refused. Both checkouts are rechecked before PASS. Input checks
 finish before creating the output directory exclusively (0700); even an
-existing empty output is refused. The output, `TMPDIR` and both Cargo output
-locations must not overlap any input.
+existing empty output is refused. Before creating staging or running Cargo,
+the harness rejects `--out` if it resolves to a path overlapping the workspace,
+source, baseline or any other protected input. `TMPDIR` and both Cargo output
+locations are inside the job directory.
 
 Git runs with only `PATH`, `HOME` and the harness's isolation settings: no
 inherited Git variables, no system or global config, and optional locks
