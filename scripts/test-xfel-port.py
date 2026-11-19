@@ -1,211 +1,144 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Port admission fixtures. No USB device or production xfel is used."""
+"""Exercise the stateless selector with fake sysfs and a fake transport."""
 
 import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
 
 SCRIPTS = Path(__file__).resolve().parent
-STUB = """#!/usr/bin/python3 -I
-import json, os, sys, signal
-from pathlib import Path
-if sys.argv[1:] == ["--help"]:
-    print("xfel [--port PATH --devnum N] COMMAND")
-    print("xfel [--port BUS-PORT[.PORT...]] COMMAND")
-else:
-    args = sys.argv[1:]
-    number = Path(os.environ["FEL_SYSFS_ROOT"]) / args[1] / "devnum"
-    if args[2] == "--devnum" and number.read_text().strip() != args[3]:
-        sys.exit(125)
-    with open(os.environ["LOG"], "a") as log:
-        print(json.dumps(args), file=log)
-    if "STUB_SIGNAL" in os.environ:
-        os.kill(os.getpid(), signal.SIGTERM)
-    if args[-1] == "0x000014af" and "STUB_RESET" in os.environ:
-        number.write_text("19")
-    if args[-1] == "version":
-        print("fixture ID=0x00190300")
-    sys.exit(int(os.getenv("STUB_RC", "0")))
-"""
 
 
-class PortTests(unittest.TestCase):
+class SelectorTests(unittest.TestCase):
     def setUp(self):
-        scratch = SCRIPTS.parent / "out"
-        scratch.mkdir(exist_ok=True)
-        tmp = tempfile.TemporaryDirectory(dir=scratch)
+        out = SCRIPTS.parent / "out"
+        out.mkdir(exist_ok=True)
+        tmp = tempfile.TemporaryDirectory(dir=out)
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.sysfs = self.root / "devices"
         self.sysfs.mkdir()
-        self.state = self.root / "state"
-        self.log = self.root / "log"
-        self.log.touch()
-        stub = self.root / "xfel"
-        stub.write_text(STUB)
-        stub.chmod(0o700)
-        self.env = os.environ | dict(
-            XFEL=str(stub),
-            EXPECT_XFEL_SHA256=hashlib.sha256(stub.read_bytes()).hexdigest(),
-            SUDO="",
-            LOG=str(self.log),
+        self.log = self.root / "commands"
+        self.tool = self.root / "fake-transport"
+        self.tool.write_text(
+            "#!/usr/bin/python3 -I\n"
+            "import json, os, signal, sys\n"
+            "if sys.argv[1:] == ['--help']:\n"
+            "    print('xfel --port PATH --devnum N COMMAND ...')\n"
+            "    sys.exit(0)\n"
+            "with open(os.environ['COMMANDS'], 'a') as log:\n"
+            "    print(json.dumps(sys.argv[1:]), file=log)\n"
+            "rc = int(os.environ.get('STATUS', '0'))\n"
+            "if rc < 0: os.kill(os.getpid(), -rc)\n"
+            "sys.exit(rc)\n"
+        )
+        self.tool.chmod(0o755)
+        self.env = dict(
+            os.environ,
+            XFEL=str(self.tool),
+            EXPECT_XFEL_SHA256=hashlib.sha256(self.tool.read_bytes()).hexdigest(),
             FEL_SYSFS_ROOT=str(self.sysfs),
+            SUDO="",
+            COMMANDS=str(self.log),
         )
-        self.device("3-3.4", 14)
-        self.device("3-6", 12)
+        self.add("3-3.4", 14)
+        self.add("3-6", 12)
 
-    def device(self, port, number):
+    def add(self, port, number):
         path = self.sysfs / port
-        path.mkdir(exist_ok=True)
-        bus, chain = port.split("-")
-        for key, val in dict(
-            idVendor="1f3a", idProduct="efe8", busnum=bus, devpath=chain, devnum=number
+        path.mkdir()
+        for key, value in dict(
+            idVendor="1f3a",
+            idProduct="efe8",
+            busnum=3,
+            devpath=port.split("-")[1],
+            devnum=number,
         ).items():
-            (path / key).write_text(str(val))
+            (path / key).write_text(str(value) + "\n")
 
-    def call(self, *args, rc, command=("version",), dispatched=None):
-        before = self.log.read_bytes()
-        result = subprocess.run(
-            [SCRIPTS / "xfel-port", "--state", self.state, *args, "--", *command],
-            capture_output=True,
+    def run_selector(self, *args, rc=0, **overrides):
+        proc = subprocess.run(
+            [SCRIPTS / "xfel-port", *args],
+            env=dict(self.env, **overrides),
             text=True,
-            env=self.env,
+            capture_output=True,
+            timeout=10,
         )
-        self.assertEqual(result.returncode, rc, result.stderr)
-        if dispatched is False or (dispatched is None and rc in (125, 2, 66)):
-            self.assertEqual(self.log.read_bytes(), before)
-        return result.stderr
+        self.assertEqual(proc.returncode, rc, (proc.stdout, proc.stderr))
+        return proc
 
-    def test_two_ports(self):
-        for port in ("3-3.4", "3-6"):
-            self.state = self.root / port
-            self.call("--port", port, rc=0)
+    def dispatch(self, port="3-6", devnum="12", **options):
+        return self.run_selector(
+            "--port", port, "--devnum", devnum, "--", "version", **options
+        )
+
+    def test_discover_without_transport(self):
+        for port, expected in (("3-6", "12\n"), ("3-3.4", "14\n")):
+            self.assertEqual(
+                self.run_selector(
+                    "--discover", "--port", port, XFEL="nonexistent"
+                ).stdout,
+                expected,
+            )
+        self.assertFalse(self.log.exists())
+
+    def test_pin_each_board(self):
+        self.dispatch("3-6", "12")
+        self.dispatch("3-3.4", "14")
         self.assertEqual(
             list(map(json.loads, self.log.read_text().splitlines())),
             [
-                ["--port", "3-3.4", "--devnum", "14", "version"],
                 ["--port", "3-6", "--devnum", "12", "version"],
+                ["--port", "3-3.4", "--devnum", "14", "version"],
             ],
         )
 
-    def test_no_selector(self):
-        self.call(rc=2)
-        self.call("--port", "3-3.4", "--port", "3-6", rc=2)
+    def test_mismatch_is_not_loss(self):
+        self.dispatch(devnum="19", rc=125)
+        (self.sysfs / "3-6/idVendor").write_text("ffff")
+        self.dispatch(rc=125)
+        self.assertFalse(self.log.exists())
 
-    def test_missing_port_timeout(self):
-        self.call("--port", "3-1", "--timeout", ".1", rc=66)
+    def test_missing_connector_not_incomplete_root(self):
+        self.dispatch(port="3-7", rc=66)
+        self.dispatch(FEL_SYSFS_ROOT=str(self.root / "missing-root"), rc=125)
+        (self.sysfs / "3-6/devnum").unlink()
+        self.dispatch(rc=125)
+        self.assertFalse(self.log.exists())
 
-    def test_wrong_ids(self):
-        for key in ("idVendor", "idProduct"):
-            self.device("3-6", 12)
-            (self.sysfs / "3-6" / key).write_text("0000")
-            self.call("--port", "3-6", rc=125)
+    def test_peer_churn_is_not_input(self):
+        (self.sysfs / "3-3.4/devnum").unlink()
+        self.dispatch()
 
-    def test_reenumeration(self):
-        args = ["--port", "3-6"]
-        self.call(*args, rc=0)
-        self.call(*args, "--after-reset", rc=125)
-        self.device("3-6", 19)
-        self.call(*args, rc=125)
-        self.call(*args, "--after-reset", rc=125)
-        self.device("3-6", 12)
-        self.call(
-            *args,
-            "--expect-reset",
-            command=["write32", "0x0205000c", "0x000014af"],
-            rc=0
-        )
-        self.call(*args, "--after-reset", rc=125)
-        self.device("3-6", 19)
-        self.call(*args, rc=125)
-        self.call(*args, "--after-reset", command=["exec", "0x90040"], rc=2)
-        old = self.state.read_bytes()
-        self.env["STUB_RC"] = "31"
-        self.call(*args, "--after-reset", rc=31)
-        self.assertEqual(old, self.state.read_bytes())
-        del self.env["STUB_RC"]
-        record, verified = map(
-            json.loads, self.call(*args, "--after-reset", rc=0).splitlines()
-        )
-        self.assertEqual(verified["event"], "verified")
-        self.assertEqual((record["previous_devnum"], record["devnum"]), (12, 19))
-        self.assertEqual(json.loads(self.state.read_text())["devnum"], 19)
+    def test_missing_duplicate_and_retired_options(self):
+        for args in (
+            ("--port", "3-6", "--", "version"),
+            ("--port", "3-6", "--port", "3-6", "--devnum", "12", "--", "version"),
+            ("--port", "3-6", "--discover", "--devnum", "12"),
+            ("--port", "3-6", "--state", "saved", "--", "version"),
+            ("--port", "3-6", "--after-reset", "--", "version"),
+        ):
+            with self.subTest(args=args):
+                self.run_selector(*args, rc=2)
+        self.assertFalse(self.log.exists())
 
-    def test_move(self):
-        args = ["--port", "3-6"]
-        self.call(*args, rc=0)
-        shutil.rmtree(self.sysfs / "3-6")
-        self.device("3-7", 19)
-        self.call(*args, rc=125)
-        self.call("--port", "3-7", rc=125)
+    def test_status_propagated(self):
+        for status in (65, 66, 74, 76, 125, 31, -signal.SIGTERM):
+            with self.subTest(status=status):
+                self.dispatch(
+                    rc=status if status >= 0 else 128 - status, STATUS=str(status)
+                )
 
-    def test_peer_change(self):
-        args = ["--port", "3-6"]
-        self.call(*args, rc=0)
-        self.device("3-3.4", 15)
-        self.call(*args, rc=125)
-
-    def test_legacy_binary(self):
-        stub = Path(self.env["XFEL"])
-        stub.write_text(STUB.replace("--port PATH --devnum", "old usage"))
-        self.env["EXPECT_XFEL_SHA256"] = hashlib.sha256(stub.read_bytes()).hexdigest()
-        self.call("--port", "3-6", rc=125)
-
-    def test_command_failure(self):
-        self.env["STUB_RC"] = "31"
-        self.call("--port", "3-6", rc=31)
-
-    def test_admission_swap(self):
-        prefix = self.root / "fake-sudo"
-        prefix.write_text(
-            '#!/bin/sh\nprintf 19 >"$FEL_SYSFS_ROOT/3-6/devnum"\nexec "$@"\n'
-        )
-        prefix.chmod(0o700)
-        self.env["SUDO"] = str(prefix)
-        self.call("--port", "3-6", rc=125)
-        self.assertFalse(self.state.exists())
-
-    def test_wdt_runner(self):
-        self.env.update(
-            FEL_PORT="3-6", FEL_STATE_FILE=str(self.state), STUB_RESET="yes"
-        )
-        proc = subprocess.run(
-            [SCRIPTS / "fel-wdt-reset.sh"], env=self.env, capture_output=True, timeout=8
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        calls = list(map(json.loads, self.log.read_text().splitlines()))
-        self.assertEqual(
-            [(c[:3], c[3], c[4]) for c in calls],
-            [
-                (["--port", "3-6", "--devnum"], n, cmd)
-                for n, cmd in [
-                    ("12", "version"),
-                    ("12", "write32"),
-                    ("12", "write32"),
-                    ("12", "write32"),
-                    ("19", "version"),
-                ]
-            ],
-        )
-
-    def test_signal_exit(self):
-        self.env["STUB_SIGNAL"] = "1"
-        self.call("--port", "3-6", rc=143)
-
-    def test_boot_requires_port(self):
-        self.env.pop("FEL_PORT", None)
-        proc = subprocess.run(
-            [SCRIPTS / "fel-boot.sh", self.root], env=self.env, capture_output=True
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn(b"requires FEL_PORT", proc.stderr)
-        self.assertEqual(self.log.read_bytes(), b"")
+    def test_legacy_binary_refused_after_help_only(self):
+        self.tool.write_text("#!/bin/sh\nprintf 'upstream usage\\n'\n")
+        new_hash = hashlib.sha256(self.tool.read_bytes()).hexdigest()
+        self.dispatch(rc=125, EXPECT_XFEL_SHA256=new_hash)
+        self.assertFalse(self.log.exists())
 
 
 if __name__ == "__main__":

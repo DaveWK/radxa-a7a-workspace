@@ -1,11 +1,9 @@
 # USB FEL boot and fastboot
 
 The A733 mask ROM has a USB download mode, **FEL**. The board in FEL shows
-up on the host as USB device `1f3a:efe8`. `scripts/fel-boot.sh` uses it to
-start the whole boot chain from the host over USB, with no SD card involved:
-bt0 initialises DRAM, the host loads oreboot main and EDK2 into DRAM, and bt0
-hands over to them. This is the current way to boot the Cubie A7A here (see
-[bring-up-status.md](bring-up-status.md) for the SD slot).
+up on the host as USB device `1f3a:efe8`. The selector layer does not boot
+or reset a board. `make fel-boot`, `scripts/fel-boot.sh` and
+`scripts/fel-wdt-reset.sh` refuse until task-000141 supplies the session runner.
 
 ## What you need
 
@@ -20,7 +18,7 @@ hands over to them. This is the current way to boot the Cubie A7A here (see
   ROM busy for about 5-7 s, longer with DRAM tracing. `make xfel` builds
   xfel v1.4.0 from <https://github.com/xboot/xfel> (MIT) with
   `libusb_bulk_transfer` raised from 10000 to 60000 ms in `fel.c`, into
-  `out/tools/xfel`. It needs `gcc`, `make`, `pkgconf` and `libusb1-devel`.
+  `out/tools/xfel` and its build receipt. It needs `cc`, `make`, `pkgconf` and `libusb1-devel`.
   No xfel binary is part of this repository.
 - Root for xfel, or xfel's udev rule
   (`out/tools/xfel-src/99-xfel.rules` in `/etc/udev/rules.d`) and `SUDO=`.
@@ -35,60 +33,42 @@ hands over to them. This is the current way to boot the Cubie A7A here (see
 
 Check with `lsusb -d 1f3a:efe8`.
 
-## Boot
+## Selector contract for task-000141
 
-    make fel-image            # in the build container: out/fel/<mode>-<mhz>/
-    make xfel                 # once, on the host
-    export FEL_SERIAL_LOG="$HOME/src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
-    FEL_PORT=3-3.4 make fel-boot    # 4 GB board; use 3-6 for the 6 GB board
+The selector is stateless. The runner first discovers a devnum on the
+assigned physical connector, then carries **both** values on each call:
 
-Every runner must set `FEL_PORT` and use `scripts/xfel-port` for each FEL
-command (including mailbox reads and resets). Never use the old bench
-`felreset.sh` or a system xfel. The port is a physical connector, not a
-board serial number: do not exchange boards between ports during a run.
-
-```
-port=(scripts/xfel-port --port "${FEL_PORT:?}" --state "${run:?}/fel-state")
-"${port[@]}" -- version
-"${port[@]}" -- write 0x90000 bt0-fel.bin
+```sh
+scripts/xfel-port --discover --port "$FEL_PORT"
+scripts/xfel-port --port "$FEL_PORT" --devnum "$devnum" -- version
 ```
 
-For an authorized A733 watchdog reset, keep one state file in the runner's
-private directory. The pinned xfel's A733 `reset` handler is **unsupported**;
-the port-bound equivalent of the bench `felreset.sh` uses its three WDT0
-writes, not `xfel reset`:
-
-```
-FEL_STATE_FILE="${run:?}/fel-state" FEL_PORT="${FEL_PORT:?}" scripts/fel-wdt-reset.sh
-```
-
-Every session starts with an A733 `version` probe. An ordinary call requires
-the same port **and** device number. `--expect-reset` on the final watchdog
-write (or an explicitly authorized watchdog-returning Entry 2) records a
-pending reset on success. Only `--after-reset -- version` can finish it, with
-a successful A733 probe at the same port and a **different** device number.
-If that probe fails, retry it with the same state. An unacknowledged reset is
-not authorization to adopt a new identity. Peer changes refuse by default.
+Discovery reads sysfs only; it never stages or starts xfel. Use `3-3.4` for
+the 4 GB board and `3-6` for the 6 GB board. Do not exchange cables. Devnums
+can change on reset; rediscovery is not authorization to adopt a new devnum.
+The runner owns the lease, epoch transitions, reconnect policy and serial
+proof. Do not dispatch raw xfel or use retired bench boot/reset helpers.
 
 On little-endian Linux with libusb 1.0.27+ and `USBDEVFS_CONNINFO_EX`, xfel
-checks sysfs, opens one usbfs node, checks the topology, address and VID:PID
-on that fd, then wraps the **same fd**, with libusb discovery disabled. No
-fallback to address-only opening. Exit 2 means invalid arguments, 66 means
-target absent from a complete snapshot, 125 means refusal; other statuses
-propagate (child signals use `128 + signal`). `--timeout` is an admission
-timeout, not a transfer timeout. Keep attempt/verified stderr receipts.
+requires `--port PATH --devnum N` before the command, checks sysfs, verifies
+the address, topology and VID:PID on a single open usbfs fd, then wraps
+that **same fd** without libusb rediscovery. It supports `version`, `read`,
+`write`, `read32`, `write32` and `exec`. It rejects other commands before
+USB access. The `version` probe checks the A733 ID, including before each
+non-version command. `XFEL` overrides require `EXPECT_XFEL_SHA256`; the
+default uses `out/tools/xfel.record.json`. Set `SUDO=` for direct access
+or use the default `sudo` prefix.
 
-`fel-boot.sh` always uses a state file (private to this invocation unless
-`FEL_STATE_FILE` names the session's existing file). For confirmed Entry 2,
-set `FEL_SERIAL_LOG` to the active board's registered regular log under
-`~/src/radxa-a7a/serial-logs/` (`2026-11-18-1725-4g-luckfox.log` for
-`3-3.4`, `2026-11-18-1725-6g-luckfox.log` for `3-6`). The runner records
-the file identity and cursor just before submission. An acknowledged exec
-followed by disappearance or mailbox state 0x21 is not proof: the new serial
-slice must contain the RVBAR handover followed by `main>`. A late serial
-flush can be checked offline with `scripts/fel-handover.py` via `python3 -I`,
-passing the same port/log and `--since` the recorded JSON cursor; do not
-resubmit Entry 2. Never confirm an unacknowledged or identity-refused command.
+| Exit | Meaning |
+|---|---|
+| 0 | Command completed and every FEL status in it was a validated ACK; discovery only: stdout is the current decimal devnum; help only: usage. An ACK is not proof a submitted boot or reset completed. |
+| 2 | Bad arguments, missing/duplicate selectors, or unsupported command. |
+| 65 | Malformed FEL status or transport framing. |
+| 66 | Selected connector absent from sysfs, or an explicit device-loss error at open, verification or transfer. Not a submission ACK. |
+| 74 | Other transport or local I/O failure (including timeout). Do not infer device loss. |
+| 76 | Well-formed FEL status with a nonzero device status. |
+| 125 | Identity, tool or setup refusal (including changed devnum, wrong VID:PID/topology, unavailable verification, or an absent usbfs node whose matching sysfs identity remains). Never interpret as device loss. |
+| Other | Wrapper passes the child exit through, mapping a signal to `128 + signal`. An unrecognized status is a failure. |
 
 `make test` includes the compiled selector suite; it requires bubblewrap.
 To run that suite alone without hardware:
@@ -132,10 +112,9 @@ build knobs, EDK2 target and arguments, DTB source path and digest, and the
 intermediate and packaged digests. Rebuild old bundles: a manifest alone is
 not a build record.
 
-`make fel-boot` runs `scripts/fel-boot.sh out/fel/<mode>-<mhz>` with
-`XFEL=out/tools/xfel`, `EXPECT_MODE=<mode>` and `EXPECT_PROFILE=<mhz>`.
-Direct script invocations default to `blobfree` and `${DRAM_MHZ:-1200}`.
-The steps:
+### Boot protocol reference for the session runner
+
+These describe the boot protocol, not commands to run from this selector-only revision.
 
 1. **Stage and validate**: copy the bundle into a private directory (mode
    0700). Hash the staged bt0 and use that digest to look up the local build
@@ -165,19 +144,11 @@ The steps:
 
 ### Measurement builds
 
-A `dramlib` or `phyfw` bundle is a measurement build. A plain `make fel-boot`
-refuses it. To boot one, write an authorization file naming the exact
-`bt0_fel_sha256` from the local build record and a human authorization
-reference (a DECISIONS date and a queue key), then use the same measurement
-mode as the build; for example:
-
-    make fel-boot VENDOR_DRAM=yes FEL_MEASUREMENT_AUTH=/path/to/auth.json
-
-The file records a human authorization; it grants nothing by itself. The
-script checks that the staged bt0's digest matches the file and prints the
-reference. `EXPECT_SOURCE_SHA`/`EXPECT_OREBOOT_SHA` override the SHAs the
-record must match (for example to replay an older bundle with its retained
-local record); they do not authorize a measurement build.
+A `dramlib` or `phyfw` bundle is a measurement build. Its authorization
+file must name the exact `bt0_fel_sha256` from the local build record and a
+human authorization reference (a DECISIONS date and a queue key). The file
+records authorization; it grants nothing by itself. `scripts/fel-check.py`
+validates the digest and reference before producing the write plan.
 
 Build options: `DRAM_MHZ=1200|2400` (the DRAM clock of our own DRAM driver,
 which is the default; 1200 unless set), `VENDOR_DRAM=yes` (the vendor DRAM
@@ -225,7 +196,8 @@ vary by board and build). With the default DRAM driver the init line names
 - If bt0 prints `no warm reset 1 s after the request`, its watchdog resets
   the board back into FEL about 16 s later.
 - A refusal at entry 2 leaves the board in FEL: fix the images and run
-  `make fel-boot` again (entry 1 has to run again after a power cycle).
+  the reviewed session runner again (entry 1 has to run again after a power
+  cycle; the runner is held on task-000141).
 - Nothing in this flow writes the SD card, the SPI NOR flash or the eFuses.
 
 ## Images

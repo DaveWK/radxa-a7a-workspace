@@ -7,7 +7,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
-RAW = re.compile(r"(?<![\w-])(?:xfel(?:-t60)?|sunxi-fel)(?![\w-])", re.I)
+RAW = re.compile(r"(?<![\w-])(?:xfel(?:-t60)?|sunxi-fel|FEL_TOOL)(?![\w-])", re.I)
 # Non-consumers: building/staging, mock programs, and the sole real dispatcher.
 INFRA = {
     "scripts/build-xfel.sh",
@@ -21,26 +21,11 @@ INFRA = {
 }
 ALLOW = {
     "Makefile": (
-        "XFEL    ?= $(OUT)/tools/xfel",
         "firmware fel-image xfel fel-boot rpms fedora-image serial test clean mrproper FORCE",
-        "xfel: $(XFEL)",
-        "ifeq ($(origin XFEL),file)",
-        "$(XFEL): scripts/build-xfel.sh scripts/xfel-port-select.patch scripts/xfel-source.json scripts/fel-tools.py",
-        "$(XFEL):",
-        "fel-boot: $(XFEL)",
-        "$(if $(filter-out file,$(origin XFEL)),XFEL=$(call shell-quote,$(XFEL))) EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh $(FEL_OUT)",
-        "test: check-sources $(OUT)/tools/xfel",
-        "python3 -I scripts/test-xfel-binary.py $(OUT)/tools/xfel",
-    ),
-    "scripts/fel-boot.sh": (
-        "if [[ -v XFEL ]]; then",
-        "XFEL=$SCRIPTS/../out/tools/xfel",
-        'xfel_source=$(command -v -- "$XFEL") || die "xfel not found (XFEL=$XFEL)"',
-        'python3 -I "$SCRIPTS/fel-tools.py" stage-xfel "${xfel_flags[@]}" "$xfel_source" "$STAGE/xfel"',
-        "export XFEL=$STAGE/xfel",
-        """EXPECT_XFEL_SHA256=$(sha256sum <"$XFEL" | cut -d' ' -f1)""",
-        'ver=$(x version) || die "xfel version failed"',
-        'x exec "$ENTRY1" || die "xfel exec $ENTRY1 failed (see the serial console)"',
+        "xfel: $(TOP)/out/tools/xfel $(TOP)/out/tools/xfel.record.json",
+        "$(TOP)/out/tools/xfel $(TOP)/out/tools/xfel.record.json &: scripts/build-xfel.sh scripts/xfel-port-select.patch scripts/xfel-source.json scripts/fel-tools.py",
+        "test: check-sources xfel",
+        "python3 -I scripts/test-xfel-binary.py $(TOP)/out/tools/xfel",
     ),
 }
 
@@ -59,6 +44,8 @@ def main():
     for forbidden in (
         "xfel version",
         'timeout 5 "$XFEL" read 1 4 m',
+        '"${FEL_TOOL}" version',
+        'tool=$(command -v xfel); "$tool" version',
         "sudo sunxi-fel ver",
     ):
         assert raw_lines("scripts/fel-boot.sh", forbidden)
@@ -86,9 +73,7 @@ def main():
         findings.extend(raw_lines(name, path.read_text()))
     if findings:
         raise SystemExit("raw FEL references: " + ", ".join(findings))
-    print(
-        "workspace FEL consumer scan passed; three injected raw dispatch forms detected"
-    )
+    print("workspace FEL consumer scan passed")
 
 
 if __name__ == "__main__":

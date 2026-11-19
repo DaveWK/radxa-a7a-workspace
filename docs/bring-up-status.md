@@ -8,7 +8,7 @@ AXP318W PMIC, Maxio MAE0621A-Q3C Ethernet PHY. Tested with Fedora 45, kernel
 
 | Path | State |
 |---|---|
-| USB FEL (`make fel-boot`) | **Works.** bt0 → main → EDK2 → GRUB → Fedora login, root on a USB disk in the blue port. The current way to boot this board; see [usb-fel-boot.md](usb-fel-boot.md) |
+| USB FEL | **Previously verified:** bt0 → main → EDK2 → GRUB → Fedora login, root on USB. Board runs are now held on the task-000141 session runner; see [usb-fel-boot.md](usb-fel-boot.md). |
 | microSD | Booted bt0 → main → EDK2 → Fedora until 2026-11-11. Since then the slot on our board does not boot any card (below) |
 | SPI NOR | Not used. The board's NOR holds no firmware; nothing here writes it |
 | Fastboot over FEL | **Works on a development build**, not yet in this workspace: the firmware is sent over USB and booted from RAM. It writes no storage ([usb-fel-boot.md](usb-fel-boot.md#fastboot-over-fel)) |

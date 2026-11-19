@@ -206,42 +206,14 @@ elif tool == "aarch64-linux-gnu-gcc":
     sys.exit("the fixture must not run the cross compiler")
 elif tool == "xfel":
     if args == ["--help"]:
-        print("xfel [--port PATH --devnum N] COMMAND ...")
+        print("xfel --port PATH --devnum N COMMAND ...")
         if "FAKE_XFEL_SWAP" in env:
             Path(env["FAKE_XFEL_SWAP"]).write_text("#!/bin/sh\nexit 97\n")
-        if "FAKE_BOOT_SWAP" in env:
-            Path(env["FAKE_BOOT_SWAP"]).write_bytes(b"replacement after validation\n")
     else:
-        assert args[:4] == ["--port", env["FEL_PORT"], "--devnum", "12"]
-        args = args[4:]
+        assert args == ["--port", env["FEL_PORT"], "--devnum", "12", "version"]
         with open(env["FAKE_USB_LOG"], "a") as log:
-            log.write(json.dumps([tool, *args]) + "\n")
-        cmd, *params = args
-        mem = Path(env["FAKE_MEM"])
-        if cmd == "version":
-            print("xfel fixture ID=0x00190300")
-        elif cmd == "write":
-            addr, contents = params
-            shutil.copyfile(contents, mem / addr)
-        elif cmd == "read":
-            addr, size, out = params
-            if addr == "0xdf000" and size == "28":
-                state = 0x21 if (mem / "entry2").exists() else 0x11
-                data = struct.pack("<7I", 0x46413741, state, 4096, 1200, 0, 0, 0)
-            else:
-                data = (mem / addr).read_bytes()
-            Path(out).write_bytes(data[:int(size)])
-        elif cmd == "exec" and params == ["0x90044"]:
-            (mem / "entry2").touch()
-            if "FAKE_NO_HANDOVER" not in env:
-                with open(env["FEL_SERIAL_LOG"], "a") as log:
-                    log.write("[bt0] RVBAR 00000000:40000000, fixture\nmain>\n")
-            if "FAKE_UNACK" in env:
-                sys.exit(31)
-            if "FAKE_CHANGE_DEVNUM" in env:
-                (Path(env["FEL_SYSFS_ROOT"]) / env["FEL_PORT"] / "devnum").write_text("19")
-            if "FAKE_UNPLUG_AFTER_ENTRY2" in env:
-                shutil.rmtree(Path(env["FEL_SYSFS_ROOT"]) / env["FEL_PORT"])
+            log.write("version\n")
+        print("xfel fixture ID=0x00190300")
 else:
     sys.exit(f"unknown fixture tool {tool}")
 """
@@ -320,8 +292,6 @@ class GateTests(unittest.TestCase):
         self.fedora = self.workspace / "fedora"
         self.tools = self.root / "tools"
         self.tools.mkdir()
-        self.mem = self.root / "mem"
-        self.mem.mkdir()
         self.cargo_log = self.root / "cargo.log"
         self.edk2_log = self.root / "edk2.log"
         self.usb_log = self.root / "usb.log"
@@ -355,7 +325,6 @@ class GateTests(unittest.TestCase):
             FAKE_CARGO_LOG=str(self.cargo_log),
             FAKE_EDK2_LOG=str(self.edk2_log),
             FAKE_USB_LOG=str(self.usb_log),
-            FAKE_MEM=str(self.mem),
             REAL_CP=shutil.which("cp"),
             REAL_CARGO=shutil.which("cargo"),
             REAL_FLOCK=shutil.which("flock"),
@@ -384,11 +353,6 @@ class GateTests(unittest.TestCase):
             path.write_text(f"#!{sys.executable}\n{FAKE_TOOLS}")
             path.chmod(0o755)
         self.env["EXPECT_XFEL_SHA256"] = sha(self.tools / "xfel")
-        serial = self.root / "src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
-        serial.parent.mkdir(parents=True)
-        serial.write_text("[bt0] RVBAR 00000000:40000000, stale\nmain>\n")
-        self.env["FEL_SERIAL_LOG"] = str(serial)
-
         self.workspace.mkdir()
         shutil.copy2(SOURCE / "Makefile", self.workspace)
         scripts = self.workspace / "scripts"
@@ -398,7 +362,6 @@ class GateTests(unittest.TestCase):
             "fel-manifest.py",
             "fel-check.py",
             "fel-boot.sh",
-            "fel-handover.py",
             "xfel-port",
             "build-xfel.sh",
             "xfel-port-select.patch",
@@ -520,8 +483,6 @@ class GateTests(unittest.TestCase):
         git(repo, "commit", "-qm", "Fixture sources")
 
     def make(self, *args, **env):
-        if "fel-boot" in args:
-            env["HOME"] = str(self.root)
         return subprocess.run(
             ["make", "--no-print-directory", *args],
             cwd=self.workspace,
@@ -539,23 +500,64 @@ class GateTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, self.process_result(proc))
         return self.workspace / "out" / "fel" / slot
 
-    def boots(self, *args, auth=None, **env):
-        return self.run_boot("make", *args, auth=auth, **env)
+    def check(self, *args, auth=None, **env):
+        flags = dict(arg.split("=", 1) for arg in args)
+        mode = {"yes": "dramlib", "phyfw": "phyfw"}.get(
+            flags.get("VENDOR_DRAM"), "blobfree"
+        )
+        profile = flags.get("DRAM_MHZ", "1200") if mode == "blobfree" else "2400"
+        bundle = self.workspace / "out/fel" / f"{mode}-{profile}"
+        return self.check_bundle(
+            bundle, auth=auth, EXPECT_MODE=mode, EXPECT_PROFILE=profile, **env
+        )
 
-    def run_boot(self, entry, *args, auth=None, **env):
-        env["HOME"] = str(self.root)
-        if auth:
-            env["FEL_MEASUREMENT_AUTH"] = str(auth)
+    def check_bundle(self, bundle, *, auth=None, EXPECT_MODE, EXPECT_PROFILE, **env):
+        stage = Path(tempfile.mkdtemp(dir=self.root))
+        self.staged = stage
+        (stage / "work").mkdir()
+        for name in (*PACKAGED, "build-manifest.json"):
+            if (bundle / name).exists():
+                shutil.copy2(bundle / name, stage)
         self.usb_log.write_text("")
-        for f in self.mem.iterdir():
-            f.unlink()
-        if entry == "make":
-            return self.make("fel-boot", *args, f"XFEL={self.tools / 'xfel'}", **env)
-        env["XFEL"] = str(self.tools / "xfel")
         return subprocess.run(
-            [str(self.workspace / "scripts/fel-boot.sh"), *args],
+            [
+                sys.executable,
+                "-I",
+                self.workspace / "scripts/fel-check.py",
+                stage,
+                "--work",
+                stage / "work",
+                "--expect-mode",
+                EXPECT_MODE,
+                "--expect-profile",
+                EXPECT_PROFILE,
+                *(["--measurement-auth", auth] if auth else []),
+            ],
             cwd=self.workspace,
             env=dict(self.env, **env),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+
+    def probe(self, *, override=True, **env):
+        self.usb_log.write_text("")
+        child_env = dict(self.env, **env)
+        child_env.pop("XFEL", None)
+        if override:
+            child_env["XFEL"] = str(self.tools / "xfel")
+        return subprocess.run(
+            [
+                self.workspace / "scripts/xfel-port",
+                "--port",
+                child_env["FEL_PORT"],
+                "--devnum",
+                "12",
+                "--",
+                "version",
+            ],
+            cwd=self.workspace,
+            env=child_env,
             text=True,
             capture_output=True,
             timeout=30,
@@ -570,34 +572,31 @@ class GateTests(unittest.TestCase):
     def record(self, bt0_digest):
         return self.workspace / "out" / "fel" / ".records" / f"{bt0_digest}.json"
 
-    def assert_writes(self, proc, bt0, firmware, base):
+    def assert_staged_plan(self, proc, slot):
         self.assertEqual(proc.returncode, 0, self.process_result(proc))
+        self.assertEqual(self.usb_log.read_text(), "")
+        self.assertEqual(
+            (self.staged / "bt0-fel.bin").read_bytes(),
+            (slot / "bt0-fel.bin").read_bytes(),
+        )
+        firmware = (slot / "firmware.bin").read_bytes()
+        base = int((slot / "firmware.seek").read_text()) * 512
         table = firmware[0x1FF000 - base : 0x1FF000 - base + 512]
-        outputs = {"0xdf000": bytes(4096), "0x90000": bt0, "0xdf200": table}
+        work = self.staged / "work"
+        self.assertEqual((work / "table.bin").read_bytes(), table)
         count = struct.unpack_from("<I", table, 12)[0]
-        for i in range(count):
+        plan = (work / "plan").read_text().splitlines()
+        self.assertEqual(len(plan), count)
+        for i, line in enumerate(plan):
             _, _, offset, size, addr, _, _ = struct.unpack_from(
                 "<IIIIQII", table, 24 + 32 * i
             )
-            outputs[hex(addr)] = firmware[offset - base : offset - base + size]
-        self.assertEqual(
-            [
-                args[2]
-                for args in map(json.loads, self.usb_log.read_text().splitlines())
-                if args[:2] == ["xfel", "write"]
-            ],
-            list(outputs),
-        )
-        for addr, expected in outputs.items():
-            self.assertEqual((self.mem / addr).read_bytes(), expected, addr)
-
-    def assert_bundle_writes(self, proc, slot):
-        self.assert_writes(
-            proc,
-            (slot / "bt0-fel.bin").read_bytes(),
-            (slot / "firmware.bin").read_bytes(),
-            int((slot / "firmware.seek").read_text()) * 512,
-        )
+            _, address, length, file, _ = line.split(maxsplit=4)
+            self.assertEqual((int(address, 0), int(length)), (addr, size))
+            self.assertEqual(
+                (work / file).read_bytes(),
+                firmware[offset - base : offset - base + size],
+            )
 
     def test_snapshot_replacement_after_copy(self):
         swapped = self.root / "swap-receipt"
@@ -620,7 +619,7 @@ class GateTests(unittest.TestCase):
     def test_unrecorded_blobfree_refused(self):
         bundle = self.build()
         self.record(sha(bundle / "bt0-fel.bin")).unlink(missing_ok=True)
-        self.refusal(self.boots(), "no local build record")
+        self.refusal(self.check(), "no local build record")
 
     def test_measurement_record_cannot_be_relabeled(self):
         bundle = self.build("dramlib-2400", "VENDOR_DRAM=yes")
@@ -628,7 +627,7 @@ class GateTests(unittest.TestCase):
         write_json(
             manifest, dict(read_json(manifest), mode="blobfree", features=["fel"])
         )
-        self.refusal(self.boots("VENDOR_DRAM=yes"), "manifest mode disagrees")
+        self.refusal(self.check("VENDOR_DRAM=yes"), "manifest mode disagrees")
 
     def test_record_disagrees_with_requested_and_manifest_profile(self):
         bundle = self.build()
@@ -639,10 +638,10 @@ class GateTests(unittest.TestCase):
         data["profile"] = type(data["profile"])(2400)
         write_json(manifest, data)
         with self.subTest("requested profile"):
-            self.refusal(self.boots("DRAM_MHZ=2400"), "record profile 1200")
+            self.refusal(self.check("DRAM_MHZ=2400"), "record profile 1200")
         with self.subTest("manifest profile"):
             write_json(bundle / "build-manifest.json", data)
-            self.refusal(self.boots(), "manifest profile disagrees")
+            self.refusal(self.check(), "manifest profile disagrees")
 
     def test_rehashed_manifest_cannot_replace_record_digests(self):
         bundle = self.build()
@@ -652,7 +651,7 @@ class GateTests(unittest.TestCase):
         image.write_bytes(firmware)
         manifest = bundle / "build-manifest.json"
         write_json(manifest, dict(read_json(manifest), firmware_sha256=sha(image)))
-        self.refusal(self.boots(), "manifest firmware_sha256 disagrees")
+        self.refusal(self.check(), "manifest firmware_sha256 disagrees")
 
     def test_manifest_cannot_claim_different_provenance(self):
         bundle = self.build()
@@ -667,7 +666,7 @@ class GateTests(unittest.TestCase):
         ):
             with self.subTest(change=change):
                 write_json(manifest, dict(data, **change))
-                self.refusal(self.boots())
+                self.refusal(self.check())
 
     def test_default_and_2400_compile_at_the_recorded_profile(self):
         low = self.build()
@@ -855,9 +854,8 @@ class GateTests(unittest.TestCase):
         ):
             with self.subTest(mode=mode):
                 self.refusal(
-                    self.run_boot(
-                        "script",
-                        str(bundle),
+                    self.check_bundle(
+                        bundle,
                         auth=auth,
                         EXPECT_MODE=mode,
                         EXPECT_PROFILE=str(profile),
@@ -865,15 +863,12 @@ class GateTests(unittest.TestCase):
                     f"does not match requested mode {mode}",
                 )
         self.refusal(
-            self.run_boot(
-                "script", str(dramlib), EXPECT_MODE="dramlib", EXPECT_PROFILE="2400"
-            ),
+            self.check_bundle(dramlib, EXPECT_MODE="dramlib", EXPECT_PROFILE="2400"),
             "FEL_MEASUREMENT_AUTH",
         )
-        self.assert_bundle_writes(
-            self.run_boot(
-                "script",
-                str(dramlib),
+        self.assert_staged_plan(
+            self.check_bundle(
+                dramlib,
                 auth=auth,
                 EXPECT_MODE="dramlib",
                 EXPECT_PROFILE="2400",
@@ -882,7 +877,7 @@ class GateTests(unittest.TestCase):
         )
         wrong_slot = blobfree.with_name("blobfree-2400")
         shutil.copytree(dramlib, wrong_slot)
-        self.refusal(self.boots("DRAM_MHZ=2400", auth=auth), "requested mode blobfree")
+        self.refusal(self.check("DRAM_MHZ=2400", auth=auth), "requested mode blobfree")
 
     def test_disjoint_dry_run_slots_and_fixed_measurement_profiles(self):
         for mode, profile, args in (
@@ -898,12 +893,6 @@ class GateTests(unittest.TestCase):
                 self.assertIn(f"--out-dir {slot}", proc.stdout.replace('"', ""))
                 self.assertIn(f"{slot}/build/", proc.stdout)
                 self.assertFalse(slot.exists())
-                boot = self.make("-n", "fel-boot", *args, f"XFEL={self.tools / 'xfel'}")
-                self.assertEqual(boot.returncode, 0, self.process_result(boot))
-                self.assertIn(
-                    f"EXPECT_MODE={mode} EXPECT_PROFILE={profile} scripts/fel-boot.sh {slot}",
-                    boot.stdout,
-                )
                 if mode == "blobfree":
                     self.assertIn(
                         f"env A7A_PROFILE={profile} CARGO_TARGET_DIR=", proc.stdout
@@ -1009,9 +998,9 @@ class GateTests(unittest.TestCase):
         dtb = self.root / "external.dtb"
         dtb.write_bytes(DTB)
         bundle = self.build("blobfree-1200", f"FEL_DTB_INPUT={dtb}")
-        self.refusal(self.boots(), "EXPECT_DTB_SHA256")
-        self.refusal(self.boots(EXPECT_DTB_SHA256="a" * 64), "EXPECT_DTB_SHA256")
-        self.assert_bundle_writes(self.boots(EXPECT_DTB_SHA256=sha(dtb)), bundle)
+        self.refusal(self.check(), "EXPECT_DTB_SHA256")
+        self.refusal(self.check(EXPECT_DTB_SHA256="a" * 64), "EXPECT_DTB_SHA256")
+        self.assert_staged_plan(self.check(EXPECT_DTB_SHA256=sha(dtb)), bundle)
 
     def test_packaged_dtb_refusals(self):
         for case, msg in (
@@ -1150,36 +1139,23 @@ class GateTests(unittest.TestCase):
             f.write("\n# different xfel\n")
         for expectation in ("", self.env["EXPECT_XFEL_SHA256"]):
             with self.subTest(expectation=expectation):
-                self.refusal(self.boots(EXPECT_XFEL_SHA256=expectation))
+                self.refusal(self.probe(EXPECT_XFEL_SHA256=expectation))
 
-    def test_handover_requires_ack_identity_and_fresh_board_serial(self):
-        bundle = self.build()
-        port = Path(self.env["FEL_SYSFS_ROOT"]) / self.env["FEL_PORT"]
-        for knobs, rc in [
-            (dict(FAKE_UNACK="1"), 31),
-            (dict(FAKE_CHANGE_DEVNUM="1"), 125),
-            (dict(FAKE_NO_HANDOVER="1"), 1),
-            (dict(FEL_SERIAL_LOG=self.env["FEL_SERIAL_LOG"].replace("4g-", "6g-")), 1),
-            (dict(FAKE_UNPLUG_AFTER_ENTRY2="1"), 0),
-        ]:
-            with self.subTest(knobs=knobs):
-                (port / "devnum").write_text("12")
-                proc = self.run_boot("script", bundle, **knobs)
-                self.assertEqual(proc.returncode, rc, self.process_result(proc))
-                self.assertEqual("confirmed by fresh serial" in proc.stdout, rc == 0)
-
-    def test_xfel_runs_only_staged_copy(self):
-        bundle = self.build()
-        self.assert_bundle_writes(
-            self.boots(FAKE_XFEL_SWAP=str(self.tools / "xfel")), bundle
+    def test_boot_waits_for_session_owner(self):
+        self.refusal(
+            self.make("fel-boot"), "FEL boots go through scripts/fel_session.py"
         )
 
+    def test_xfel_runs_only_staged_copy(self):
+        proc = self.probe(FAKE_XFEL_SWAP=str(self.tools / "xfel"))
+        self.assertEqual(proc.returncode, 0, self.process_result(proc))
+        self.assertEqual(self.usb_log.read_text(), "version\n")
+
     def test_default_xfel_needs_build_record(self):
-        bundle = self.build()
         default = self.workspace / "out/tools/xfel"
         default.parent.mkdir()
         shutil.copy2(self.tools / "xfel", default)
-        self.refusal(self.make("fel-boot"))
+        self.refusal(self.probe(override=False))
         commit = "445e8aefe6914c85817cc9bd1d201629364b0ec6"
         patched = self.tools / "fel.c"
         patched.write_text("// patched fixture source\n")
@@ -1196,7 +1172,6 @@ class GateTests(unittest.TestCase):
         write_json(pins_path, pins)
         git(self.workspace, "commit", "-qam", "pin fixture xfel sources")
         # Use a record for the fixture workspace's new HEAD.
-        bundle = self.build()
         subprocess.run(
             [
                 sys.executable,
@@ -1205,6 +1180,7 @@ class GateTests(unittest.TestCase):
                 "record-xfel",
                 self.tools,
                 commit,
+                *(shutil.which(tool) for tool in ("cc", "make", "pkg-config")),
             ],
             check=True,
         )
@@ -1219,25 +1195,36 @@ class GateTests(unittest.TestCase):
                 "selector_patch_sha256": sha(
                     self.workspace / "scripts/xfel-port-select.patch"
                 ),
-                "compiler": subprocess.check_output(
-                    ["gcc", "--version"], text=True
-                ).splitlines()[0],
+                **{
+                    key: {
+                        "path": shutil.which(tool),
+                        "version": subprocess.check_output(
+                            [tool, "--version"], text=True
+                        ).splitlines()[0],
+                    }
+                    for key, tool in (
+                        ("compiler", "cc"),
+                        ("make", "make"),
+                        ("pkg_config", "pkg-config"),
+                    )
+                },
                 "libusb_version": subprocess.check_output(
                     ["pkg-config", "--modversion", "libusb-1.0"], text=True
                 ).strip(),
             },
         )
-        self.assert_bundle_writes(self.make("fel-boot"), bundle)
+        proc = self.probe(override=False)
+        self.assertEqual(proc.returncode, 0, self.process_result(proc))
         receipt_path = default.with_suffix(".record.json")
         receipt = read_json(receipt_path)
         write_json(receipt_path, dict(receipt, patched_main_c_sha256="wrong"))
         self.usb_log.write_text("")
-        self.refusal(self.make("fel-boot"), "source/selector seal mismatch")
+        self.refusal(self.probe(override=False), "source/selector seal mismatch")
         write_json(receipt_path, receipt)
         with default.open("a") as f:
             f.write("\n# other binary\n")
         self.usb_log.write_text("")
-        self.refusal(self.make("fel-boot"))
+        self.refusal(self.probe(override=False))
 
     def test_basetools_changed_binary(self):
         self.build()
@@ -1313,20 +1300,20 @@ class GateTests(unittest.TestCase):
         self.assertEqual(git(self.workspace, "status", "--porcelain"), "")
         self.assertFalse((self.workspace / "out" / "fel" / ".records").exists())
 
-    def test_measurement_authorization_and_exact_writes(self):
+    def test_measurement_authorization_and_exact_plan(self):
         for opt, mode in (("yes", "dramlib"), ("phyfw", "phyfw")):
             with self.subTest(mode=mode):
                 flags = (f"VENDOR_DRAM={opt}",)
                 bundle = self.build(f"{mode}-2400", *flags)
                 bt0 = sha(bundle / "bt0-fel.bin")
-                self.refusal(self.boots(*flags), "FEL_MEASUREMENT_AUTH")
+                self.refusal(self.check(*flags), "FEL_MEASUREMENT_AUTH")
                 auth = self.root / "auth.json"
                 write_json(
                     auth, {"bt0_fel_sha256": "0" * 64, "authorization": "fixture"}
                 )
-                self.refusal(self.boots(*flags, auth=auth))
+                self.refusal(self.check(*flags, auth=auth))
                 write_json(auth, {"bt0_fel_sha256": bt0, "authorization": "fixture"})
-                self.assert_bundle_writes(self.boots(*flags, auth=auth), bundle)
+                self.assert_staged_plan(self.check(*flags, auth=auth), bundle)
                 self.assertTrue(
                     self.record(bt0).is_file(), "missing measurement record"
                 )
@@ -1340,16 +1327,12 @@ class GateTests(unittest.TestCase):
                     {"A733_DRAM_LIB"} if mode == "dramlib" else {"A733_PHY_FW_OBJ"},
                 )
 
-    def test_success_writes_staged_bt0_table_and_payload(self):
+    def test_success_stages_bt0_table_and_payload(self):
         bundle = self.build()
-        bt0, firmware = (
-            (bundle / name).read_bytes() for name in ("bt0-fel.bin", "firmware.bin")
-        )
-        proc = self.boots(FAKE_BOOT_SWAP=str(bundle / "bt0-fel.bin"))
-        self.assert_writes(proc, bt0, firmware, 0x20000)
-        self.assertEqual(
-            (bundle / "bt0-fel.bin").read_bytes(), b"replacement after validation\n"
-        )
+        self.assert_staged_plan(self.check(), bundle)
+        original = (self.staged / "bt0-fel.bin").read_bytes()
+        (bundle / "bt0-fel.bin").write_bytes(b"replacement after validation\n")
+        self.assertEqual((self.staged / "bt0-fel.bin").read_bytes(), original)
 
     def refresh_fixture_digests(self, bundle):
         # Make a consistent but malformed fixture so it reaches layout/SRAM
@@ -1368,7 +1351,7 @@ class GateTests(unittest.TestCase):
         bundle = self.build()
         files = {name: (bundle / name).read_bytes() for name in PACKAGED}
         (bundle / "firmware.seek").unlink()
-        self.refusal(self.boots(), "firmware.seek missing")
+        self.refusal(self.check(), "firmware.seek")
         (bundle / "firmware.seek").write_bytes(files["firmware.seek"])
         image = bundle / "firmware.bin"
         bytes_ = bytearray(files["firmware.bin"])
@@ -1376,13 +1359,13 @@ class GateTests(unittest.TestCase):
         image.write_bytes(bytes_)
         self.refresh_fixture_digests(bundle)
         with self.subTest("layout corruption"):
-            self.refusal(self.boots(), "layout table header or CRC")
+            self.refusal(self.check(), "layout table header or CRC")
         image.write_bytes(files["firmware.bin"])
         with (bundle / "bt0-fel.bin").open("ab") as f:
             f.truncate(0x4F001)
         self.refresh_fixture_digests(bundle)
         with self.subTest("FEL SRAM overflow"):
-            self.refusal(self.boots(), "outside the FEL SRAM window")
+            self.refusal(self.check(), "outside the FEL SRAM window")
 
     def test_edk2_modes_wait_at_the_same_lock(self):
         fifo = self.root / "edk2-events"

@@ -86,7 +86,7 @@ Fedora 45 host with the packages in `Containerfile`; there
 | `make firmware` | `out/firmware/firmware.bin` + `firmware.seek`: bt0, layout table, main, EDK2 (with the DTB), for the SD card or the eMMC at sector 256 |
 | `make fel-image` | `out/fel/<mode>-<mhz>/` (`blobfree-1200`, `blobfree-2400`, `dramlib-2400`, `phyfw-2400`): `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and `build-manifest.json`; intermediates and the cargo target under `build/` |
 | `make xfel` | `out/tools/xfel`: xfel v1.4.0 built from source with a 60 s USB timeout |
-| `make fel-boot` | boots the board over USB FEL with `out/fel/<mode>-<mhz>/` (run on the host, see below). Refuses any mode but `blobfree`; a measurement build needs `FEL_MEASUREMENT_AUTH=<file>` |
+| `make fel-boot` | refuses until task-000141 supplies the FEL session runner |
 | `make rpms` | `out/fedora/rpmbuild/`: the `cubie-a7a-*` SRPMs and RPMs |
 | `make fedora-image` | `out/image/a7a-fedora45.img`: GPT, `firmware.bin` at sector 256, ESP, Fedora 45 root (grows to the card on first boot) |
 | `make serial` | UART0 logger: picocom in a detached screen session, logs in `serial-logs/` |
@@ -105,18 +105,9 @@ are generated on first boot). Change the password on first login.
 
 ## Boot it
 
-**USB FEL boot** is the current path, with no SD card needed. Full
-instructions are in [docs/usb-fel-boot.md](docs/usb-fel-boot.md):
-
-    dd if=out/image/a7a-fedora45.img of=/dev/sdX bs=4M conv=fsync   # USB disk, blue port
-    make xfel                       # once
-    export FEL_SERIAL_LOG="$HOME/src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
-    FEL_PORT=3-3.4 make fel-boot    # 4 GB board; the 6 GB board uses 3-6
-
-`make fel-boot` boots the blob-free image (`out/fel/blobfree-1200/`). A
-`dramlib` or `phyfw` measurement build needs `FEL_MEASUREMENT_AUTH=<file>`
-naming the bundle's `bt0_fel_sha256` and a human authorization reference; the
-file records the authorization and grants nothing by itself.
+**USB FEL boot** is held until task-000141. The host selector API and exit
+codes are in [docs/usb-fel-boot.md](docs/usb-fel-boot.md). You can build the
+selector with `make xfel` without a board.
 
 **SD card**: write `out/image/a7a-fedora45.img` to a microSD card, or write
 only `out/firmware/firmware.bin` at sector 256 of an existing card. See
@@ -146,29 +137,26 @@ built in, so `make firmware` and `make fel-image` need no `make vendor`.
   the firmware's default, 1200, the clock Fedora boots at. 2400 is there
   for the work on it: it does not boot Linux yet (see the status above). The
   vendor paths run 2400 MHz. The profile is part of the bundle path
-  (`out/fel/<mode>-<mhz>/`) and `make fel-boot` checks it.
+  (`out/fel/<mode>-<mhz>/`) and `scripts/fel-check.py` verifies it.
 - `VENDOR_DRAM=yes`: measurement build. DRAM init through Allwinner's DRAM
   library, linked into bt0 from `vendor/` (run `make vendor` first), at
   2400 MHz. It is also what the 8 and 12 GB boards need for now: their
   parameter sets run another DRAM clock, which our driver's stages refuse.
-  A plain `make fel-boot` refuses it; boot it with
-  `FEL_MEASUREMENT_AUTH=<file>`.
+  The build does not authorize a measurement boot.
 - `VENDOR_DRAM=phyfw`: measurement build. Our driver with the PHY's own
   training firmware, read from the library object as data (`make vendor` as
-  well). A plain `make fel-boot` refuses it; boot it with
-  `FEL_MEASUREMENT_AUTH=<file>`.
+  well). The build does not authorize a measurement boot.
 
 One setting of our driver can be changed for a build by its `A7A_*`
 variable in the environment; the board README in `firmware/oreboot`
 (`src/mainboard/radxa/cubie-a7a/`) lists how. Earlier spellings:
 `BLOBLESS=yes` and `FEL_DRAM=open` are the default now, and
-`FEL_DRAM=dramlib` still builds only the FEL `bt0` with the library, a
-measurement build a plain `make fel-boot` refuses (`FEL_MEASUREMENT_AUTH=<file>`
-to boot it).
+`FEL_DRAM=dramlib` still builds only the FEL `bt0` with the library, for
+measurements.
 
 When our driver's training does not end clean, `bt0` halts instead of
-booting: over USB FEL the board stays in FEL and `make fel-boot` reports
-the mailbox state; from a card the next start enters FEL.
+booting: over USB FEL the board stays in FEL and records the failure in
+the mailbox; from a card the next start enters FEL.
 
 ## Vendor inputs
 

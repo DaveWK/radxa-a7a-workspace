@@ -1,12 +1,9 @@
 #!/usr/bin/python3 -I
 # SPDX-License-Identifier: GPL-2.0-only
-"""Run one command on a port-bound FEL device; never fall back to a USB address."""
+"""Stateless A733 FEL selector, pinned to a port and current devnum."""
 
 import argparse
-from contextlib import ExitStack
-import fcntl
-import json
-import math
+import errno
 import os
 from pathlib import Path
 import re
@@ -14,120 +11,88 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 
 SCRIPTS = Path(__file__).resolve().parent
 PORT = re.compile(r"[1-9][0-9]*-[1-9][0-9]*(?:\.[1-9][0-9]*)*")
+DECIMAL = re.compile(r"[0-9]+")
 
 
-class PortAbsent(Exception):
-    """Complete snapshot, peer checks passed, target absent."""
+def number(text, max_value):
+    if not DECIMAL.fullmatch(text) or not 1 <= int(text) <= max_value:
+        raise ValueError(f"invalid USB number: {text!r}")
+    return int(text)
 
 
-def snapshot(root, requested):
-    devices = {}
-    for path in root.iterdir():
-        if not PORT.fullmatch(path.name):
-            continue
-        vid_pid = tuple(
-            (path / key).read_text().strip() for key in ("idVendor", "idProduct")
-        )
-        if vid_pid != ("1f3a", "efe8"):
-            if path.name == requested:
-                raise ValueError(f"wrong VID:PID at {requested}: {':'.join(vid_pid)}")
-            continue
-        bus, ports, number = (
-            (path / key).read_text().strip() for key in ("busnum", "devpath", "devnum")
-        )
-        if f"{int(bus)}-{ports}" != path.name or not 1 <= int(number) <= 127:
-            raise ValueError(f"inconsistent USB identity at {path.name}")
-        devices[path.name] = int(number)
-    return devices
-
-
-def select(args, previous):
-    if previous is None and (args.command[1:] != ["version"] or args.after_reset):
-        raise ValueError("begin a session with a successful version probe")
-    if previous is not None and previous["pending_reset"] != args.after_reset:
-        raise ValueError(
-            "pending reset requires --after-reset; otherwise it is forbidden"
-        )
-    if previous is not None and previous["port"] != args.port:
-        raise ValueError("state belongs to another port")
-    deadline = time.monotonic() + args.timeout
-    while True:
-        try:
-            devices = snapshot(args.sysfs, args.port)
-        except FileNotFoundError:
-            # A sysfs entry disappeared during enumeration; never use a partial scan.
-            devices = None
-        if devices is not None:
-            peers = {k: v for k, v in devices.items() if k != args.port}
-            if previous is not None and previous["peers"] != peers:
-                raise ValueError("another FEL port changed since the preceding call")
-            if args.port in devices and (
-                not args.after_reset or devices[args.port] != previous["devnum"]
-            ):
-                if (
-                    previous
-                    and not args.after_reset
-                    and devices[args.port] != previous["devnum"]
-                ):
-                    raise ValueError("live session devnum changed")
-                return dict(
-                    port=args.port,
-                    devnum=devices[args.port],
-                    peers=peers,
-                    pending_reset=args.expect_reset,
-                )
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            if devices is not None and args.port not in devices:
-                raise PortAbsent(f"no FEL device at {args.port}")
-            raise ValueError(f"expected FEL enumeration at {args.port} not observed")
-        time.sleep(min(0.1, remaining))
+def discover(root, port):
+    root.stat()  # A missing/unreadable sysfs root is not device loss.
+    path = root / port
+    try:
+        fields = [
+            (path / name).read_text().strip()
+            for name in ("idVendor", "idProduct", "busnum", "devpath", "devnum")
+        ]
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENODEV):
+            raise
+        root.stat()
+        path.stat()  # Only classify the whole missing connector as absent.
+        raise ValueError(f"incomplete USB identity at {port}") from exc
+    vid, pid, bus, chain, devnum = fields
+    if (vid, pid) != ("1f3a", "efe8") or f"{number(bus, 255)}-{chain}" != port:
+        raise ValueError(f"wrong USB identity at {port}")
+    return number(devnum, 127)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--discover", action="store_true")
     parser.add_argument("--port", required=True)
-    parser.add_argument("--timeout", type=float, default=0, metavar="SECONDS")
-    parser.add_argument("--state", type=Path, required=True)
-    reset = parser.add_mutually_exclusive_group()
-    reset.add_argument("--after-reset", action="store_true")
-    reset.add_argument("--expect-reset", action="store_true")
+    parser.add_argument("--devnum")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     opts = sys.argv[1 : sys.argv.index("--")] if "--" in sys.argv else sys.argv[1:]
-    for key in ("--port", "--state"):
-        if sum(x.split("=", 1)[0] == key for x in opts) != 1:
-            parser.error(f"exactly one {key} is required")
-    if not PORT.fullmatch(args.port):
+    for key in ("--port", "--devnum", "--discover"):
+        if sum(x.split("=", 1)[0] == key for x in opts) > 1:
+            parser.error(f"duplicate {key}")
+    if len(args.port) >= 40 or not PORT.fullmatch(args.port):
         parser.error("expected a sysfs port such as 3-3.4")
-    if not math.isfinite(args.timeout) or args.timeout < 0:
-        parser.error("timeout must be finite and non-negative")
-    if (
-        len(args.command) < 2
-        or args.command[0] != "--"
-        or args.command[1].startswith("-")
-        or any(a in ("--help", "-h") for a in args.command[1:])
-    ):
-        parser.error("expected -- COMMAND [ARG ...]")
-    if args.after_reset and args.command[1:] != ["version"]:
-        parser.error("--after-reset permits only version")
-    if args.expect_reset and args.command[1:] not in (
-        ["write32", "0x0205000c", "0x000014af"],
-        ["exec", "0x90044"],
-    ):
-        parser.error("--expect-reset requires the WDT trigger or Entry 2")
-    args.sysfs = Path(os.getenv("FEL_SYSFS_ROOT", "/sys/bus/usb/devices"))
+    if args.discover:
+        if args.devnum is not None or args.command:
+            parser.error("--discover takes only --port PATH")
+    else:
+        try:
+            expected = number(args.devnum or "", 127)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if (
+            len(args.command) < 2
+            or args.command[0] != "--"
+            or args.command[1].startswith("-")
+        ):
+            parser.error("expected -- COMMAND [ARG ...]")
+    root = Path(os.getenv("FEL_SYSFS_ROOT", "/sys/bus/usb/devices"))
+    try:
+        current = discover(root, args.port)
+    except OSError as exc:
+        if exc.filename == str(root / args.port) and exc.errno in (
+            errno.ENOENT,
+            errno.ENODEV,
+        ):
+            print(f"xfel-port: no device at {args.port}", file=sys.stderr)
+            return 66
+        raise
+    if args.discover:
+        print(current)
+        return 0
+    if current != expected:
+        raise ValueError(
+            f"devnum changed at {args.port}: expected {expected}, found {current}"
+        )
+
     out = SCRIPTS.parent / "out"
     out.mkdir(exist_ok=True)
-    with ExitStack() as stack:
-        # Both the capability check (no USB) and dispatch use the same verified
-        # private copy. Old xfel opens a device even for unknown command names.
-        tmp = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=out)))
-        tool = tmp / "xfel"
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        tool = Path(tmp) / "xfel"
         override = os.getenv("XFEL")
         subprocess.run(
             [
@@ -135,87 +100,39 @@ def main():
                 "-I",
                 SCRIPTS / "fel-tools.py",
                 "stage-xfel",
-                *(["--override"] if override is not None else []),
-                override if override is not None else out / "tools/xfel",
+                *(
+                    ["--override", override]
+                    if override is not None
+                    else [out / "tools/xfel"]
+                ),
                 tool,
             ],
             stdout=subprocess.DEVNULL,
             check=True,
         )
         help_text = subprocess.check_output([tool, "--help"])
-        if b"xfel [--port PATH --devnum N] COMMAND" not in help_text:
-            raise ValueError("xfel lacks port selection; rebuild with make xfel")
-        previous = None
-        if args.state:
-            lock = stack.enter_context(Path(str(args.state) + ".lock").open("a"))
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                previous = json.loads(args.state.read_text())
-                if (
-                    not isinstance(previous, dict)
-                    or type(previous.get("devnum")) is not int
-                    or not 1 <= previous["devnum"] <= 127
-                    or type(previous.get("pending_reset")) is not bool
-                ):
-                    raise ValueError("invalid FEL state")
-            except FileNotFoundError:
-                pass
-        current = select(args, previous)
-        print(
-            json.dumps(
-                dict(
-                    port=args.port,
-                    devnum=current["devnum"],
-                    previous_devnum=previous["devnum"] if previous else None,
-                    command=args.command[1:],
-                    event="attempt",
-                )
-            ),
-            file=sys.stderr,
-            flush=True,
-        )
+        if b"xfel --port PATH --devnum N COMMAND" not in help_text:
+            raise ValueError(
+                "xfel lacks the mandatory selector; rebuild with make xfel"
+            )
         prefix = shlex.split(os.getenv("SUDO", "sudo"))
-        probe = args.command[1:] == ["version"]
-        proc = subprocess.run(
+        status = subprocess.run(
             [
                 *prefix,
                 tool,
                 "--port",
                 args.port,
                 "--devnum",
-                str(current["devnum"]),
+                str(expected),
                 *args.command[1:],
-            ],
-            stdout=subprocess.PIPE if probe else None,
-        )
-        if probe:
-            sys.stdout.buffer.write(proc.stdout)
-            if not proc.returncode and not re.search(
-                rb"\bID=0x00190300\b", proc.stdout
-            ):
-                raise ValueError("version probe did not identify an A733")
-        rc = proc.returncode
-        if rc:
-            return 128 - rc if rc < 0 else rc
-        with tempfile.NamedTemporaryFile(dir=args.state.parent, delete=False) as f:
-            f.write((json.dumps(current) + "\n").encode())
-        os.replace(f.name, args.state)
-        print(json.dumps(dict(event="verified", **current)), file=sys.stderr)
-        return 0
+            ]
+        ).returncode
+        return 128 - status if status < 0 else status
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except PortAbsent as exc:
-        print(f"xfel-port: absent: {exc}", file=sys.stderr)
-        sys.exit(66)
-    except (
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-        subprocess.SubprocessError,
-    ) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"xfel-port: refused: {exc}", file=sys.stderr)
         sys.exit(125)

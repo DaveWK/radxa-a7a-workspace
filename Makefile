@@ -10,7 +10,7 @@
 #                      dramlib-2400, phyfw-2400). Private build and packaging
 #                      directories, and a build record under out/fel/.records/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
-#   make fel-boot      requires FEL_PORT; boot that USB port with out/fel/<mode>-<mhz>/
+#   make fel-boot      refuses until the task-000141 FEL session runner lands
 #                      (board in FEL on the host's USB). Only a blobfree
 #                      bundle; a dramlib or phyfw measurement build needs
 #                      FEL_MEASUREMENT_AUTH=<file>
@@ -33,16 +33,12 @@
 #                        Linux yet. The vendor paths run 2400.
 #   VENDOR_DRAM=yes      measurement build: DRAM through Allwinner's DRAM
 #                        library instead (run `make vendor` first), at
-#                        2400 MHz. A plain `make fel-boot` refuses it; boot it
-#                        with FEL_MEASUREMENT_AUTH=<file>
+#                        2400 MHz; measurement booting is held on task-000141.
 #   VENDOR_DRAM=phyfw    measurement build: our driver with the PHY's own
 #                        training firmware read from that library's object as
-#                        data (`make vendor` too). A plain `make fel-boot`
-#                        refuses it; boot it with FEL_MEASUREMENT_AUTH=<file>
+#                        data (`make vendor` too). Booting is held on task-000141.
 #   Earlier spellings: BLOBLESS=yes and FEL_DRAM=open are the default now;
-#   FEL_DRAM=dramlib builds only the FEL bt0 with the library (a measurement
-#   build; a plain `make fel-boot` refuses it; FEL_MEASUREMENT_AUTH=<file> to
-#   boot it).
+#   FEL_DRAM=dramlib builds only the FEL bt0 with the library (measurement only).
 #   fel-image refuses inherited or Cargo-configured A7A_* and A733_* knobs.
 #   Use the separate lab tooling for individual driver settings.
 
@@ -94,7 +90,6 @@ LIBDRAM_A := $(OUT)/oreboot/libdram-a733.a
 BT0_BIN := $(OUT)/oreboot/bt0.bin
 MAIN_BIN := $(OUT)/oreboot/main.bin
 EDK2_FD := $(OUT)/edk2/CUBIEA7A_EFI.fd
-XFEL    ?= $(OUT)/tools/xfel
 IMAGE   := $(OUT)/image/a7a-fedora$(FEDORA_RELEASE).img
 
 # The DRAM path of bt0 and of the FEL bt0: no (ours, nothing from a vendor),
@@ -255,23 +250,12 @@ fel-image:
 		--edk2-args=$(call shell-quote,$(EDK2_ARGS)) \
 		--fel-dtb-input=$(call shell-quote,$(FEL_DTB_INPUT)))
 
-xfel: $(XFEL)
-ifeq ($(origin XFEL),file)
-$(XFEL): scripts/build-xfel.sh scripts/xfel-port-select.patch scripts/xfel-source.json scripts/fel-tools.py
-endif
-$(XFEL):
+xfel: $(TOP)/out/tools/xfel $(TOP)/out/tools/xfel.record.json
+$(TOP)/out/tools/xfel $(TOP)/out/tools/xfel.record.json &: scripts/build-xfel.sh scripts/xfel-port-select.patch scripts/xfel-source.json scripts/fel-tools.py
 	scripts/build-xfel.sh
 
-# Needs the board in FEL (USB 1f3a:efe8) on this host and root for xfel
-# (SUDO=, with xfel's udev rule installed, runs it as you). Run it on the
-# host, not in the build container. The workspace build record, looked up
-# by staged bt0 digest, must agree with the bundle and the requested mode/profile.
-# A dramlib or phyfw measurement build needs
-# FEL_MEASUREMENT_AUTH=<file> naming this bt0 and a human authorization.
-fel-boot: $(XFEL)
-	$(fel-profile-check)
-	@test -f $(FEL_OUT)/bt0-fel.bin || { echo "run make fel-image first (in the container)" >&2; exit 1; }
-	$(if $(filter-out file,$(origin XFEL)),XFEL=$(call shell-quote,$(XFEL))) EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh $(FEL_OUT)
+fel-boot:
+	scripts/fel-boot.sh
 
 rpms: check-sources
 	FWREPO=$(FWREPO) FEDORA_RELEASE=$(FEDORA_RELEASE) $(if $(AIC8800_SRC),AIC8800_SRC=$(abspath $(AIC8800_SRC))) \
@@ -299,8 +283,8 @@ fedora-image: firmware fel-image rpms
 serial:
 	scripts/serial-log.sh $(or $(LABEL),run) $(or $(DEV),/dev/ttyUSB0)
 
-test: check-sources $(OUT)/tools/xfel
-	python3 -I scripts/test-xfel-binary.py $(OUT)/tools/xfel
+test: check-sources xfel
+	python3 -I scripts/test-xfel-binary.py $(TOP)/out/tools/xfel
 	python3 -I scripts/test-fel-callers.py
 	cd $(BOARD)/dram && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	cd $(BOARD)/common && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
