@@ -204,15 +204,18 @@ elif tool == "cp":
         Path(env["FAKE_SWAP"]).write_text("swapped after snapshot copy")
 elif tool == "aarch64-linux-gnu-gcc":
     sys.exit("the fixture must not run the cross compiler")
-elif tool in ("xfel", "lsusb"):
-    with open(env["FAKE_USB_LOG"], "a") as log:
-        log.write(json.dumps([tool, *args]) + "\n")
-    if tool == "lsusb":
+elif tool == "xfel":
+    if args == ["--help"]:
+        print("xfel [--port BUS-PORT[.PORT...]] COMMAND ...")
         if "FAKE_XFEL_SWAP" in env:
             Path(env["FAKE_XFEL_SWAP"]).write_text("#!/bin/sh\nexit 97\n")
         if "FAKE_BOOT_SWAP" in env:
             Path(env["FAKE_BOOT_SWAP"]).write_bytes(b"replacement after validation\n")
     else:
+        assert args[:2] == ["--port", env["FEL_PORT"]]
+        args = args[2:]
+        with open(env["FAKE_USB_LOG"], "a") as log:
+            log.write(json.dumps([tool, *args]) + "\n")
         cmd, *params = args
         mem = Path(env["FAKE_MEM"])
         if cmd == "version":
@@ -230,6 +233,8 @@ elif tool in ("xfel", "lsusb"):
             Path(out).write_bytes(data[:int(size)])
         elif cmd == "exec" and params == ["0x90044"]:
             (mem / "entry2").touch()
+            if "FAKE_UNPLUG_AFTER_ENTRY2" in env:
+                shutil.rmtree(Path(env["FEL_SYSFS_ROOT"]) / env["FEL_PORT"])
 else:
     sys.exit(f"unknown fixture tool {tool}")
 """
@@ -338,6 +343,8 @@ class GateTests(unittest.TestCase):
             CARGO_HOME=str(self.root / "caller-cargo"),
             CARGO_NET_OFFLINE="true",
             SUDO="",
+            FEL_PORT="3-3.4",
+            FEL_SYSFS_ROOT=str(self.root / "sysfs"),
             FAKE_CARGO_LOG=str(self.cargo_log),
             FAKE_EDK2_LOG=str(self.edk2_log),
             FAKE_USB_LOG=str(self.usb_log),
@@ -346,6 +353,16 @@ class GateTests(unittest.TestCase):
             REAL_CARGO=shutil.which("cargo"),
             REAL_FLOCK=shutil.which("flock"),
         )
+        port = Path(self.env["FEL_SYSFS_ROOT"]) / self.env["FEL_PORT"]
+        port.mkdir(parents=True)
+        for name, value in (
+            ("idVendor", "1f3a"),
+            ("idProduct", "efe8"),
+            ("busnum", "3"),
+            ("devpath", "3.4"),
+            ("devnum", "12"),
+        ):
+            (port / name).write_text(value)
         for name in (
             "cargo",
             "llvm-objcopy",
@@ -370,6 +387,9 @@ class GateTests(unittest.TestCase):
             "fel-manifest.py",
             "fel-check.py",
             "fel-boot.sh",
+            "xfel-port",
+            "build-xfel.sh",
+            "xfel-port-select.patch",
             "build-edk2.sh",
         ):
             shutil.copy2(SOURCE / "scripts" / name, scripts)
@@ -1115,6 +1135,12 @@ class GateTests(unittest.TestCase):
         for expectation in ("", self.env["EXPECT_XFEL_SHA256"]):
             with self.subTest(expectation=expectation):
                 self.refusal(self.boots(EXPECT_XFEL_SHA256=expectation))
+
+    def test_mailbox_port_refusal_is_not_handover_evidence(self):
+        self.build()
+        proc = self.boots(FAKE_UNPLUG_AFTER_ENTRY2="1")
+        self.assertEqual(proc.returncode, 125, self.process_result(proc))
+        self.assertNotIn("bt0 is past the checks", proc.stdout)
 
     def test_xfel_runs_only_staged_copy(self):
         bundle = self.build()

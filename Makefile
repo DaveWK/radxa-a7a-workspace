@@ -10,7 +10,7 @@
 #                      dramlib-2400, phyfw-2400). Private build and packaging
 #                      directories, and a build record under out/fel/.records/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
-#   make fel-boot      boot the board over USB FEL with out/fel/<mode>-<mhz>/
+#   make fel-boot      requires FEL_PORT; boot that USB port with out/fel/<mode>-<mhz>/
 #                      (board in FEL on the host's USB). Only a blobfree
 #                      bundle; a dramlib or phyfw measurement build needs
 #                      FEL_MEASUREMENT_AUTH=<file>
@@ -256,6 +256,9 @@ fel-image:
 		--fel-dtb-input=$(call shell-quote,$(FEL_DTB_INPUT)))
 
 xfel: $(XFEL)
+ifeq ($(origin XFEL),file)
+$(XFEL): scripts/build-xfel.sh scripts/xfel-port-select.patch
+endif
 $(XFEL):
 	scripts/build-xfel.sh
 
@@ -301,10 +304,11 @@ test: check-sources
 	cd $(BOARD)/common && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/fel-fmmt.py scripts/fel-check.py scripts/fel-tools.py scripts/test-fel-manifest.py
 	python3 -I scripts/test-fel-manifest.py
+	python3 -I scripts/test-xfel-port.py
 	bash -n scripts/fel-boot.sh scripts/build-edk2.sh scripts/serial-log.sh scripts/fetch-vendor.sh scripts/build-xfel.sh scripts/binfmt-aarch64.sh
 	shellcheck scripts/*.sh
 	shfmt -d scripts/*.sh
-	black --check scripts/*.py
+	black --check scripts/*.py scripts/xfel-port
 
 clean:
 	rm -rf $(OUT)

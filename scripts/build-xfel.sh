@@ -24,7 +24,8 @@ fi
     echo "build-xfel: $SRC is not xfel $XFEL_TAG ($XFEL_COMMIT)" >&2
     exit 1
 }
-git -C "$SRC" checkout -q -- fel.c
+git -C "$SRC" restore --source="$XFEL_COMMIT" -- main.c fel.c
+git -C "$SRC" apply --unidiff-zero "$TOP/scripts/xfel-port-select.patch"
 grep -c '&bytes, 10000);' "$SRC/fel.c" | grep -qx 2 || {
     echo "build-xfel: fel.c does not have the two 10 s bulk transfers this script patches" >&2
     exit 1
@@ -33,4 +34,4 @@ sed -i 's/&bytes, 10000);/\&bytes, 60000);/' "$SRC/fel.c"
 make -C "$SRC" -s clean >/dev/null 2>&1 || true
 make -C "$SRC" -s
 python3 -I "$TOP/scripts/fel-tools.py" record-xfel "$SRC" "$XFEL_COMMIT"
-echo "build-xfel: $TOP/out/tools/xfel (xfel $XFEL_TAG, 60 s USB timeout)"
+echo "build-xfel: $TOP/out/tools/xfel (xfel $XFEL_TAG, port selector, 60 s USB timeout)"

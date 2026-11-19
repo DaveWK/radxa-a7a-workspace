@@ -1,0 +1,67 @@
+diff --git a/main.c b/main.c
+index b23a8c9..1f79aab 100644
+--- a/main.c
++++ b/main.c
+@@ -15,0 +16 @@ static void usage(void)
++	printf("    xfel [--port BUS-PORT[.PORT...]] COMMAND ...\r\n");
+@@ -74,0 +76,10 @@ int main(int argc, char * argv[])
++	const char * port = NULL;
++	if(!strcmp(argv[1], "--port"))
++	{
++		if(argc < 4 || !argv[2][0])
++			return 125;
++		port = argv[2];
++		argv += 2;
++		argc -= 2;
++	}
++	libusb_device * selected = NULL;
+@@ -77,3 +88,5 @@ int main(int argc, char * argv[])
+-	libusb_init(&context);
+-	int count = libusb_get_device_list(context, &list);
+-	for(int i = 0; i < count; i++)
++	char selected_path[40];
++	if(libusb_init(&context) != 0)
++		return 125;
++	ssize_t count = libusb_get_device_list(context, &list);
++	for(ssize_t i = 0; i < count; i++)
+@@ -84 +97 @@ int main(int argc, char * argv[])
+-			printf("ERROR: Can't get device list\r\n");
++			goto refused;
+@@ -87,3 +100,14 @@ int main(int argc, char * argv[])
+-			if(libusb_open(device, &ctx.hdl) != 0)
+-				printf("ERROR: Can't connect to device\r\n");
+-			break;
++			uint8_t chain[8];
++			int n = libusb_get_port_numbers(device, chain, sizeof(chain));
++			if(n <= 0)
++				goto refused;
++			char path[40]; /* 3 bus digits, 8 separators and 8 x 3 port digits */
++			int used = snprintf(path, sizeof(path), "%u", (unsigned)libusb_get_bus_number(device));
++			for(int j = 0; j < n; j++)
++				used += snprintf(path + used, sizeof(path) - used, "%c%u", j ? '.' : '-', (unsigned)chain[j]);
++			if(port && strcmp(path, port))
++				continue;
++			if(selected)
++				goto refused;
++			selected = device;
++			strcpy(selected_path, path);
+@@ -91,0 +116,5 @@ int main(int argc, char * argv[])
++	if(!selected || libusb_open(selected, &ctx.hdl) != 0)
++		goto refused;
++	fprintf(stderr, "xfel: selected bus=%u port=%s devnum=%u\n",
++		(unsigned)libusb_get_bus_number(selected), selected_path, (unsigned)libusb_get_device_address(selected));
++	libusb_free_device_list(list, 1);
+@@ -98 +127 @@ int main(int argc, char * argv[])
+-		libusb_exit(NULL);
++		libusb_exit(context);
+@@ -460 +489 @@ int main(int argc, char * argv[])
+-	libusb_exit(NULL);
++	libusb_exit(context);
+@@ -462,0 +492,7 @@ int main(int argc, char * argv[])
++
++refused:
++	fprintf(stderr, "xfel: cannot uniquely select and open FEL device (port=%s)\n", port ? port : "unspecified");
++	if(list)
++		libusb_free_device_list(list, 1);
++	libusb_exit(context);
++	return 125;

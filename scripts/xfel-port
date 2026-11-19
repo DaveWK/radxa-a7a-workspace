@@ -1,0 +1,162 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-only
+"""Run one command on a port-bound FEL device; never fall back to a USB address."""
+
+import argparse
+from contextlib import ExitStack
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+SCRIPTS = Path(__file__).resolve().parent
+PORT = re.compile(r"[1-9][0-9]*-[1-9][0-9]*(?:\.[1-9][0-9]*)*")
+
+
+def snapshot(root, requested):
+    devices = {}
+    for path in root.iterdir():
+        if not PORT.fullmatch(path.name):
+            continue
+        vid_pid = tuple(
+            (path / key).read_text().strip() for key in ("idVendor", "idProduct")
+        )
+        if vid_pid != ("1f3a", "efe8"):
+            if path.name == requested:
+                raise ValueError(f"wrong VID:PID at {requested}: {':'.join(vid_pid)}")
+            continue
+        bus, ports, number = (
+            (path / key).read_text().strip() for key in ("busnum", "devpath", "devnum")
+        )
+        if f"{int(bus)}-{ports}" != path.name or not 1 <= int(number) <= 127:
+            raise ValueError(f"inconsistent USB identity at {path.name}")
+        devices[path.name] = int(number)
+    return devices
+
+
+def select(args, previous):
+    if args.after_reset and previous is None:
+        raise ValueError("--after-reset requires a pre-reset snapshot")
+    if previous is not None and previous["port"] != args.port:
+        raise ValueError("state belongs to another port")
+    deadline = time.monotonic() + args.timeout
+    while True:
+        try:
+            devices = snapshot(args.sysfs, args.port)
+        except FileNotFoundError:
+            # A sysfs entry disappeared during enumeration; never use a partial scan.
+            devices = None
+        if devices is not None:
+            peers = {k: v for k, v in devices.items() if k != args.port}
+            if previous is not None and previous["peers"] != peers:
+                raise ValueError("another FEL port changed since the preceding call")
+            if args.port in devices and (
+                not args.after_reset or devices[args.port] != previous["devnum"]
+            ):
+                return dict(port=args.port, devnum=devices[args.port], peers=peers)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError(f"expected FEL enumeration at {args.port} not observed")
+        time.sleep(min(0.1, remaining))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", required=True)
+    parser.add_argument("--timeout", type=float, default=0, metavar="SECONDS")
+    parser.add_argument("--state", type=Path)
+    parser.add_argument("--after-reset", action="store_true")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if not PORT.fullmatch(args.port):
+        parser.error("expected a sysfs port such as 3-3.4")
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        parser.error("timeout must be finite and non-negative")
+    if (
+        len(args.command) < 2
+        or args.command[0] != "--"
+        or args.command[1].startswith("-")
+        or any(a in ("--help", "-h") for a in args.command[1:])
+    ):
+        parser.error("expected -- COMMAND [ARG ...]")
+    args.sysfs = Path(os.getenv("FEL_SYSFS_ROOT", "/sys/bus/usb/devices"))
+    out = SCRIPTS.parent / "out"
+    out.mkdir(exist_ok=True)
+    with ExitStack() as stack:
+        # Both the capability check (no USB) and dispatch use the same verified
+        # private copy. Old xfel opens a device even for unknown command names.
+        tmp = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=out)))
+        tool = tmp / "xfel"
+        override = os.getenv("XFEL")
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                SCRIPTS / "fel-tools.py",
+                "stage-xfel",
+                *(["--override"] if override is not None else []),
+                override if override is not None else out / "tools/xfel",
+                tool,
+            ],
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
+        help_text = subprocess.check_output([tool, "--help"])
+        if b"xfel [--port BUS-PORT[.PORT...]] COMMAND" not in help_text:
+            raise ValueError("xfel lacks port selection; rebuild with make xfel")
+        previous = None
+        if args.state:
+            lock = stack.enter_context(Path(str(args.state) + ".lock").open("a"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                previous = json.loads(args.state.read_text())
+                if (
+                    not isinstance(previous, dict)
+                    or type(previous.get("devnum")) is not int
+                    or not 1 <= previous["devnum"] <= 127
+                ):
+                    raise ValueError("invalid FEL state")
+            except FileNotFoundError:
+                pass
+        current = select(args, previous)
+        if args.state:
+            with tempfile.NamedTemporaryFile(dir=args.state.parent, delete=False) as f:
+                f.write((json.dumps(current) + "\n").encode())
+            os.replace(f.name, args.state)
+        print(
+            json.dumps(
+                dict(
+                    port=args.port,
+                    devnum=current["devnum"],
+                    previous_devnum=previous["devnum"] if previous else None,
+                    command=args.command[1:],
+                )
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        prefix = shlex.split(os.getenv("SUDO", "sudo"))
+        return subprocess.run(
+            [*prefix, tool, "--port", args.port, *args.command[1:]]
+        ).returncode
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        print(f"xfel-port: refused: {exc}", file=sys.stderr)
+        sys.exit(125)

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Boot the Radxa Cubie A7A over USB FEL, without its SD card slot.
 #
-#   scripts/fel-boot.sh <image dir>
+#   FEL_PORT=3-3.4 scripts/fel-boot.sh <image dir>
 #
 # The image dir is a `make fel-image` output (out/fel): bt0-fel.bin (bt0
 # feature fel, linked at 0x90000) and the SD image firmware.bin +
@@ -24,6 +24,8 @@
 # hand-over to main nothing answers any more.
 #
 # Environment:
+#   FEL_PORT   required physical sysfs port, never a transient USB address.
+#   FEL_STATE_FILE   optional per-run peer snapshot, passed to every invocation.
 #   XFEL   optional xfel override; requires EXPECT_XFEL_SHA256. The default
 #          uses out/tools/xfel and its build receipt. Upstream waits 10 s for a FEL
 #          call to return; entry 1 takes ~7 s, so use a build with a 60 s USB
@@ -60,11 +62,6 @@ if [[ -v XFEL ]]; then
 else
     XFEL=$SCRIPTS/../out/tools/xfel
 fi
-SUDO=${SUDO-sudo}
-sudo_prefix=()
-if [[ -n $SUDO ]]; then
-    read -r -a sudo_prefix <<<"$SUDO"
-fi
 
 die() {
     printf 'fel-boot: %s\n' "$*" >&2
@@ -72,7 +69,12 @@ die() {
 }
 step() { printf '\n==> %s\n' "$*"; }
 # Keep stdin closed so xfel/sudo never reads the plan file.
-x() { "${sudo_prefix[@]}" "$XFEL" "$@" </dev/null; }
+: "${FEL_PORT:?fel-boot requires FEL_PORT (for example 3-3.4)}"
+selector=("$SCRIPTS/xfel-port" --port "$FEL_PORT")
+if [[ -n ${FEL_STATE_FILE:-} ]]; then
+    selector+=(--state "$FEL_STATE_FILE")
+fi
+x() { "${selector[@]}" -- "$@" </dev/null; }
 
 [ $# -eq 1 ] || die "usage: $0 <image dir with bt0-fel.bin, firmware.bin, firmware.seek, build-manifest.json>"
 IMAGE=$(cd "$1" && pwd)
@@ -87,7 +89,9 @@ xfel_source=$(command -v -- "$XFEL") || die "xfel not found (XFEL=$XFEL)"
 STAGE=$(mktemp -d "$(dirname "$IMAGE")/.fel-stage.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
 python3 -I "$SCRIPTS/fel-tools.py" stage-xfel "${xfel_flags[@]}" "$xfel_source" "$STAGE/xfel"
-XFEL=$STAGE/xfel
+export XFEL=$STAGE/xfel
+EXPECT_XFEL_SHA256=$(sha256sum <"$XFEL" | cut -d' ' -f1)
+export EXPECT_XFEL_SHA256
 cp "$IMAGE/bt0-fel.bin" "$IMAGE/firmware.bin" "$IMAGE/firmware.seek" \
     "$IMAGE/build-manifest.json" "$STAGE/"
 WORK="$STAGE/work"
@@ -116,15 +120,15 @@ put() {
 # mailbox [seconds]: prints "magic state dram_mb dram_mhz rom_sctlr
 # rom_cpsr rom_vbar", or "none" if FEL does not answer within the time.
 mailbox() {
-    if timeout "${1:-30}" "${sudo_prefix[@]}" "$XFEL" read "$MAILBOX" 28 "$WORK/mailbox" </dev/null >/dev/null 2>&1; then
+    if timeout "${1:-30}" "${selector[@]}" -- read "$MAILBOX" 28 "$WORK/mailbox" </dev/null >/dev/null; then
         od -An -v -tx4 -w28 "$WORK/mailbox" | tr -s ' ' | sed 's/^ //'
     else
+        [[ $? != 125 ]] || return 125
         echo none
     fi
 }
 
 step "FEL device"
-lsusb -d 1f3a:efe8 || die "no Allwinner FEL device (1f3a:efe8): is the board in FEL and its USB-C on this host?"
 ver=$(x version) || die "xfel version failed"
 printf '  %s\n' "$ver"
 grep -q 'ID=0x00190300' <<<"$ver" || die "FEL device is not an A733 (ID 0x00190300)"
@@ -167,7 +171,8 @@ done <"$WORK/plan"
 
 step "Entry 2 ($ENTRY2): check the images, warm reset into oreboot main"
 rc=0
-timeout 15 "${sudo_prefix[@]}" "$XFEL" exec "$ENTRY2" </dev/null || rc=$?
+timeout 15 "${selector[@]}" -- exec "$ENTRY2" </dev/null || rc=$?
+[[ $rc != 125 ]] || die "port selection refused before entry 2"
 state=none
 if [ "$rc" -eq 0 ]; then
     # exec answered; whether entry 2 has started yet is the mailbox's to say.

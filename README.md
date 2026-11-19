@@ -110,7 +110,7 @@ instructions are in [docs/usb-fel-boot.md](docs/usb-fel-boot.md):
 
     dd if=out/image/a7a-fedora45.img of=/dev/sdX bs=4M conv=fsync   # USB disk, blue port
     make xfel                       # once
-    make fel-boot                   # board in FEL on this host's USB (its USB-C port)
+    FEL_PORT=3-3.4 make fel-boot    # 4 GB board; the 6 GB board uses 3-6
 
 `make fel-boot` boots the blob-free image (`out/fel/blobfree-1200/`). A
 `dramlib` or `phyfw` measurement build needs `FEL_MEASUREMENT_AUTH=<file>`

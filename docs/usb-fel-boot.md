@@ -39,7 +39,46 @@ Check with `lsusb -d 1f3a:efe8`.
 
     make fel-image            # in the build container: out/fel/<mode>-<mhz>/
     make xfel                 # once, on the host
-    make fel-boot             # on the host, board in FEL
+    FEL_PORT=3-3.4 make fel-boot    # 4 GB board; use 3-6 for the 6 GB board
+
+Every runner must set `FEL_PORT` and use `scripts/xfel-port` for each FEL
+command (including mailbox reads and resets). Never use the old bench
+`felreset.sh` or a system xfel. The port is a physical connector, not a
+board serial number: do not exchange boards between ports during a run.
+
+```
+scripts/xfel-port --port 3-3.4 -- write 0x90000 bt0-fel.bin
+```
+
+For an authorized A733 watchdog reset, keep one state file in the runner's
+private directory. The pinned xfel's A733 `reset` handler is **unsupported**;
+the port-bound equivalent of the bench `felreset.sh` uses its three WDT0
+writes, not `xfel reset`. In the Bash runner:
+
+```
+set -e
+port=(scripts/xfel-port --port "${FEL_PORT:?}" --state "${run:?}/fel-state")
+"${port[@]}" -- write32 0x02050010 0x16aa0001
+"${port[@]}" -- write32 0x02050014 0x16aa0001
+"${port[@]}" -- write32 0x0205000c 0x000014af
+"${port[@]}" --after-reset --timeout 60 -- version
+```
+
+`--after-reset` requires a recorded pre-reset device number and waits for a
+different number at that same port. The old enumeration is not reset evidence.
+
+The wrapper verifies the tool, reads sysfs, and passes the port to patched
+xfel, which selects the unique matching libusb device before opening it.
+`--timeout` waits only for port admission (default: 0 seconds). A new device
+number at the same port is allowed and logged to stderr. `--state` also
+refuses a change at another FEL port; use `FEL_STATE_FILE` to enable this
+guard during `make fel-boot`. Omit the optional guard for independent runs
+in which peer resets are expected. A move never redirects the command to
+the new port. Keep stderr with the run receipt. Exit 2 denotes bad wrapper
+arguments, 125 an admission refusal; otherwise the child status is returned.
+Test the compiled selector without hardware using a replacement libusb:
+
+    python3 -I scripts/test-xfel-binary.py out/tools/xfel
 
 `make fel-image` builds one bundle for the current DRAM mode and profile into
 `out/fel/<mode>-<mhz>/` (`blobfree-1200` by default, `blobfree-2400` with
