@@ -519,11 +519,61 @@ class SessionTests(Fixture):
             pass
 
 
+class SerialDirectoryTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.logs = self.root / "serial-logs"
+        self.logs.mkdir()
+        self.log = self.logs / M["LOGS"][PORT]
+        self.log.write_bytes(b"capture\n")
+
+    def test_invalid_directory_refuses(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.logs, target_is_directory=True)
+        for value, reason in (
+            (None, "is unset"),
+            ("", "is empty"),
+            ("serial-logs", "must be absolute"),
+            (str(self.root / "missing"), "must name an existing directory"),
+            (str(self.log), "must name an existing directory"),
+            (str(alias), "must be canonical"),
+        ):
+            with self.subTest(value=value), patch.dict(os.environ):
+                if value is None:
+                    os.environ.pop("A7A_SERIAL_LOG_DIR", None)
+                else:
+                    os.environ["A7A_SERIAL_LOG_DIR"] = value
+                with self.assertRaises(M["SessionError"]) as caught:
+                    M["Serial"](PORT, self.log)
+                self.assertEqual(caught.exception.code, EXIT.IDENTITY)
+                self.assertEqual(
+                    str(caught.exception),
+                    f"A7A_SERIAL_LOG_DIR {reason}; "
+                    "the registered serial-log directory has no default",
+                )
+
+    def test_registered_port_only(self):
+        wrong_log = self.logs / M["LOGS"]["3-6"]
+        wrong_log.write_bytes(b"other board\n")
+        with patch.dict(os.environ, A7A_SERIAL_LOG_DIR=str(self.logs)):
+            with self.assertRaises(M["SessionError"]) as caught:
+                M["Serial"](PORT, wrong_log)
+            self.assertEqual(caught.exception.code, EXIT.IDENTITY)
+            self.assertEqual(
+                str(caught.exception), "serial log is not registered on this port"
+            )
+            self.assertEqual(
+                M["Serial"](PORT, self.log).capture()["log"], str(self.log)
+            )
+
+
 class SerialTests(Fixture):
     def setUp(self):
         super().setUp()
-        self.log = self.root / "src/radxa-a7a/serial-logs" / M["LOGS"][PORT]
-        self.log.parent.mkdir(parents=True)
+        logs = self.root / "serial-logs"
+        logs.mkdir()
+        self.enterContext(patch.dict(os.environ, A7A_SERIAL_LOG_DIR=str(logs)))
+        self.log = logs / M["LOGS"][PORT]
         self.prefix = b"previous capture\n"
         self.log.write_bytes(self.prefix)
         self.serial = M["Serial"](PORT, self.log)

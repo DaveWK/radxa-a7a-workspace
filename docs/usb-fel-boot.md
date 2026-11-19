@@ -138,9 +138,17 @@ the two-stage runner with their per-boot serial identity gate.
 
 Build the receipt-verified selector with `make xfel` and the selected bundle
 with `make fel-image` first. Use the same mode and profile for `make fel-boot`,
-and set `FEL_PORT` plus `FEL_SERIAL_LOG` (the registered regular capture
-file named in [the session guide](fel-session.md#capture-boundaries)).
-For example, `FEL_PORT="$port" FEL_SERIAL_LOG="$log" make fel-boot DRAM_MHZ=1200`.
+and set `FEL_PORT`, `A7A_SERIAL_LOG_DIR`, and `FEL_SERIAL_LOG`. The directory
+must exist and its path must be absolute and canonical. There is no default;
+the runner refuses if `A7A_SERIAL_LOG_DIR` is unset or invalid. `FEL_SERIAL_LOG`
+must be the full path to the port's fixed capture filename from
+[the session guide](fel-session.md#capture-boundaries).
+For example:
+
+```sh
+A7A_SERIAL_LOG_DIR="$log_dir" FEL_PORT="$port" FEL_SERIAL_LOG="$log" \
+  make fel-boot DRAM_MHZ=1200
+```
 
 1. **Stage and validate**: copy the bundle into a private directory (mode
    0700). Hash the staged bt0 and use that digest to look up the local build

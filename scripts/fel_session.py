@@ -159,11 +159,39 @@ def lease(port):
         yield stream.fileno()
 
 
+def serial_log_dir():
+    def refuse(reason):
+        return SessionError(
+            Exit.IDENTITY,
+            f"A7A_SERIAL_LOG_DIR {reason}; "
+            "the registered serial-log directory has no default",
+        )
+
+    value = os.environ.get("A7A_SERIAL_LOG_DIR")
+    if value is None:
+        raise refuse("is unset")
+    if not value:
+        raise refuse("is empty")
+    path = Path(value)
+    if not path.is_absolute():
+        raise refuse("must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+        mode = resolved.stat().st_mode
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise refuse("must name an existing directory") from exc
+    if not stat.S_ISDIR(mode):
+        raise refuse("must name an existing directory")
+    if resolved != path:
+        raise refuse("must be canonical")
+    return path
+
+
 class Serial:
     def __init__(self, port, path):
         self.port = port
         self.path = Path(path)
-        if self.path != Path.home() / "src/radxa-a7a/serial-logs" / LOGS[port]:
+        if self.path != serial_log_dir() / LOGS[port]:
             raise SessionError(
                 Exit.IDENTITY, "serial log is not registered on this port"
             )
@@ -1080,7 +1108,13 @@ def start_guardian(args):
 
 def cached_main():
     parser = argparse.ArgumentParser(
-        description="Run a cached memtest in two stages", allow_abbrev=False
+        description="Run a cached memtest in two stages",
+        epilog=(
+            "Preflight requires A7A_SERIAL_LOG_DIR to name an absolute, canonical, "
+            "existing directory. There is no default; if unset, preflight refuses. "
+            "The registered filenames are fixed by port."
+        ),
+        allow_abbrev=False,
     )
     parser.add_argument("--stage", required=True, choices=("preflight", "resume"))
     parser.add_argument("--receipt", required=True, type=absolute)
@@ -1088,7 +1122,9 @@ def cached_main():
     parser.add_argument("--state", type=absolute)
     parser.add_argument("--set", type=absolute)
     parser.add_argument("--expect-set-sha256")
-    parser.add_argument("--serial-log", type=absolute)
+    parser.add_argument(
+        "--serial-log", type=absolute, help="absolute path to the port's registered log"
+    )
     parser.add_argument("--identity-cleared")
     parser.add_argument("--expect-board", choices=BOARDS)
     args = parser.parse_args()

@@ -239,8 +239,9 @@ class RunnerTests(unittest.TestCase):
         self.sysfs = self.root / "devices"
         self.sysfs.mkdir()
         self.home = self.root / "home"
-        logs = self.home / "src/radxa-a7a/serial-logs"
-        logs.mkdir(parents=True)
+        logs = self.root / "serial-logs"
+        logs.mkdir()
+        self.home.mkdir()
         self.logs = {}
         log_names = {
             "4g": "2026-11-19-1033-a7a-4g.log",
@@ -283,6 +284,7 @@ class RunnerTests(unittest.TestCase):
         fake.write_text(FAKE)
         fake.chmod(0o700)
         self.env = os.environ | dict(
+            A7A_SERIAL_LOG_DIR=str(logs),
             HOME=str(self.home),
             PATH=f"{self.root}:{os.environ['PATH']}",
             FEL_FIXTURE_HOME=str(self.home),

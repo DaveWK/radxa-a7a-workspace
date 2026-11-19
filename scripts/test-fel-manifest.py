@@ -1216,12 +1216,14 @@ class GateTests(unittest.TestCase):
         selector = scripts / "xfel-port"
         selector.write_text(SESSION_SELECTOR)
         selector.chmod(0o700)
-        serial = self.root / "src/radxa-a7a/serial-logs/2026-11-19-1033-a7a-4g.log"
-        serial.parent.mkdir(parents=True)
+        logs = self.root / "serial-logs"
+        logs.mkdir()
+        serial = logs / "2026-11-19-1033-a7a-4g.log"
         lease_home = runner / "lease-home"
         lease_home.mkdir()
         env = dict(
             self.env,
+            A7A_SERIAL_LOG_DIR=str(logs),
             PATH=f"{runner}:{self.env['PATH']}",
             HOME=str(self.root),
             FEL_FIXTURE_HOME=str(lease_home),

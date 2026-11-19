@@ -10,7 +10,9 @@
 #                      dramlib-2400, phyfw-2400). Private build and packaging
 #                      directories, and a build record under out/fel/.records/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
-#   make fel-boot      workspace maintenance boot; requires FEL_PORT, FEL_SERIAL_LOG
+#   make fel-boot      workspace maintenance boot; requires FEL_PORT, FEL_SERIAL_LOG,
+#                     and an absolute, canonical A7A_SERIAL_LOG_DIR (no default;
+#                     unset is refused; registered filenames are fixed by port)
 #   make rpms          the cubie-a7a-* SRPMs and RPMs -> fresh run in out/fedora/rpmbuild/
 #                      sealed run path noted in out/fedora/run (for operators)
 #   make fedora-image  Fedora 45 image with firmware at LBA 256 and verification
