@@ -216,6 +216,54 @@ else:
     sys.exit(f"unknown fixture tool {tool}")
 """
 
+SESSION_SELECTOR = r"""#!/usr/bin/python3 -I
+import json, os, shutil, struct, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+port = os.environ["FEL_PORT"]
+number = Path(os.environ["FEL_SYSFS_ROOT"]) / port / "devnum"
+memory = Path(os.environ["SESSION_MEMORY"])
+case = os.environ["SESSION_CASE"]
+if args == ["--discover", "--port", port]:
+    print(number.read_text())
+    sys.exit(0)
+assert args[:2] == ["--port", port] and args[2] == "--devnum" and args[4] == "--"
+if args[3] != number.read_text().strip():
+    sys.exit(125)
+cmd, *values = args[5:]
+with Path(os.environ["FAKE_USB_LOG"]).open("a") as log:
+    print(json.dumps([cmd, *values]), file=log)
+if cmd == "version":
+    print("AWUC ID=0x00190300(A733)")
+elif cmd == "write":
+    shutil.copyfile(values[1], memory / values[0])
+elif cmd == "read":
+    address, size, dest = values
+    if (address, size) == ("0xdf000", "28"):
+        entry_two = (memory / "entry2").exists()
+        if entry_two:
+            if case != "no-serial":
+                with Path(os.environ["FEL_SERIAL_LOG"]).open("a") as log:
+                    print("[bt0] RVBAR 00000000:40000000, fixture\nmain>", file=log)
+            if case == "offline":
+                sys.exit(66)
+            if case == "generic-loss":
+                sys.exit(74)
+        data = struct.pack("<7I", 0x46413741, 0x21 if entry_two else 0x11, 4096, 1200, 0, 0, 0)
+    else:
+        data = (memory / address).read_bytes()
+    Path(dest).write_bytes(data[:int(size)])
+elif (cmd, values) == ("exec", ["0x90044"]):
+    if case == "no-ack":
+        sys.exit(76)
+    (memory / "entry2").touch()
+    if case == "changed-identity":
+        number.write_text("19")
+elif (cmd, values) == ("write32", ["0x0205000c", "0x000014af"]):
+    number.write_text("19")
+"""
+
 # At the old hash-to-open race, change the main binary just as mkimage opens
 # it. On W3 the cp fixture above has already replaced the original instead.
 MKIMAGE_HOOK = r"""
@@ -1147,9 +1195,113 @@ class GateTests(unittest.TestCase):
             self.stage_xfel("--override", self.tools / "xfel", self.root / "stage")
         )
 
-    def test_boot_waits_for_session_owner(self):
-        self.refusal(
-            self.make("fel-boot"), "FEL boots go through scripts/fel_session.py"
+    def session_fixture(self):
+        runner = self.root / "session-fixture"
+        scripts = runner / "scripts"
+        scripts.mkdir(parents=True)
+        for name in (
+            "fel_session.py",
+            "fel-boot.sh",
+            "fel-wdt-reset.sh",
+            "fel-check.py",
+            "fel-manifest.py",
+            "mkimage.py",
+        ):
+            shutil.copy2(SOURCE / "scripts" / name, scripts)
+        shutil.copytree(SOURCE / "scripts/lib", scripts / "lib")
+        module = scripts / "fel_session.py"
+        source = module.read_text()
+        host_home = "Path(pwd.getpwuid(os.geteuid()).pw_dir)"
+        self.assertEqual(source.count(host_home), 1)
+        module.write_text(
+            source.replace(host_home, "Path.home()").replace(
+                "cursor, record, seconds=10", "cursor, record, seconds=0.1"
+            )
+        )
+        selector = scripts / "xfel-port"
+        selector.write_text(SESSION_SELECTOR)
+        selector.chmod(0o700)
+        serial = self.root / "src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
+        serial.parent.mkdir(parents=True)
+        env = dict(
+            self.env,
+            HOME=str(self.root),
+            FEL_SERIAL_LOG=str(serial),
+            EXPECT_WORKSPACE=str(self.workspace),
+            EXPECT_OREBOOT=str(self.oreboot),
+        )
+        return runner, scripts, serial, env
+
+    def test_workspace_boot_through_session(self):
+        bundle = self.build()
+        runner, scripts, serial, env = self.session_fixture()
+        shutil.copytree(
+            self.workspace / "out/fel/.records", runner / "out/fel/.records"
+        )
+        for case, expected in (
+            ("normal", 0),
+            ("offline", 0),
+            ("no-serial", 3),
+            ("no-ack", 6),
+            ("changed-identity", 8),
+            ("generic-loss", 10),
+        ):
+            with self.subTest(case=case):
+                memory = self.root / case
+                memory.mkdir()
+                self.usb_log.write_text("")
+                (Path(env["FEL_SYSFS_ROOT"]) / env["FEL_PORT"] / "devnum").write_text(
+                    "12"
+                )
+                serial.write_text("[bt0] RVBAR 00000000:40000000, stale\nmain>\n")
+                proc = subprocess.run(
+                    [scripts / "fel-boot.sh", bundle],
+                    env=dict(env, SESSION_CASE=case, SESSION_MEMORY=str(memory)),
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(proc.returncode, expected, self.process_result(proc))
+                self.assertEqual(
+                    "confirmed by fresh serial" in proc.stdout, expected == 0
+                )
+                calls = [
+                    json.loads(line) for line in self.usb_log.read_text().splitlines()
+                ]
+                self.assertEqual(calls[0], ["version"])
+                self.assertEqual(
+                    [args[1] for args in calls if args[0] == "write"],
+                    ["0xdf000", "0x90000", "0xdf200", "0x40000000", "0x41000000"],
+                )
+
+    def test_watchdog_reset_through_session(self):
+        _, scripts, _, env = self.session_fixture()
+        state = self.root / "reset.json"
+        proc = subprocess.run(
+            [scripts / "fel-wdt-reset.sh"],
+            env=dict(
+                env,
+                FEL_STATE_FILE=str(state),
+                SESSION_CASE="reset",
+                SESSION_MEMORY=str(self.root),
+            ),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, self.process_result(proc))
+        self.assertEqual(
+            read_json(state), dict(port="3-3.4", devnum=19, epoch=2, pending=None)
+        )
+        self.assertEqual(
+            [json.loads(line) for line in self.usb_log.read_text().splitlines()],
+            [
+                ["version"],
+                ["write32", "0x02050010", "0x16aa0001"],
+                ["write32", "0x02050014", "0x16aa0001"],
+                ["write32", "0x0205000c", "0x000014af"],
+                ["version"],
+            ],
         )
 
     def test_xfel_staging_copies_approved_bytes(self):

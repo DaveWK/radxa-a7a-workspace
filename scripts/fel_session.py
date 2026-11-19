@@ -33,7 +33,8 @@ RVBAR = re.compile(rb"\[bt0\] RVBAR 00000000:40000000(?:[ \t,].*)?")
 MAIN = re.compile(rb"main>.*")
 BOUNDARY = re.compile(
     rb"(?:\[bt0\].*\b(?:reset|failed|failure|refused|halted|panic)\b|"
-    rb"\[bt0\] DRAM: strap\b|\[bt0\] DRAM: [0-9]+ MiB|panic:)",
+    rb"\[bt0\] DRAM: strap\b|\[bt0\] DRAM: [0-9]+ MiB|"
+    rb"oreboot .* bt0 \| Radxa Cubie A7A|panic:)",
     re.I,
 )
 NORMAL_RESET = re.compile(
@@ -576,16 +577,32 @@ def cached_resume(request, receipt, session, serial, cached, work):
     record["handover"] = (
         "handover unconfirmed pending fresh board-specific serial evidence"
     )
-    record["handover_cursor"] = serial.capture(cursor)
+    try:
+        record["handover_cursor"] = serial.capture(cursor)
+    except (OSError, ValueError) as exc:
+        raise SessionError(Exit.SERIAL_UNCONFIRMED, str(exc)) from exc
     try:
         session.reconnect()
-    finally:
-        end = serial.capture(record["handover_cursor"])
-        record["handover_end"] = end["start"]
-        record["handover_end_cursor"] = end
+    except SessionError:
+        # Keep the reconnect exit even if the serial capture also fails.
+        try:
+            close_handover(serial, record)
+        except (OSError, ValueError) as exc:
+            record["handover_capture_error"] = str(exc)
+        raise
+    try:
+        close_handover(serial, record)
+    except (OSError, ValueError) as exc:
+        raise SessionError(Exit.SERIAL_UNCONFIRMED, str(exc)) from exc
     record["reconnect_epoch"] = session.state
     record["status"] = "reconnected-handover-unconfirmed"
     return Exit.SERIAL_UNCONFIRMED, record["handover"]
+
+
+def close_handover(serial, record):
+    end = serial.capture(record["handover_cursor"])
+    record["handover_end"] = end["start"]
+    record["handover_end_cursor"] = end
 
 
 def guardian(args, reply):
@@ -901,13 +918,13 @@ def workspace_boot(args, fd, record):
         entry = ("exec", "0x90044")
         generation = serial.capture()
         session.submit(entry, returns=False, timeout=15)
-        record["handover_cursor"] = cursor = serial.capture(generation)
         try:
+            record["handover_cursor"] = cursor = serial.capture(generation)
             wait_for_handover_target(
                 lambda: cached["read_mailbox"](session, work), record
             )
             wait_for_handover(serial, cursor, record)
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             if isinstance(exc, SessionError):
                 raise
             raise SessionError(Exit.SERIAL_UNCONFIRMED, str(exc)) from exc

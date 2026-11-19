@@ -1,9 +1,10 @@
 # USB FEL boot and fastboot
 
 The A733 mask ROM has a USB download mode, **FEL**. The board in FEL shows
-up on the host as USB device `1f3a:efe8`. The selector layer does not boot
-or reset a board. `make fel-boot`, `scripts/fel-boot.sh` and
-`scripts/fel-wdt-reset.sh` refuse until task-000141 supplies the session runner.
+up on the host as USB device `1f3a:efe8`. `make fel-boot`,
+`scripts/fel-boot.sh` and `scripts/fel-wdt-reset.sh` own a complete
+[port-bound session](fel-session.md). Use the two-stage cached runner
+documented there for cached memtests.
 
 ## What you need
 
@@ -35,7 +36,7 @@ or reset a board. `make fel-boot`, `scripts/fel-boot.sh` and
 
 Check with `lsusb -d 1f3a:efe8`.
 
-## Selector contract for task-000141
+## Stateless selector contract
 
 The selector is stateless. The runner first discovers a devnum on the
 assigned physical connector, then carries **both** values on each call:
@@ -129,7 +130,8 @@ not a build record.
 
 ### Boot protocol reference for the session runner
 
-These describe the boot protocol, not commands to run from this selector-only revision.
+These describe the workspace boot protocol. Use `make fel-boot` or the
+reviewed session launcher rather than running the selector by hand.
 
 1. **Stage and validate**: copy the bundle into a private directory (mode
    0700). Hash the staged bt0 and use that digest to look up the local build
@@ -144,8 +146,8 @@ These describe the boot protocol, not commands to run from this selector-only re
    it back.
 4. **Entry 1** (`xfel exec 0x90040`): bt0 brings up clocks, PMIC and DRAM,
    boosts the CPUs and returns to FEL. The ROM answers `exec` before the code
-   finishes, so the script polls the mailbox until it reports DRAM up, then
-   prints the DRAM size and clock.
+   finishes, so the session polls the mailbox until it reports DRAM up and
+   records the verified size and clock.
 5. **Load the images**: the layout table frame goes to `0xdf200`, oreboot
    main to `0x40000000` and the EDK2 FD to `0x41000000`, all taken from the
    staged `firmware.bin`. Each write is read back and compared (SHA-256).
