@@ -5,14 +5,17 @@
 #
 #   make dtb           the Cubie A7A device tree (out/dtb/)
 #   make firmware      bt0 + main + EDK2 -> out/firmware/firmware.bin (SD card or eMMC, LBA 256)
-#   make fel-image     firmware + bt0 for USB FEL boot -> out/fel/<mode>/
-#                      (<mode>: blobfree, dramlib or phyfw). Writes a build
-#                      manifest (mode, features, source SHA, image SHA256)
-#                      next to the images
+#   make fel-image     the FEL bundle for one mode and profile ->
+#                      out/fel/<mode>-<mhz>/ (blobfree-1200, blobfree-2400,
+#                      dramlib-2400, phyfw-2400). Its own cargo target and
+#                      intermediates under out/fel/<mode>-<mhz>/build/, and a
+#                      build-manifest.json (mode, profile, features, source
+#                      SHA, image SHA256)
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
-#   make fel-boot      boot the board over USB FEL (board in FEL on the host's
-#                      USB). Only a blobfree image; set FEL_MEASUREMENT_ONLY=yes
-#                      to boot a dramlib or phyfw measurement build
+#   make fel-boot      boot the board over USB FEL with out/fel/<mode>-<mhz>/
+#                      (board in FEL on the host's USB). Only a blobfree
+#                      bundle; a dramlib or phyfw measurement build needs
+#                      FEL_MEASUREMENT_AUTH=<file>
 #   make rpms          the cubie-a7a-* SRPMs and RPMs -> out/fedora/rpmbuild/
 #   make fedora-image  Fedora 45 image with the firmware at LBA 256 -> out/image/
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
@@ -29,17 +32,19 @@
 #   DRAM_MHZ=1200|2400   the DRAM clock of that driver's built-in settings.
 #                        Unset: the firmware's default, 1200, which boots
 #                        Linux; 2400 passes bt0's tests but does not boot
-#                        Linux yet
+#                        Linux yet. The vendor paths run 2400.
 #   VENDOR_DRAM=yes      measurement build: DRAM through Allwinner's DRAM
-#                        library instead (run `make vendor` first). A plain
-#                        `make fel-boot` refuses it
+#                        library instead (run `make vendor` first), at
+#                        2400 MHz. A plain `make fel-boot` refuses it; boot it
+#                        with FEL_MEASUREMENT_AUTH=<file>
 #   VENDOR_DRAM=phyfw    measurement build: our driver with the PHY's own
 #                        training firmware read from that library's object as
 #                        data (`make vendor` too). A plain `make fel-boot`
-#                        refuses it
+#                        refuses it; boot it with FEL_MEASUREMENT_AUTH=<file>
 #   Earlier spellings: BLOBLESS=yes and FEL_DRAM=open are the default now;
 #   FEL_DRAM=dramlib builds only the FEL bt0 with the library (a measurement
-#   build; a plain `make fel-boot` refuses it).
+#   build; a plain `make fel-boot` refuses it; FEL_MEASUREMENT_AUTH=<file> to
+#   boot it).
 #   A7A_* variables in the environment reach the bt0 build and override
 #   single settings of our driver (see the board README in firmware/oreboot).
 
@@ -90,9 +95,7 @@ DTB     := $(OUT)/dtb/sun60i-a733-cubie-a7a.dtb
 DTB_VERSION = $(shell cat $(DTS)/DTB_VERSION)
 LIBDRAM_A := $(OUT)/oreboot/libdram-a733.a
 BT0_BIN := $(OUT)/oreboot/bt0.bin
-BT0_FEL_BIN := $(OUT)/oreboot/bt0-fel.bin
 MAIN_BIN := $(OUT)/oreboot/main.bin
-FEL_MAIN_BIN := $(OUT)/oreboot/main-fel.bin
 EDK2_FD := $(OUT)/edk2/CUBIEA7A_EFI.fd
 XFEL    ?= $(OUT)/tools/xfel
 IMAGE   := $(OUT)/image/a7a-fedora$(FEDORA_RELEASE).img
@@ -113,16 +116,27 @@ FEL_BT0_DRAM := $(if $(filter dramlib,$(FEL_DRAM)),yes,$(VENDOR_DRAM))
 dram-cargo = $(if $(filter no,$(1)),,--no-default-features)
 dram-feature = $(if $(filter yes,$(1)),dramlib)
 # dram-env <no|yes|phyfw>: what the build reads from outside the tree, and
-# the clock of the built-in settings (only our driver alone has them).
+# the clock of the built-in settings (only our driver alone has them). The
+# vendor paths run 2400 MHz, so DRAM_MHZ=2400 is accepted there and any other
+# value is refused.
 dram-env = $(if $(filter yes,$(1)),A733_DRAM_LIB=$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),A733_PHY_FW_OBJ=$(DRAM_LIB)) \
-	$(if $(filter no,$(1)),$(if $(DRAM_MHZ),A7A_PROFILE=$(DRAM_MHZ)),$(if $(DRAM_MHZ),$(error DRAM_MHZ sets the clock of our own DRAM settings; VENDOR_DRAM=$(1) has none)))
+	$(if $(filter no,$(1)),$(if $(DRAM_MHZ),A7A_PROFILE=$(DRAM_MHZ)),$(if $(DRAM_MHZ),$(if $(filter 2400,$(DRAM_MHZ)),,$(error DRAM_MHZ=$(DRAM_MHZ): the vendor DRAM path runs 2400 MHz))))
 # dram-dep <no|yes|phyfw>: the vendor file the build needs, if any.
 dram-dep = $(if $(filter yes,$(1)),$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),$(DRAM_LIB))
 dram-tag = $(if $(filter no,$(1)),blobfree,$(if $(filter yes,$(1)),dramlib,phyfw))
-# Each DRAM mode gets its own FEL output directory, so a blobfree build and a
-# measurement build never share or overwrite the same bt0-fel.bin.
-FEL_TAG := $(call dram-tag,$(FEL_BT0_DRAM))
-FEL_OUT := $(OUT)/fel/$(FEL_TAG)
+# Each DRAM mode and profile gets its own FEL build and output directory, so
+# two builds never share or overwrite the same intermediate or bundle.
+FEL_TAG_MODE := $(call dram-tag,$(FEL_BT0_DRAM))
+FEL_PROFILE := $(or $(DRAM_MHZ),$(if $(filter blobfree,$(FEL_TAG_MODE)),1200,2400))
+FEL_SLOT := $(FEL_TAG_MODE)-$(FEL_PROFILE)
+FEL_OUT := $(OUT)/fel/$(FEL_SLOT)
+FEL_BUILD := $(FEL_OUT)/build
+FEL_TGT := $(FEL_BUILD)/target
+FEL_DTB := $(FEL_BUILD)/dtb/sun60i-a733-cubie-a7a.dtb
+FEL_EDK2_DIR := $(FEL_BUILD)/edk2
+FEL_BT0 := $(FEL_BUILD)/bt0.bin
+FEL_BT0_FEL := $(FEL_BUILD)/bt0-fel.bin
+FEL_MAIN := $(FEL_BUILD)/main-fel.bin
 BT0_FEATURES = $(strip $(call dram-feature,$(BT0_DRAM)) $(if $(filter yes,$(OTP)),otp))
 FEL_FEATURES = $(strip fel $(call dram-feature,$(FEL_BT0_DRAM)))
 empty :=
@@ -148,8 +162,8 @@ define main_build
 	$(OBJCOPY) -O binary $(2)/aarch64-unknown-none-softfloat/release/oreboot-cubie-a7a-main $(3)
 endef
 
-.PHONY: help check-sources vendor dtb bt0 bt0-fel main main-fel edk2 firmware fel-image xfel fel-boot \
-	rpms fedora-image serial test clean mrproper FORCE
+.PHONY: help check-sources vendor dtb bt0 bt0-fel main main-fel edk2 fel-dtb fel-edk2 fel-bt0 \
+	firmware fel-image xfel fel-boot rpms fedora-image serial test clean mrproper FORCE
 
 help:
 	@sed -n '/^$$/q;s/^# \{0,1\}//p' Makefile
@@ -185,15 +199,28 @@ dtb: check-sources
 bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(OUT)/oreboot
 	$(call bt0_build,$(BT0_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(BT0_DRAM)) $(BT0_FEATURES))),$(BT0_BIN),$(BT0_DRAM))
 
-bt0-fel: check-sources $(call dram-dep,$(FEL_BT0_DRAM)) | $(OUT)/oreboot
-	$(call bt0_build,$(FEL_FEATURES),$(TGT)/bt0-$(subst $(space),-,$(strip $(call dram-tag,$(FEL_BT0_DRAM)) $(FEL_FEATURES))),$(BT0_FEL_BIN),$(FEL_BT0_DRAM))
-	@echo "$(BT0_FEL_BIN): linked at 0x90000"
+$(FEL_BUILD):
+	mkdir -p $@
+
+fel-dtb: check-sources
+	mkdir -p $(dir $(FEL_DTB))
+	$(MAKE) -C $(DTS) OUT=$(FEL_DTB) DTB_ORIGIN=firmware
+
+fel-edk2: check-sources fel-dtb
+	EDK2_OUT=$(FEL_EDK2_DIR) BUILD_TAG=$(FEL_SLOT) scripts/build-edk2.sh $(EDK2_TARGET) $(EDK2_ARGS) -D DTB_FILE=$(FEL_DTB)
+
+fel-bt0: check-sources $(call dram-dep,$(BT0_DRAM)) | $(FEL_BUILD)
+	$(call bt0_build,$(BT0_FEATURES),$(FEL_TGT)/bt0-sd,$(FEL_BT0),$(BT0_DRAM))
+
+bt0-fel: check-sources $(call dram-dep,$(FEL_BT0_DRAM)) | $(FEL_BUILD)
+	$(call bt0_build,$(FEL_FEATURES),$(FEL_TGT)/bt0-fel,$(FEL_BT0_FEL),$(FEL_BT0_DRAM))
+	@echo "$(FEL_BT0_FEL): linked at 0x90000"
 
 main: check-sources | $(OUT)/oreboot
 	$(call main_build,$(BRINGUP),$(TGT)/main,$(MAIN_BIN))
 
-main-fel: check-sources | $(OUT)/oreboot
-	$(call main_build,$(FEL_BRINGUP),$(TGT)/main-fel,$(FEL_MAIN_BIN))
+main-fel: check-sources | $(FEL_BUILD)
+	$(call main_build,$(FEL_BRINGUP),$(FEL_TGT)/main-fel,$(FEL_MAIN))
 
 edk2: check-sources dtb
 	EDK2_OUT=$(OUT)/edk2 scripts/build-edk2.sh $(EDK2_TARGET) $(EDK2_ARGS) -D DTB_FILE=$(DTB)
@@ -206,18 +233,17 @@ firmware: bt0 main edk2
 	cd $(FW_OUT) && sha256sum firmware.bin firmware.seek | tee SHA256SUMS
 
 # USB FEL boot set for scripts/fel-boot.sh: bt0-fel.bin plus a firmware.bin
-# whose layout table names main (FEL_BRINGUP) and EDK2. The build-mode
-# manifest records the DRAM mode, features, source revisions and image
-# SHA256; fel-boot checks it before any USB access.
-fel-image: bt0 bt0-fel main-fel edk2
-	python3 scripts/mkimage.py --bt0 $(BT0_BIN) --main $(FEL_MAIN_BIN) --payload $(EDK2_FD) \
-		--out $(FEL_OUT) --egon-offset $(EGON_OFFSET)
-	cp $(BT0_FEL_BIN) $(FEL_OUT)/bt0-fel.bin
-	cd $(FEL_OUT) && sha256sum bt0-fel.bin firmware.bin firmware.seek | tee SHA256SUMS
-	SOURCE_SHA=$$(git -C $(TOP) rev-parse HEAD 2>/dev/null || echo unknown); \
-	OREBOOT_SHA=$$(git -C $(OREBOOT) rev-parse HEAD 2>/dev/null || echo unknown); \
-	python3 scripts/fel-manifest.py --dir $(FEL_OUT) --mode $(FEL_TAG) \
-		--features "$(FEL_FEATURES)" --source-sha "$$SOURCE_SHA" --oreboot-sha "$$OREBOOT_SHA"
+# whose layout table names main (FEL_BRINGUP) and EDK2. The intermediates
+# stay under $(FEL_BUILD); the packaging step reads only from there and
+# writes build-manifest.json (mode, profile, features, source SHA, image
+# SHA256) next to the images. fel-boot validates a staged copy before any
+# USB access.
+fel-image: fel-bt0 bt0-fel main-fel fel-edk2
+	python3 -I scripts/fel-manifest.py record --build-dir $(FEL_BUILD) \
+		--mode $(FEL_TAG_MODE) --profile $(FEL_PROFILE) --features "$(FEL_FEATURES)" \
+		--workspace $(TOP) --oreboot $(OREBOOT)
+	python3 -I scripts/fel-manifest.py package --build-dir $(FEL_BUILD) --out-dir $(FEL_OUT) \
+		--egon-offset $(EGON_OFFSET)
 
 xfel: $(XFEL)
 $(XFEL):
@@ -225,12 +251,13 @@ $(XFEL):
 
 # Needs the board in FEL (USB 1f3a:efe8) on this host and root for xfel
 # (SUDO=, with xfel's udev rule installed, runs it as you). Run it on the
-# host, not in the build container. Only a blobfree image is booted: the
-# manifest in $(FEL_OUT) must say blobfree and match the files. Set
-# FEL_MEASUREMENT_ONLY=yes to boot a dramlib or phyfw measurement build.
+# host, not in the build container. Only a blobfree bundle is booted: the
+# staged manifest must say blobfree, match the current workspace and oreboot
+# SHAs and the requested profile. A dramlib or phyfw measurement build needs
+# FEL_MEASUREMENT_AUTH=<file> naming this bt0 and a human authorization.
 fel-boot: $(XFEL)
 	@test -f $(FEL_OUT)/bt0-fel.bin || { echo "run make fel-image first (in the container)" >&2; exit 1; }
-	XFEL=$(XFEL) scripts/fel-boot.sh $(FEL_OUT)
+	XFEL=$(XFEL) EXPECT_PROFILE=$(FEL_PROFILE) scripts/fel-boot.sh $(FEL_OUT)
 
 rpms: check-sources
 	FWREPO=$(FWREPO) FEDORA_RELEASE=$(FEDORA_RELEASE) $(if $(AIC8800_SRC),AIC8800_SRC=$(abspath $(AIC8800_SRC))) \
@@ -261,7 +288,7 @@ serial:
 test: check-sources
 	cd $(BOARD)/dram && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	cd $(BOARD)/common && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
-	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/test-fel-manifest.py
+	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/fel-check.py scripts/test-fel-manifest.py
 	python3 -I scripts/test-fel-manifest.py
 	bash -n scripts/fel-boot.sh scripts/build-edk2.sh scripts/serial-log.sh scripts/fetch-vendor.sh scripts/build-xfel.sh scripts/binfmt-aarch64.sh
 	shellcheck scripts/*.sh

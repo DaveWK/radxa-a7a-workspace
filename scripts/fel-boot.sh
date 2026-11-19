@@ -30,11 +30,15 @@
 #   SUDO   prefix for xfel (default: sudo; empty if the udev rule grants
 #          access).
 #
-# The image dir must carry build-manifest.json, written by `make fel-image`
-# next to the images. fel-boot checks it before any USB access: the manifest
-# mode must be blobfree, and the recorded sha256 of bt0-fel.bin, firmware.bin
-# and firmware.seek must match the files. A dramlib or phyfw image is a
-# measurement build: set FEL_MEASUREMENT_ONLY=yes to boot one deliberately.
+# The image dir is a `make fel-image` output (out/fel/<mode>-<mhz>/):
+# bt0-fel.bin (bt0 feature fel, linked at 0x90000), firmware.bin +
+# firmware.seek, whose boot layout table names oreboot main and the EDK2 FD,
+# and build-manifest.json. fel-boot copies the bundle into a private staging
+# directory under out/ (mode 0700), validates the copies with
+# scripts/fel-check.py before any USB access, and passes only the staged paths
+# to xfel. A dramlib or phyfw bundle is a measurement build: it needs
+# FEL_MEASUREMENT_AUTH=<file> naming this bt0's digest and a human
+# authorization reference.
 #
 # No board access beyond FEL: nothing here touches an SD card or SPI NOR.
 set -euo pipefail
@@ -46,6 +50,7 @@ MAILBOX=0xdf000
 TABLE=0xdf200
 TABLE_OFFSET=0x1ff000 # layout table offset on the boot medium
 
+SCRIPTS=$(cd "$(dirname "$0")" && pwd)
 XFEL=${XFEL:-xfel}
 SUDO=${SUDO-sudo}
 
@@ -59,7 +64,7 @@ step() { printf '\n==> %s\n' "$*"; }
 # shellcheck disable=SC2086
 x() { $SUDO "$XFEL" "$@" </dev/null; }
 
-[ $# -eq 1 ] || die "usage: $0 <image dir with bt0-fel.bin, firmware.bin, firmware.seek>"
+[ $# -eq 1 ] || die "usage: $0 <image dir with bt0-fel.bin, firmware.bin, firmware.seek, build-manifest.json>"
 IMAGE=$(cd "$1" && pwd)
 for f in bt0-fel.bin firmware.bin firmware.seek build-manifest.json; do
     [ -f "$IMAGE/$f" ] || die "$IMAGE/$f missing (make fel-image)"
@@ -67,65 +72,20 @@ done
 command -v python3 >/dev/null || die "python3 not found"
 command -v "$XFEL" >/dev/null || die "xfel not found (XFEL=$XFEL)"
 
-# Refuse a legacy or non-blobfree image before any USB access.
-MEASUREMENT=${FEL_MEASUREMENT_ONLY:-no}
-python3 -I - "$IMAGE/build-manifest.json" "$IMAGE" "$MEASUREMENT" <<'PY'
-import hashlib, json, sys
+# Copy the bundle into a private staging directory and validate the copies
+# before any USB access. Nothing reads the original bundle after this.
+STAGE=$(mktemp -d "$(dirname "$IMAGE")/.fel-stage.XXXXXX")
+trap 'rm -rf "$STAGE"' EXIT
+cp "$IMAGE/bt0-fel.bin" "$IMAGE/firmware.bin" "$IMAGE/firmware.seek" \
+    "$IMAGE/build-manifest.json" "$STAGE/"
+WORK="$STAGE/work"
+mkdir -p "$WORK"
 
-manifest_path, image, measurement = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-except OSError as e:
-    sys.exit(f"fel-boot: cannot read {manifest_path}: {e}")
-except ValueError as e:
-    sys.exit(f"fel-boot: {manifest_path} is not valid JSON: {e}")
-mode = manifest.get("mode")
-if mode not in ("blobfree", "dramlib", "phyfw"):
-    sys.exit(f"fel-boot: manifest mode {mode!r} is not blobfree, dramlib or phyfw")
-if mode != "blobfree":
-    if measurement != "yes":
-        sys.exit(
-            f"fel-boot: {manifest_path} is a {mode} measurement build, not blobfree;"
-            " refusing before USB access (set FEL_MEASUREMENT_ONLY=yes to boot it)"
-        )
-    print(f"fel-boot: FEL_MEASUREMENT_ONLY=yes: booting a {mode} measurement build")
-
-
-def sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-for key, name in (
-    ("bt0_fel_sha256", "bt0-fel.bin"),
-    ("firmware_sha256", "firmware.bin"),
-    ("firmware_seek_sha256", "firmware.seek"),
-):
-    want = manifest.get(key)
-    if not want:
-        sys.exit(f"fel-boot: {manifest_path} has no {key}")
-    got = sha256(f"{image}/{name}")
-    if want != got:
-        sys.exit(
-            f"fel-boot: {name} sha256 {got} does not match the manifest ({want});"
-            " the image is stale or mixed"
-        )
-print(
-    f"build mode {mode}; features {manifest.get('features')};"
-    f" source {manifest.get('source_sha')}"
-)
-PY
-
-WORK=$(mktemp -d "$IMAGE/.fel-boot.XXXXXX")
-cleanup() {
-    find "$WORK" -maxdepth 1 -type f -delete 2>/dev/null || true
-    rmdir "$WORK" 2>/dev/null || true
-}
-trap cleanup EXIT
+check_args=(--expect-profile "${EXPECT_PROFILE:-${DRAM_MHZ:-1200}}")
+if [ -n "${FEL_MEASUREMENT_AUTH:-}" ]; then
+    check_args+=(--measurement-auth "$FEL_MEASUREMENT_AUTH")
+fi
+python3 -I "$SCRIPTS/fel-check.py" "$STAGE" "${check_args[@]}"
 
 # put <file> <address> <label>: write, read back, compare.
 put() {
@@ -157,10 +117,10 @@ ver=$(x version) || die "xfel version failed"
 printf '  %s\n' "$ver"
 grep -q 'ID=0x00190300' <<<"$ver" || die "FEL device is not an A733 (ID 0x00190300)"
 
-step "Images from $IMAGE"
+step "Images from $STAGE"
 # The layout table frame and every image it names, out of firmware.bin; the
 # table's CRCs are checked here as bt0 will check them.
-python3 -I - "$IMAGE" "$WORK" "$TABLE_OFFSET" >"$WORK/plan" <<'PY'
+python3 -I - "$STAGE" "$WORK" "$TABLE_OFFSET" >"$WORK/plan" <<'PY'
 import struct, sys, zlib
 image, work, table_offset = sys.argv[1], sys.argv[2], int(sys.argv[3], 0)
 fw = open(f"{image}/firmware.bin", "rb").read()
@@ -197,7 +157,7 @@ grep -q '^2 ' "$WORK/plan" || die "no payload in the layout table"
 step "bt0 (FEL build) to $BT0_BASE"
 head -c 4096 /dev/zero >"$WORK/zero"
 put "$WORK/zero" "$MAILBOX" "mailbox (cleared)"
-put "$IMAGE/bt0-fel.bin" "$BT0_BASE" "bt0-fel.bin"
+put "$STAGE/bt0-fel.bin" "$BT0_BASE" "bt0-fel.bin"
 # xfel's read32 helper invalidates the I-cache and branch predictor first.
 x read32 "$ENTRY1" >/dev/null
 
