@@ -13,6 +13,8 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,6 +40,13 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 FEL_ROOT = ROOT / "out" / "fel"
 RECORDS = FEL_ROOT / ".records"
+OREBOOT = Path("firmware/oreboot")
+BOARD = OREBOOT / "src/mainboard/radxa/cubie-a7a"
+SUBMODULES = {
+    "oreboot": OREBOOT,
+    "edk2": Path("firmware/edk2"),
+    "edk2_platforms": Path("firmware/edk2-platforms"),
+}
 
 
 def die(msg):
@@ -75,22 +84,49 @@ def git_sha(cwd):
 
 
 def source_identity(workspace, phase):
-    result = {}
-    for name, path in (
-        ("workspace", workspace),
-        ("oreboot", workspace / "firmware" / "oreboot"),
-    ):
-        sha = git_sha(path)
-        if not sha:
-            die(f"{phase}: {path} is not an initialized repository with a 40-hex HEAD")
+    roots = {}
+    for name, relative in {
+        "workspace": Path("."),
+        **SUBMODULES,
+        "board": BOARD,
+    }.items():
+        path = workspace / relative
+        expected_top = workspace / OREBOOT if name == "board" else path
+        top = git_text(path, "rev-parse", "--show-toplevel")
+        sha = git_text(path, "rev-parse", "--verify", "HEAD^{commit}")
+        if path.resolve() != path or top != str(expected_top) or not is_hex(sha, 40):
+            die(
+                f"{phase}: {path} is not an initialized repository with a 40-hex HEAD at {expected_top}"
+            )
+        if name in SUBMODULES:
+            expected = f"160000 commit {sha}\t{relative}"
+            if (
+                git_text(
+                    workspace,
+                    "ls-tree",
+                    roots["workspace"]["head"],
+                    "--",
+                    str(relative),
+                )
+                != expected
+            ):
+                die(f"{phase}: {path} HEAD {sha} does not match the workspace gitlink")
+        roots[name] = dict(path=str(path), toplevel=top, head=sha, clean=True)
+
+    for name in ("oreboot", "edk2", "edk2_platforms", "workspace"):
+        path = Path(roots[name]["path"])
         if (
             git_text(path, "status", "--porcelain", "-uall", "--ignore-submodules=none")
             != ""
         ):
             die(f"{phase}: {path} is not clean (git status --porcelain)")
-        result["source_sha" if name == "workspace" else "oreboot_sha"] = sha
-        result[f"{name}_clean"] = True
-    return result
+    return dict(
+        source_sha=roots["workspace"]["head"],
+        oreboot_sha=roots["oreboot"]["head"],
+        workspace_clean=True,
+        oreboot_clean=True,
+        source_roots=roots,
+    )
 
 
 def load_json(path):
@@ -121,12 +157,64 @@ def knob(name):
     return name.startswith(("A7A_", "A733_"))
 
 
-def snapshot(build_dir, snapshot_dir, name):
-    source, dest = build_dir / name, snapshot_dir / name
+def snapshot(source, dest):
     if not source.is_file():
         die(f"missing intermediate {source}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["cp", "--", str(source), str(dest)], check=True)
+
+
+def seed_cargo_home(home, cache_home):
+    # The pinned build uses crates.io, not git dependencies. Only copy the
+    # offline inputs; Cargo can extract archives and write locks in this home
+    # but never gets the caller's config, credentials or unpacked sources.
+    for name in ("index", "cache"):
+        source = cache_home / "registry" / name
+        if not source.is_dir():
+            continue
+        dest = home / "registry" / name
+        dest.parent.mkdir(exist_ok=True)
+        subprocess.run(
+            ["cp", "-RL", "--reflink=auto", "--", str(source), str(dest)], check=True
+        )
+        for path in dest.rglob("*"):
+            path.chmod(stat.S_IMODE(path.stat().st_mode) & ~0o222)
+        dest.chmod(stat.S_IMODE(dest.stat().st_mode) & ~0o222)
+
+
+def check_cargo_env(home):
+    env = dict(os.environ, CARGO_HOME=str(home), CARGO_NET_OFFLINE="true")
+    for name in ("RUSTUP_TOOLCHAIN", "RUSTFLAGS"):
+        env.pop(name, None)
+    for crate in ("bt0", "main"):
+        cwd = ROOT / BOARD / crate
+        result = subprocess.run(
+            ["cargo", "-Zunstable-options", "config", "get", "--format=json", "env"],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            if (
+                result.returncode == 101
+                and not result.stdout
+                and result.stderr.rstrip().splitlines()[-1:]
+                == ["error: config value `env` is not set"]
+            ):
+                continue
+            die(f"cannot inspect Cargo [env] from {cwd} (exit {result.returncode})")
+        try:
+            config_env = json.loads(result.stdout)["env"]
+            if not isinstance(config_env, dict):
+                raise ValueError("env is not a table")
+        except (KeyError, TypeError, ValueError):
+            die(f"cannot read Cargo [env] as JSON from {cwd}")
+        # The Make recipe supplies the allowed knobs as process environment,
+        # not as Cargo config. Even the same key in config may use force=true.
+        knobs = sorted(name for name in config_env if knob(name))
+        if knobs:
+            die(f"refuses Cargo [env] build knobs from {cwd}: {', '.join(knobs)}")
 
 
 def build(args):
@@ -141,6 +229,11 @@ def build(args):
     inherited = sorted(name for name in os.environ if knob(name))
     if inherited:
         die(f"fel-image refuses inherited build knobs: {', '.join(inherited)}")
+    for name in ("EDK2_DIR", "EDK2_PLATFORMS_DIR"):
+        if name in os.environ:
+            die(f"fel-image refuses {name} override")
+    edk2_args = shlex.split(args.edk2_args)
+    dtb_input = Path(args.fel_dtb_input).resolve() if args.fel_dtb_input else None
     # No inherited knob gets past the rejection. Also clear the inputs FEL
     # owns at the compiler's parent boundary, before the recipes set them.
     make = [
@@ -170,17 +263,49 @@ def build(args):
             close_fds=False,  # preserve GNU Make's pipe jobserver as well as FIFO
         )
 
-    first = ("fel-bt0", "bt0-fel", "main-fel", "fel-dtb")
+    def compile_edk2(run_dir, dtb, dry_run=False):
+        edk2_env = dict(os.environ, EDK2_OUT=str(run_dir / "edk2"), BUILD_TAG=out.name)
+        # edksetup otherwise reuses settings left by a different EDK2 shell.
+        for name in ("WORKSPACE", "CONF_PATH"):
+            edk2_env.pop(name, None)
+        command = [
+            str(HERE / "build-edk2.sh"),
+            args.edk2_target,
+            *edk2_args,
+            "-D",
+            f"DTB_FILE={dtb}",
+        ]
+        if dry_run:
+            print(
+                shlex.join(
+                    [
+                        f"EDK2_OUT={edk2_env['EDK2_OUT']}",
+                        f"BUILD_TAG={out.name}",
+                        *command,
+                    ]
+                )
+            )
+            return
+        subprocess.run(command, cwd=ROOT, env=edk2_env, check=True, close_fds=False)
+
+    def compile_firmware(run_dir):
+        targets = ["fel-bt0", "bt0-fel", "main-fel"]
+        if dtb_input is None:
+            targets.append("fel-dtb")
+        # Command-line assignments also replace a caller's Make overrides.
+        compile_targets(
+            run_dir,
+            targets,
+            f"CARGO_HOME={run_dir / 'cargo-home'}",
+            "CARGO_NET_OFFLINE=true",
+        )
+
     build_root = out / "build"
     if args.dry_run:
         make.append("-n")
         run_dir = build_root / ".compile.DRY-RUN"
-        compile_targets(run_dir, first)
-        compile_targets(
-            run_dir,
-            ("fel-edk2",),
-            f"FEL_DTB_INPUT={build_root / '.snapshot.DRY-RUN' / DTB}",
-        )
+        compile_firmware(run_dir)
+        compile_edk2(run_dir, build_root / ".snapshot.DRY-RUN" / DTB, dry_run=True)
         return
 
     build_root.mkdir(parents=True, exist_ok=True)
@@ -192,16 +317,25 @@ def build(args):
         fcntl.flock(lock, fcntl.LOCK_EX)
         before = source_identity(ROOT, "before compilation")
         compiled, private = Path(compiled), Path(private)
-        compile_targets(compiled, first, "FEL_DTB_INPUT=")
+        home = compiled / "cargo-home"
+        home.mkdir(mode=0o700)
+        cache_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+        seed_cargo_home(home, cache_home)
+        check_cargo_env(home)
+        compile_firmware(compiled)
         # EDK2 embeds the DTB. Use the private DTB copy as its source as well.
-        snapshot(compiled, private, DTB)
-        compile_targets(compiled, ("fel-edk2",), f"FEL_DTB_INPUT={private / DTB}")
+        dtb_path = dtb_input if dtb_input is not None else compiled / DTB
+        snapshot(dtb_path, private / DTB)
+        dtb_sha = sha256(private / DTB)
+        compile_edk2(compiled, private / DTB)
         if before != source_identity(ROOT, "after compilation"):
             die("workspace or oreboot HEAD changed during compilation")
         for name, _ in INTERMEDIATES:
             if name != DTB:
-                snapshot(compiled, private, name)
+                snapshot(compiled / name, private / name)
         digests = {key: sha256(private / name) for name, key in INTERMEDIATES}
+        if digests["dtb_sha256"] != dtb_sha:
+            die("private DTB changed during EDK2 compilation")
 
         # Hash and package the same files. Nothing reopens the originals.
         subprocess.run(
@@ -228,6 +362,11 @@ def build(args):
             features=features,
             clean=True,
             **before,
+            edk2_target=args.edk2_target,
+            edk2_args=edk2_args,
+            fel_dtb_input=str(dtb_input) if dtb_input is not None else None,
+            dtb_path=str(dtb_path),
+            dtb_sha256=dtb_sha,
             **{key: sha256(private / name) for name, key in PACKAGED},
         )
         record = dict(
@@ -277,7 +416,9 @@ def check_auth(path, digest):
     return ref
 
 
-def check_manifest(bundle, expect_source, expect_oreboot, expect_profile, auth_path):
+def check_manifest(
+    bundle, expect_source, expect_oreboot, expect_mode, expect_profile, auth_path
+):
     digest = sha256(bundle / "bt0-fel.bin")
     path = RECORDS / f"{digest}.json"
     if not path.is_file():
@@ -298,6 +439,8 @@ def check_manifest(bundle, expect_source, expect_oreboot, expect_profile, auth_p
         value = record.get(field)
         if not is_hex(value, 40) or value != expected:
             die(f"record {field} {value!r} does not match expected HEAD {expected}")
+    if mode != expect_mode:
+        die(f"record mode {mode} does not match requested mode {expect_mode}")
     if profile != expect_profile:
         die(
             f"record profile {profile} does not match requested profile {expect_profile}"
@@ -313,6 +456,12 @@ def check_manifest(bundle, expect_source, expect_oreboot, expect_profile, auth_p
         "clean",
         "workspace_clean",
         "oreboot_clean",
+        "source_roots",
+        "edk2_target",
+        "edk2_args",
+        "fel_dtb_input",
+        "dtb_path",
+        "dtb_sha256",
         *(key for _, key in PACKAGED),
     ):
         if key not in manifest or manifest[key] != record.get(key):
@@ -342,9 +491,12 @@ def main():
     for arg in ("features", "sd-features", "main-features", "fel-env", "sd-env"):
         b.add_argument(f"--{arg}", required=True)
     b.add_argument("--egon-offset", required=True)
+    b.add_argument("--edk2-target", required=True, choices=("DEBUG", "RELEASE"))
+    b.add_argument("--edk2-args", required=True)
+    b.add_argument("--fel-dtb-input", required=True)
     try:
         build(ap.parse_args())
-    except (OSError, subprocess.CalledProcessError) as e:
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
         die(e)
 
 

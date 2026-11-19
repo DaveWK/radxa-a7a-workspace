@@ -104,6 +104,7 @@ def main():
     ap.add_argument(
         "--work", type=Path, required=True, help="private write-plan directory"
     )
+    ap.add_argument("--expect-mode", choices=fel_manifest.MODES, default="blobfree")
     ap.add_argument("--expect-profile", type=int, default=1200)
     ap.add_argument("--measurement-auth", type=Path)
     a = ap.parse_args()
@@ -126,6 +127,7 @@ def main():
             a.bundle,
             expect_source,
             expect_oreboot,
+            a.expect_mode,
             a.expect_profile,
             a.measurement_auth,
         )

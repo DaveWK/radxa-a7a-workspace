@@ -30,6 +30,8 @@
 #          uses).
 #   SUDO   prefix for xfel (default: sudo; empty if the udev rule grants
 #          access).
+#   EXPECT_MODE / EXPECT_PROFILE   expected build record mode and profile
+#          (default: blobfree and ${DRAM_MHZ:-1200}).
 #
 # The image dir is a `make fel-image` output (out/fel/<mode>-<mhz>/):
 # bt0-fel.bin (bt0 feature fel, linked at 0x90000), firmware.bin +
@@ -83,7 +85,8 @@ cp "$IMAGE/bt0-fel.bin" "$IMAGE/firmware.bin" "$IMAGE/firmware.seek" \
 WORK="$STAGE/work"
 mkdir -p "$WORK"
 
-check_args=(--work "$WORK" --expect-profile "${EXPECT_PROFILE:-${DRAM_MHZ:-1200}}")
+check_args=(--work "$WORK" --expect-mode "${EXPECT_MODE:-blobfree}"
+    --expect-profile "${EXPECT_PROFILE:-${DRAM_MHZ:-1200}}")
 if [ -n "${FEL_MEASUREMENT_AUTH:-}" ]; then
     check_args+=(--measurement-auth "$FEL_MEASUREMENT_AUTH")
 fi

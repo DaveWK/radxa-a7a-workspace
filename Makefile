@@ -43,7 +43,7 @@
 #   FEL_DRAM=dramlib builds only the FEL bt0 with the library (a measurement
 #   build; a plain `make fel-boot` refuses it; FEL_MEASUREMENT_AUTH=<file> to
 #   boot it).
-#   fel-image refuses inherited A7A_* and A733_* variables in every mode.
+#   fel-image refuses inherited or Cargo-configured A7A_* and A733_* knobs.
 #   Use the separate lab tooling for individual driver settings.
 
 TOP      := $(abspath .)
@@ -146,6 +146,7 @@ override FEL_BT0_ENV = $(if $(filter blobfree,$(FEL_TAG_MODE)),A7A_PROFILE=$(PRO
 fel-profile-check = $(if $(filter-out blobfree,$(FEL_TAG_MODE)),$(if $(filter-out undefined,$(origin DRAM_MHZ)),$(error DRAM_MHZ must be unset for FEL measurement mode $(FEL_TAG_MODE), which runs at 2400 MHz)))
 empty :=
 space := $(empty) $(empty)
+shell-quote = '$(subst ','"'"',$(1))'
 
 define check-bt0-size
 	@s=$$(stat -c %s $(1)); if [ $$s -gt $(BT0_MAX_BYTES) ]; then \
@@ -243,12 +244,16 @@ firmware: bt0 main edk2
 # handles -n without acquiring locks, creating directories or compiling.
 fel-image:
 	$(fel-profile-check)
+	$(foreach var,TOP OREBOOT BOARD CARGO,$(if $(filter file,$(origin $(var))),,$(error fel-image refuses $(var) override (origin: $(origin $(var))))))
 	$(if $(findstring t,$(filter-out -%,$(firstword $(MAKEFLAGS)))),:,python3 -I scripts/fel-manifest.py build \
 		--make "$(MAKE)" $(if $(findstring n,$(filter-out -%,$(firstword $(MAKEFLAGS)))),--dry-run) \
 		--out-dir "$(FEL_OUT)" --mode $(FEL_TAG_MODE) --profile $(PROFILE) \
 		--features "$(FEL_FEATURES)" --sd-features "$(BT0_FEATURES)" \
 		--main-features "$(FEL_BRINGUP)" --fel-env "$(strip $(FEL_BT0_ENV))" \
-		--sd-env "$(strip $(FEL_SD_ENV))" --egon-offset $(EGON_OFFSET))
+		--sd-env "$(strip $(FEL_SD_ENV))" --egon-offset $(EGON_OFFSET) \
+		--edk2-target=$(call shell-quote,$(or $(EDK2_TARGET),DEBUG)) \
+		--edk2-args=$(call shell-quote,$(EDK2_ARGS)) \
+		--fel-dtb-input=$(call shell-quote,$(FEL_DTB_INPUT)))
 
 xfel: $(XFEL)
 $(XFEL):
@@ -257,13 +262,13 @@ $(XFEL):
 # Needs the board in FEL (USB 1f3a:efe8) on this host and root for xfel
 # (SUDO=, with xfel's udev rule installed, runs it as you). Run it on the
 # host, not in the build container. The workspace build record, looked up
-# by staged bt0 digest, must agree with the bundle and the requested profile.
+# by staged bt0 digest, must agree with the bundle and the requested mode/profile.
 # A dramlib or phyfw measurement build needs
 # FEL_MEASUREMENT_AUTH=<file> naming this bt0 and a human authorization.
 fel-boot: $(XFEL)
 	$(fel-profile-check)
 	@test -f $(FEL_OUT)/bt0-fel.bin || { echo "run make fel-image first (in the container)" >&2; exit 1; }
-	XFEL=$(XFEL) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh $(FEL_OUT)
+	XFEL=$(XFEL) EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh $(FEL_OUT)
 
 rpms: check-sources
 	FWREPO=$(FWREPO) FEDORA_RELEASE=$(FEDORA_RELEASE) $(if $(AIC8800_SRC),AIC8800_SRC=$(abspath $(AIC8800_SRC))) \
