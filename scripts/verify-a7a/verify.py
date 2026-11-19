@@ -333,6 +333,11 @@ def negative_contract_ok(returncode: int, output: str) -> tuple[bool, str]:
     return True, "expected feature-conflict diagnostic found"
 
 
+def has_dram_section(readelf_output: str) -> bool:
+    """True when readelf lists a .dram section (its lines are indented)."""
+    return re.search(r"^\s*\[\s*\d+\]\s+\.dram\b", readelf_output, re.M) is not None
+
+
 def parse_test_results(output: str) -> tuple[int, int, int, bool]:
     passed = failed = ignored = 0
     found = False
@@ -595,9 +600,7 @@ class Harness:
             return BuildResult(
                 tag, section, False, "build failed", detail="llvm-readelf failed"
             )
-        has_dram = (
-            re.search(r"^\[\s*\d+\]\s+\.dram\b", readelf.output, re.M) is not None
-        )
+        has_dram = has_dram_section(readelf.output)
         bin_path = self.args.out / "matrix" / "out" / f"bt0-{tag}.bin"
         ext_path = self.args.out / "matrix" / "out" / f"bt0-{tag}-ext.bin"
         if has_dram:

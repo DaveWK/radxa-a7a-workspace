@@ -263,6 +263,20 @@ class PureLogicTest(unittest.TestCase):
         ok, _ = verify.negative_contract_ok(1, "error: unused manifest key")
         self.assertFalse(ok)
 
+    def test_dram_section_detection_allows_readelf_indent(self):
+        self.assertTrue(
+            verify.has_dram_section(
+                "  [Nr] Name              Type\n"
+                "  [ 1] .dram             PROGBITS        59000000 010000 000004\n"
+            )
+        )
+        self.assertFalse(
+            verify.has_dram_section(
+                "  [Nr] Name              Type\n"
+                "  [ 1] .text             PROGBITS        00090000 020000 000050\n"
+            )
+        )
+
     def test_test_results_aggregate_every_binary(self):
         output = (
             "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered\n"
