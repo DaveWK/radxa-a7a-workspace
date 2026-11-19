@@ -137,6 +137,11 @@ class SessionTests(Fixture):
                 self.selector.failure[cmd] = selector
                 self.assert_exit(expected, session.at, 12, *cmd)
 
+    def test_identity_deadline_boundary(self):
+        M["bounded_identity_time"](100, 220)
+        with self.assertRaisesRegex(ValueError, "expired"):
+            M["bounded_identity_time"](100, 221)
+
     def test_timed_out_live_child_retains_lease(self):
         child = self.root / "selector"
         alive, done = self.root / "alive", self.root / "done"

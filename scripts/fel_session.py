@@ -44,7 +44,8 @@ ENTRY_TWO = b"[bt0] FEL: entry 2: checking the images in DRAM"
 MAX_SERIAL = 1 << 20
 IDENTITY_LIFETIME = 120
 BOARDS = {"4g": (b"CXMT 4GB", b"4096"), "6g": (b"CXMT 6GB", b"6144")}
-# See oreboot bt0/src/main.rs and dram/src/sets.rs for the identity strings.
+# The pinned oreboot board's bt0/src/dram.rs, bt0/src/main.rs and
+# dram/src/sets.rs define the two emitted identity fields.
 STRAP = re.compile(rb"\[bt0\] DRAM: strap [0-9]+ mV \(nearest [0-9]+ mV\) -> (.+)")
 SIZE = re.compile(rb"\[bt0\] DRAM: ([0-9]+) MiB")
 SHA256 = re.compile(r"[0-9a-f]{64}")
