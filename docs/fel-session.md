@@ -98,8 +98,11 @@ the device. Do not retry an interrupted submission.
 ## Capture boundaries
 
 The registered log for `3-3.4` is `2026-11-19-1033-a7a-4g.log`; for
-`3-6` it is `2026-11-19-1041-a7a-6g.log`, both under
-`~/src/radxa-a7a/serial-logs/`. These are the USB serial adapter captures
+`3-6` it is `2026-11-19-1041-a7a-6g.log`. Pass the absolute path with
+`--serial-log` for cached preflight or `FEL_SERIAL_LOG` for workspace boot.
+The path must match the port's registered file in the bench's fixed
+serial-log directory; the option does not change that directory.
+These are the USB serial adapter captures
 (4 GB: FTDI FT231X; 6 GB: CH340) that replaced the Luckfox bridge on
 2026-11-19; the per-boot identity gate is the guard against an adapter swap.
 No tty or pty is opened. Each cursor records

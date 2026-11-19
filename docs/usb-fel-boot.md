@@ -171,10 +171,13 @@ For example, `FEL_PORT="$port" FEL_SERIAL_LOG="$log" make fel-boot DRAM_MHZ=1200
 ### Measurement builds
 
 A `dramlib` or `phyfw` bundle is a measurement build. Its authorization
-file must name the exact `bt0_fel_sha256` from the local build record and a
-human authorization reference (a DECISIONS date and a queue key). The file
-records authorization; it grants nothing by itself. `scripts/fel-check.py`
-validates the digest and reference before producing the write plan.
+file must be a JSON object with `bt0_fel_sha256` equal to the exact digest
+from the local build record and `authorization` set to a non-blank string
+that references a human decision (for example, a dated decision and a
+tracking key). `scripts/fel-check.py` checks the digest and that the string
+contains non-whitespace text before producing the write plan. It does not
+enforce a date or tracking-key format. The file records authorization; it
+grants nothing by itself.
 
 Build options: `DRAM_MHZ=1200|2400` (the DRAM clock of our own DRAM driver,
 which is the default; 1200 unless set), `VENDOR_DRAM=yes` (the vendor DRAM
