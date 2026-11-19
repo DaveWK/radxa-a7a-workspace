@@ -293,6 +293,7 @@ test: check-sources
 	bash -n scripts/fel-boot.sh scripts/build-edk2.sh scripts/serial-log.sh scripts/fetch-vendor.sh scripts/build-xfel.sh scripts/binfmt-aarch64.sh
 	shellcheck scripts/*.sh
 	shfmt -d scripts/*.sh
+	black --check scripts/*.py
 
 clean:
 	rm -rf $(OUT)
