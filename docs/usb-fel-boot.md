@@ -37,24 +37,38 @@ Check with `lsusb -d 1f3a:efe8`.
 
 ## Boot
 
-    make fel-image            # in the build container: out/fel/
+    make fel-image            # in the build container: out/fel/<mode>-<mhz>/
     make xfel                 # once, on the host
     make fel-boot             # on the host, board in FEL
 
-`make fel-boot` runs `scripts/fel-boot.sh out/fel` with `XFEL=out/tools/xfel`.
-The steps:
+`make fel-image` builds one bundle for the current DRAM mode and profile into
+`out/fel/<mode>-<mhz>/` (`blobfree-1200` by default, `blobfree-2400` with
+`DRAM_MHZ=2400`, `dramlib-2400` with `VENDOR_DRAM=yes`). The intermediates
+and the cargo target stay under `out/fel/<mode>-<mhz>/build/`; the bundle
+holds `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and
+`build-manifest.json`.
 
-1. **Check** that the FEL device is an A733 (`xfel version`, ID `0x00190300`).
-2. **Load bt0**: clear the mailbox at `0xdf000`, write `bt0-fel.bin` (bt0
-   built with feature `fel`, linked at `0x90000`) and read it back.
-3. **Entry 1** (`xfel exec 0x90040`): bt0 brings up clocks, PMIC and DRAM,
+`make fel-boot` runs `scripts/fel-boot.sh out/fel/<mode>-<mhz>` with
+`XFEL=out/tools/xfel` and `EXPECT_PROFILE=<mhz>`. The steps:
+
+1. **Stage and validate**: copy the bundle into a private directory under
+   `out/` (mode 0700), then check the copies with `scripts/fel-check.py`
+   before any USB access. The manifest must say `blobfree`, carry 40-hex
+   workspace and oreboot SHAs equal to the current `HEAD`s, a clean flag, the
+   requested profile, and SHA-256 values matching the staged files. The
+   staging directory is removed on exit; xfel sees only the staged paths.
+2. **Check** that the FEL device is an A733 (`xfel version`, ID `0x00190300`).
+3. **Load bt0**: clear the mailbox at `0xdf000`, write the staged
+   `bt0-fel.bin` (bt0 built with feature `fel`, linked at `0x90000`) and read
+   it back.
+4. **Entry 1** (`xfel exec 0x90040`): bt0 brings up clocks, PMIC and DRAM,
    boosts the CPUs and returns to FEL. The ROM answers `exec` before the code
    finishes, so the script polls the mailbox until it reports DRAM up, then
    prints the DRAM size and clock.
-4. **Load the images**: the layout table frame goes to `0xdf200`, oreboot
-   main to `0x40000000` and the EDK2 FD to `0x41000000`, all taken from
-   `firmware.bin`. Each write is read back and compared (SHA-256).
-5. **Entry 2** (`xfel exec 0x90044`): bt0 checks the layout table and the
+5. **Load the images**: the layout table frame goes to `0xdf200`, oreboot
+   main to `0x40000000` and the EDK2 FD to `0x41000000`, all taken from the
+   staged `firmware.bin`. Each write is read back and compared (SHA-256).
+6. **Entry 2** (`xfel exec 0x90044`): bt0 checks the layout table and the
    images' CRCs in DRAM and turns off the GIC state the ROM left behind (its
    USB runs on interrupts, and a pending interrupt blocks the warm reset).
    It then warm-resets into main at EL3, as the SD boot does. FEL does not
@@ -62,12 +76,25 @@ The steps:
    `0xe0` entry 1 not run, `0xe1` bad layout table, `0xe2` CRC mismatch), and
    the board stays in FEL.
 
-`out/fel/` holds `bt0-fel.bin`, `firmware.bin`, `firmware.seek` and
-`SHA256SUMS`. Build options: `DRAM_MHZ=1200|2400` (the DRAM clock of our
-own DRAM driver, which is the default; 1200 unless set), `VENDOR_DRAM=yes`
-(the vendor DRAM library instead; see the [README](../README.md#dram)), and
-`FEL_BRINGUP=` (features of the FEL main, default `gmac usb usb-hs-only
-trng`).
+### Measurement builds
+
+A `dramlib` or `phyfw` bundle is a measurement build. A plain `make fel-boot`
+refuses it. To boot one, write an authorization file naming the exact
+`bt0_fel_sha256` from the bundle's `build-manifest.json` and a human
+authorization reference (a DECISIONS date and a queue key), then:
+
+    make fel-boot FEL_MEASUREMENT_AUTH=/path/to/auth.json
+
+The file records a human authorization; it grants nothing by itself. The
+script checks that the staged bt0's digest matches the file and prints the
+reference. `EXPECT_SOURCE_SHA`/`EXPECT_OREBOOT_SHA` override the SHAs the
+manifest must match (for example to replay an older bundle); they do not
+authorize a measurement build.
+
+Build options: `DRAM_MHZ=1200|2400` (the DRAM clock of our own DRAM driver,
+which is the default; 1200 unless set), `VENDOR_DRAM=yes` (the vendor DRAM
+library instead; see the [README](../README.md#dram)), and `FEL_BRINGUP=`
+(features of the FEL main, default `gmac usb usb-hs-only trng`).
 
 ## Expected serial output
 
