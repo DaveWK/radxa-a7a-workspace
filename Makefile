@@ -11,8 +11,10 @@
 #                      directories, and a build record under out/fel/.records/
 #   make xfel          xfel with a 60 s USB timeout -> out/tools/xfel
 #   make fel-boot      workspace maintenance boot; requires FEL_PORT, FEL_SERIAL_LOG
-#   make rpms          the cubie-a7a-* SRPMs and RPMs -> out/fedora/rpmbuild/
-#   make fedora-image  Fedora 45 image with the firmware at LBA 256 -> out/image/
+#   make rpms          the cubie-a7a-* SRPMs and RPMs -> fresh run in out/fedora/rpmbuild/
+#                      sealed run path recorded in out/fedora/run
+#   make fedora-image  Fedora 45 image with firmware at LBA 256 and verification
+#                      sidecars -> out/image/; self-check using the build receipt
 #   make serial        UART0 logger (picocom in screen, logs in serial-logs/)
 #   make test          host tests (oreboot board crates, scripts)
 #   make vendor        fetch the vendor DRAM library object (measurement builds
@@ -88,6 +90,8 @@ BT0_BIN := $(OUT)/oreboot/bt0.bin
 MAIN_BIN := $(OUT)/oreboot/main.bin
 EDK2_FD := $(OUT)/edk2/CUBIEA7A_EFI.fd
 IMAGE   := $(OUT)/image/a7a-fedora$(FEDORA_RELEASE).img
+RPM_RUN_FILE := $(OUT)/fedora/run
+DEVCARD_SCRATCH := $(abspath $(OUT)/fedora/verify-scratch)
 
 # The DRAM path of bt0 and of the FEL bt0: no (ours, nothing from a vendor),
 # yes (the vendor library) or phyfw (ours with the PHY's firmware as data).
@@ -113,6 +117,8 @@ dram-env = $(if $(filter yes,$(1)),A733_DRAM_LIB=$(LIBDRAM_A)) $(if $(filter phy
 # dram-dep <no|yes|phyfw>: the vendor file the build needs, if any.
 dram-dep = $(if $(filter yes,$(1)),$(LIBDRAM_A)) $(if $(filter phyfw,$(1)),$(DRAM_LIB))
 dram-tag = $(if $(filter no,$(1)),blobfree,$(if $(filter yes,$(1)),dramlib,phyfw))
+# firmware.bin uses bt0 (BT0_DRAM), not the separate FEL build's profile.
+DRAM_FIRMWARE_IDENTITY ?= $(call dram-tag,$(BT0_DRAM))-$(if $(filter no,$(BT0_DRAM)),$(or $(DRAM_MHZ),1200),2400)
 # Each DRAM mode and profile gets its own FEL build and output directory, so
 # two builds never share or overwrite the same intermediate or bundle.
 override FEL_TAG_MODE := $(call dram-tag,$(FEL_BT0_DRAM))
@@ -256,24 +262,47 @@ fel-boot:
 	EXPECT_MODE=$(FEL_TAG_MODE) EXPECT_PROFILE=$(PROFILE) scripts/fel-boot.sh "$(FEL_OUT)"
 
 rpms: check-sources
-	FWREPO=$(FWREPO) FEDORA_RELEASE=$(FEDORA_RELEASE) $(if $(AIC8800_SRC),AIC8800_SRC=$(abspath $(AIC8800_SRC))) \
-		$(FEDORA)/fedora/build-rpms.sh $(OUT)/fedora/rpmbuild
-	$(if $(filter none,$(FWREPO)),,$(FEDORA)/fedora/build-aarch64-rpms.sh $(OUT)/fedora/rpmbuild)
+	set -eu; \
+		run=$$(FWREPO="$(FWREPO)" FEDORA_RELEASE="$(FEDORA_RELEASE)" \
+			$(if $(AIC8800_SRC),AIC8800_SRC="$(abspath $(AIC8800_SRC))") \
+			"$(FEDORA)/fedora/build-rpms.sh" "$(OUT)/fedora/rpmbuild"); \
+		test -d "$$run"; \
+		if [ "$(FWREPO)" != none ]; then \
+			FEDORA_RELEASE="$(FEDORA_RELEASE)" "$(FEDORA)/fedora/build-aarch64-rpms.sh" "$$run"; \
+		fi; \
+		tmp=$$(mktemp "$(RPM_RUN_FILE).XXXXXXXX"); \
+		trap 'rm -f -- "$$tmp"' EXIT; \
+		printf '%s\n' "$$run" > "$$tmp"; \
+		mv -fT -- "$$tmp" "$(RPM_RUN_FILE)"
 
 # The Fedora image with this build's firmware at LBA 256 (it boots from the
 # SD card, and the same image on a USB disk is the root for the FEL boot).
 # mkdevcard.sh only writes to fresh paths under fedora/build/ (gitignored
-# there); the image is moved to out/image/ afterwards.
+# there); keep the final basename there so the checksum rows survive the move.
 STAMP := $(shell date +%Y%m%d-%H%M%S)
 IMG_BUILD = $(FEDORA)/build/image-$(STAMP)
+STAGED_IMAGE = $(IMG_BUILD)/package/$(notdir $(IMAGE))
 fedora-image: firmware fel-image rpms
-	mkdir -p $(dir $(IMAGE)) $(FEDORA)/build
+	mkdir -p "$(dir $(IMAGE))" "$(FEDORA)/build" "$(DEVCARD_SCRATCH)"
 	scripts/binfmt-aarch64.sh
-	WORK=$(IMG_BUILD) OUT=$(IMG_BUILD).img FEDORA_RELEASE=$(FEDORA_RELEASE) \
-		FIRMWARE_DTB_VERSION=$(DTB_VERSION) \
-		$(FEDORA)/fedora/mkdevcard.sh $(FW_OUT)/firmware.bin $(OUT)/fedora/rpmbuild/RPMS
-	mv -f $(IMG_BUILD).img $(IMAGE)
-	[ ! -f $(IMG_BUILD).img.xz ] || mv -f $(IMG_BUILD).img.xz $(IMAGE).xz
+	set -eu; \
+		IFS= read -r run < "$(RPM_RUN_FILE)"; \
+		WORK="$(IMG_BUILD)" OUT="$(STAGED_IMAGE)" FEDORA_RELEASE="$(FEDORA_RELEASE)" \
+			FIRMWARE_DTB_VERSION="$(DTB_VERSION)" DRAM_FIRMWARE_IDENTITY="$(DRAM_FIRMWARE_IDENTITY)" \
+			"$(FEDORA)/fedora/mkdevcard.sh" "$(FW_OUT)/firmware.bin" "$$run"; \
+		for suffix in '' .devcard-manifest.json .build-receipt.json .sha256; do \
+			mv -fT -- "$(STAGED_IMAGE)$$suffix" "$(IMAGE)$$suffix"; \
+		done; \
+		if [ -f "$(STAGED_IMAGE).xz" ]; then \
+			mv -fT -- "$(STAGED_IMAGE).xz" "$(IMAGE).xz"; \
+		else \
+			rm -f -- "$(IMAGE).xz"; \
+		fi; \
+		manifest_sha=$$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["manifest_sha256"])' \
+			< "$(IMAGE).build-receipt.json"); \
+		echo "devcard self-check against this build's receipt (not independent verification)"; \
+		TMPDIR="$(DEVCARD_SCRATCH)" "$(FEDORA)/fedora/verify-devcard.sh" \
+			"$(IMAGE)" "$(IMAGE).devcard-manifest.json" --expect-manifest-sha256 "$$manifest_sha"
 	@echo "image: $(IMAGE) (never commit or upload it)"
 
 # UART0 at 115200 8N1 (LABEL=<name> DEV=/dev/ttyUSB0); scripts/serial-log.sh
