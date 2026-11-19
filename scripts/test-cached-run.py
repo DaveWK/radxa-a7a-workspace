@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Cached-set host fixtures. The transport records calls in memory."""
 
-import fcntl
 import hashlib
 import json
 import os
@@ -29,7 +28,7 @@ ORDER = """# Set A — 2400 MHz — cached memtest
 4. Execute entry 2 (0x90044).
 """
 FAKE = r"""#!/usr/bin/python3 -I
-import os, shutil, signal, socket, struct, sys, time
+import fcntl, os, shutil, signal, socket, struct, sys, time
 from pathlib import Path
 
 ports = Path(os.environ["FEL_SYSFS_ROOT"])
@@ -71,7 +70,17 @@ elif cmd == "write":
     if args[0] == os.getenv("CANCEL_AT"):
         with socket.socket(socket.AF_UNIX) as control:
             control.connect("\0" + os.environ["CANCEL_CONTROL"])
-            signal.signal(signal.SIGTERM, lambda *_: control.sendall(b"term\n"))
+            def on_term(*_):
+                lock = Path.home() / ".cache/a7a-fel-locks" / f"{port}.lock"
+                with lock.open("a") as competing:
+                    try:
+                        fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        control.sendall(b"term lock-held\n")
+                    else:
+                        control.sendall(b"term lock-free\n")
+
+            signal.signal(signal.SIGTERM, on_term)
             control.sendall(f"ready {os.getpid()}\n".encode())
             control.recv(1)  # The host must cancel the group rather than release this write.
     shutil.copyfile(args[1], root / args[0])
@@ -790,13 +799,7 @@ class RunnerTests(unittest.TestCase):
                             transfer = int(ready.split()[1])
                             proc.kill()
                             self.assertEqual(proc.wait(timeout=5), -9)
-                            self.assertEqual(frames.readline(64), b"term\n")
-                            lock = self.home / ".cache/a7a-fel-locks" / f"{port}.lock"
-                            with lock.open("a") as competing:
-                                with self.assertRaises(BlockingIOError):
-                                    fcntl.flock(
-                                        competing, fcntl.LOCK_EX | fcntl.LOCK_NB
-                                    )
+                            self.assertEqual(frames.readline(64), b"term lock-held\n")
                             self.assertEqual(frames.readline(64), b"")
                 deadline = time.monotonic() + 5
                 while (receipt := self.receipt(port))["status"] != f"{stage}-refused":
