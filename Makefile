@@ -257,7 +257,7 @@ fel-image:
 
 xfel: $(XFEL)
 ifeq ($(origin XFEL),file)
-$(XFEL): scripts/build-xfel.sh scripts/xfel-port-select.patch
+$(XFEL): scripts/build-xfel.sh scripts/xfel-port-select.patch scripts/xfel-source.json scripts/fel-tools.py
 endif
 $(XFEL):
 	scripts/build-xfel.sh
@@ -299,7 +299,9 @@ fedora-image: firmware fel-image rpms
 serial:
 	scripts/serial-log.sh $(or $(LABEL),run) $(or $(DEV),/dev/ttyUSB0)
 
-test: check-sources
+test: check-sources $(OUT)/tools/xfel
+	python3 -I scripts/test-xfel-binary.py $(OUT)/tools/xfel
+	python3 -I scripts/test-fel-callers.py
 	cd $(BOARD)/dram && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	cd $(BOARD)/common && CARGO_TARGET_DIR=$(TGT)/host $(CARGO) test --offline -q --target x86_64-unknown-linux-gnu
 	python3 -I -m py_compile scripts/mkimage.py scripts/check-nvstore.py scripts/lib/bootlayout.py scripts/lib/mkcard.py scripts/fel-manifest.py scripts/fel-fmmt.py scripts/fel-check.py scripts/fel-tools.py scripts/test-fel-manifest.py

@@ -1,0 +1,7 @@
+{
+  "patched_fel_c_sha256": "6f61bf366f6bc52a78c992c2ccdcab9abd79daa9a2cc502843d1ca7fbfb6d740",
+  "patched_main_c_sha256": "2521200ec95c0f8a3cb6024f248bb16446adec3b6d4ea19e35ef618416750178",
+  "patched_selector_h_sha256": "fc918cb732110a17364f280e23af0d6a080e4657c58749d88ac48758878e9a6e",
+  "selector_patch_sha256": "c1c58ac9655d825a804ef5e0a0eaeedd065698ce396f8d119c517db3ac972134",
+  "source_commit": "445e8aefe6914c85817cc9bd1d201629364b0ec6"
+}

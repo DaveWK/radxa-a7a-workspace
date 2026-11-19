@@ -1,67 +1,188 @@
+diff --git a/linux-fel-port.h b/linux-fel-port.h
+new file mode 100644
+index 0000000..2a4dde8
+--- /dev/null
++++ b/linux-fel-port.h
+@@ -0,0 +1,109 @@
++/* SPDX-License-Identifier: MIT */
++/* Linux only: select in sysfs, then attest and wrap the SAME open usbfs fd.
++ * Never ask libusb to rediscover a device by its recyclable address. */
++#include <fcntl.h>
++#include <glob.h>
++#include <limits.h>
++#include <linux/usbdevice_fs.h>
++#include <stddef.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++struct fel_identity {
++	char path[40];
++	unsigned bus, address;
++};
++
++static int attribute(const char *dir, const char *name, char value[40])
++{
++	char file[PATH_MAX], tail;
++	if(snprintf(file, sizeof(file), "%s/%s", dir, name) >= (int)sizeof(file))
++		return 0;
++	FILE *f = fopen(file, "r");
++	if(!f)
++		return 0;
++	int ok = fscanf(f, "%39s %c", value, &tail) == 1;
++	fclose(f);
++	return ok;
++}
++
++static int number(const char *text, unsigned *out, unsigned max)
++{
++	char *end;
++	unsigned long n = strtoul(text, &end, 10);
++	if(!*text || *end || strspn(text, "0123456789") != strlen(text) || n == 0 || n > max)
++		return 0;
++	*out = n;
++	return 1;
++}
++
++static int discover(const char *port, unsigned expected, struct fel_identity *found)
++{
++	glob_t paths = {0};
++	int matches = 0;
++	if(glob("/sys/bus/usb/devices/[0-9]*-*", GLOB_ERR, NULL, &paths) != 0)
++		goto done;
++	for(size_t i = 0; i < paths.gl_pathc; ++i)
++	{
++		const char *dir = paths.gl_pathv[i], *name = strrchr(dir, '/') + 1;
++		if(strchr(name, ':')) /* USB interface, not a device. */
++			continue;
++		char bus[40], chain[40], address[40], vid[40], pid[40];
++		struct fel_identity id = {0};
++		if(!attribute(dir, "busnum", bus) || !number(bus, &id.bus, 255) ||
++		   !attribute(dir, "devpath", chain) ||
++		   snprintf(id.path, sizeof(id.path), "%u-%s", id.bus, chain) >= (int)sizeof(id.path) ||
++		   strcmp(name, id.path))
++			goto refuse;
++		if(port && strcmp(port, id.path))
++			continue;
++		if(!attribute(dir, "idVendor", vid) || !attribute(dir, "idProduct", pid))
++			goto refuse;
++		if(strcmp(vid, "1f3a") || strcmp(pid, "efe8"))
++		{
++			if(port)
++				goto refuse;
++			continue;
++		}
++		if(!attribute(dir, "devnum", address) || !number(address, &id.address, 127) ||
++		   (expected && expected != id.address))
++			goto refuse;
++		*found = id;
++		++matches;
++	}
++done:
++	globfree(&paths);
++	return matches == 1;
++refuse:
++	globfree(&paths);
++	return 0;
++}
++
++static int verified_fd(const struct fel_identity *id)
++{
++	char node[40], path[40];
++	struct usbdevfs_conninfo_ex info = {0};
++	unsigned char desc[18];
++	snprintf(node, sizeof(node), "/dev/bus/usb/%03u/%03u", id->bus, id->address);
++	int fd = open(node, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
++	if(fd < 0)
++		return -1;
++	if(ioctl(fd, USBDEVFS_CONNINFO_EX(sizeof(info)), &info) < 0 ||
++	   info.busnum != id->bus || info.devnum != id->address ||
++	   !info.num_ports || info.num_ports > sizeof(info.ports) ||
++	   info.size < offsetof(struct usbdevfs_conninfo_ex, ports) + info.num_ports)
++		goto refuse;
++	int used = snprintf(path, sizeof(path), "%u", info.busnum);
++	for(unsigned i = 0; i < info.num_ports; ++i)
++		used += snprintf(path + used, sizeof(path) - used, "%c%u", i ? '.' : '-', (unsigned)info.ports[i]);
++	/* usbfs read at offset 0 returns the cached device descriptor, not a
++	 * control transfer. Supported hosts are little-endian Linux. */
++	if(strcmp(path, id->path) || pread(fd, desc, sizeof(desc), 0) != sizeof(desc) ||
++	   desc[0] != sizeof(desc) || desc[1] != LIBUSB_DT_DEVICE ||
++	   desc[8] != 0x3a || desc[9] != 0x1f || desc[10] != 0xe8 || desc[11] != 0xef)
++		goto refuse;
++	return fd;
++refuse:
++	close(fd);
++	return -1;
++}
 diff --git a/main.c b/main.c
-index b23a8c9..1f79aab 100644
+index b23a8c9..2ec5127 100644
 --- a/main.c
 +++ b/main.c
-@@ -15,0 +16 @@ static void usage(void)
-+	printf("    xfel [--port BUS-PORT[.PORT...]] COMMAND ...\r\n");
-@@ -74,0 +76,10 @@ int main(int argc, char * argv[])
-+	const char * port = NULL;
+@@ -6,0 +7 @@
++#include "linux-fel-port.h"
+@@ -14,0 +16 @@ static void usage(void)
++	printf("    xfel [--port PATH --devnum N] COMMAND ...\r\n");
+@@ -61 +63 @@ int main(int argc, char * argv[])
+-	if(argc < 2)
++	if(argc == 1 || (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))))
+@@ -66 +68,3 @@ int main(int argc, char * argv[])
+-	for(int i = 1; i < argc; i++)
++	const char *port = NULL;
++	unsigned expected = 0;
 +	if(!strcmp(argv[1], "--port"))
-+	{
-+		if(argc < 4 || !argv[2][0])
-+			return 125;
+@@ -68,5 +72,5 @@ int main(int argc, char * argv[])
+-		if(!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
+-		{
+-			usage();
+-			return 0;
+-		}
++		if(argc < 6 || !argv[2][0] || strcmp(argv[3], "--devnum") || !number(argv[4], &expected, 127))
++			return 2;
 +		port = argv[2];
-+		argv += 2;
-+		argc -= 2;
-+	}
-+	libusb_device * selected = NULL;
-@@ -77,3 +88,5 @@ int main(int argc, char * argv[])
++		argc -= 4;
++		argv += 4;
+@@ -74,6 +78,13 @@ int main(int argc, char * argv[])
+-
+-	libusb_device ** list = NULL;
+-	libusb_context * context = NULL;
 -	libusb_init(&context);
 -	int count = libusb_get_device_list(context, &list);
 -	for(int i = 0; i < count; i++)
-+	char selected_path[40];
-+	if(libusb_init(&context) != 0)
-+		return 125;
-+	ssize_t count = libusb_get_device_list(context, &list);
-+	for(ssize_t i = 0; i < count; i++)
-@@ -84 +97 @@ int main(int argc, char * argv[])
++	if(argv[1][0] == '-')
++		return 2;
++	for(int i = 1; i < argc; ++i)
++		if(!strcmp(argv[i], "--port") || !strncmp(argv[i], "--port=", 7) ||
++		   !strcmp(argv[i], "--devnum") || !strncmp(argv[i], "--devnum=", 9))
++			return 2;
++	struct fel_identity id;
++	int fd = -1;
++	libusb_context *context = NULL;
++	const struct libusb_init_option option = {.option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY};
++	if(!discover(port, expected, &id) || (fd = verified_fd(&id)) < 0 ||
++	   libusb_init_context(&context, &option, 1) != 0 ||
++	   libusb_wrap_sys_device(context, fd, &ctx.hdl) != 0)
+@@ -81,10 +92,4 @@ int main(int argc, char * argv[])
+-		libusb_device * device = list[i];
+-		struct libusb_device_descriptor desc;
+-		if(libusb_get_device_descriptor(device, &desc) != 0)
 -			printf("ERROR: Can't get device list\r\n");
-+			goto refused;
-@@ -87,3 +100,14 @@ int main(int argc, char * argv[])
+-		if((desc.idVendor == 0x1f3a) && (desc.idProduct == 0xefe8))
+-		{
 -			if(libusb_open(device, &ctx.hdl) != 0)
 -				printf("ERROR: Can't connect to device\r\n");
 -			break;
-+			uint8_t chain[8];
-+			int n = libusb_get_port_numbers(device, chain, sizeof(chain));
-+			if(n <= 0)
-+				goto refused;
-+			char path[40]; /* 3 bus digits, 8 separators and 8 x 3 port digits */
-+			int used = snprintf(path, sizeof(path), "%u", (unsigned)libusb_get_bus_number(device));
-+			for(int j = 0; j < n; j++)
-+				used += snprintf(path + used, sizeof(path) - used, "%c%u", j ? '.' : '-', (unsigned)chain[j]);
-+			if(port && strcmp(path, port))
-+				continue;
-+			if(selected)
-+				goto refused;
-+			selected = device;
-+			strcpy(selected_path, path);
-@@ -91,0 +116,5 @@ int main(int argc, char * argv[])
-+	if(!selected || libusb_open(selected, &ctx.hdl) != 0)
-+		goto refused;
-+	fprintf(stderr, "xfel: selected bus=%u port=%s devnum=%u\n",
-+		(unsigned)libusb_get_bus_number(selected), selected_path, (unsigned)libusb_get_device_address(selected));
-+	libusb_free_device_list(list, 1);
-@@ -98 +127 @@ int main(int argc, char * argv[])
+-		}
++		fprintf(stderr, "xfel: cannot verify FEL identity before claim\n");
++		if(context) libusb_exit(context);
++		if(fd >= 0) close(fd);
++		return 125;
+@@ -92 +97 @@ int main(int argc, char * argv[])
+-
++	fprintf(stderr, "xfel: selected bus=%u port=%s devnum=%u\n", id.bus, id.path, id.address);
+@@ -98 +103,2 @@ int main(int argc, char * argv[])
 -		libusb_exit(NULL);
 +		libusb_exit(context);
-@@ -460 +489 @@ int main(int argc, char * argv[])
++		close(fd);
+@@ -460 +466,2 @@ int main(int argc, char * argv[])
 -	libusb_exit(NULL);
 +	libusb_exit(context);
-@@ -462,0 +492,7 @@ int main(int argc, char * argv[])
-+
-+refused:
-+	fprintf(stderr, "xfel: cannot uniquely select and open FEL device (port=%s)\n", port ? port : "unspecified");
-+	if(list)
-+		libusb_free_device_list(list, 1);
-+	libusb_exit(context);
-+	return 125;
++	close(fd);

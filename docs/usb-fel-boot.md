@@ -39,6 +39,7 @@ Check with `lsusb -d 1f3a:efe8`.
 
     make fel-image            # in the build container: out/fel/<mode>-<mhz>/
     make xfel                 # once, on the host
+    export FEL_SERIAL_LOG="$HOME/src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
     FEL_PORT=3-3.4 make fel-boot    # 4 GB board; use 3-6 for the 6 GB board
 
 Every runner must set `FEL_PORT` and use `scripts/xfel-port` for each FEL
@@ -47,36 +48,50 @@ command (including mailbox reads and resets). Never use the old bench
 board serial number: do not exchange boards between ports during a run.
 
 ```
-scripts/xfel-port --port 3-3.4 -- write 0x90000 bt0-fel.bin
+port=(scripts/xfel-port --port "${FEL_PORT:?}" --state "${run:?}/fel-state")
+"${port[@]}" -- version
+"${port[@]}" -- write 0x90000 bt0-fel.bin
 ```
 
 For an authorized A733 watchdog reset, keep one state file in the runner's
 private directory. The pinned xfel's A733 `reset` handler is **unsupported**;
 the port-bound equivalent of the bench `felreset.sh` uses its three WDT0
-writes, not `xfel reset`. In the Bash runner:
+writes, not `xfel reset`:
 
 ```
-set -e
-port=(scripts/xfel-port --port "${FEL_PORT:?}" --state "${run:?}/fel-state")
-"${port[@]}" -- write32 0x02050010 0x16aa0001
-"${port[@]}" -- write32 0x02050014 0x16aa0001
-"${port[@]}" -- write32 0x0205000c 0x000014af
-"${port[@]}" --after-reset --timeout 60 -- version
+FEL_STATE_FILE="${run:?}/fel-state" FEL_PORT="${FEL_PORT:?}" scripts/fel-wdt-reset.sh
 ```
 
-`--after-reset` requires a recorded pre-reset device number and waits for a
-different number at that same port. The old enumeration is not reset evidence.
+Every session starts with an A733 `version` probe. An ordinary call requires
+the same port **and** device number. `--expect-reset` on the final watchdog
+write (or an explicitly authorized watchdog-returning Entry 2) records a
+pending reset on success. Only `--after-reset -- version` can finish it, with
+a successful A733 probe at the same port and a **different** device number.
+If that probe fails, retry it with the same state. An unacknowledged reset is
+not authorization to adopt a new identity. Peer changes refuse by default.
 
-The wrapper verifies the tool, reads sysfs, and passes the port to patched
-xfel, which selects the unique matching libusb device before opening it.
-`--timeout` waits only for port admission (default: 0 seconds). A new device
-number at the same port is allowed and logged to stderr. `--state` also
-refuses a change at another FEL port; use `FEL_STATE_FILE` to enable this
-guard during `make fel-boot`. Omit the optional guard for independent runs
-in which peer resets are expected. A move never redirects the command to
-the new port. Keep stderr with the run receipt. Exit 2 denotes bad wrapper
-arguments, 125 an admission refusal; otherwise the child status is returned.
-Test the compiled selector without hardware using a replacement libusb:
+On little-endian Linux with libusb 1.0.27+ and `USBDEVFS_CONNINFO_EX`, xfel
+checks sysfs, opens one usbfs node, checks the topology, address and VID:PID
+on that fd, then wraps the **same fd**, with libusb discovery disabled. No
+fallback to address-only opening. Exit 2 means invalid arguments, 66 means
+target absent from a complete snapshot, 125 means refusal; other statuses
+propagate (child signals use `128 + signal`). `--timeout` is an admission
+timeout, not a transfer timeout. Keep attempt/verified stderr receipts.
+
+`fel-boot.sh` always uses a state file (private to this invocation unless
+`FEL_STATE_FILE` names the session's existing file). For confirmed Entry 2,
+set `FEL_SERIAL_LOG` to the active board's registered regular log under
+`~/src/radxa-a7a/serial-logs/` (`2026-11-18-1725-4g-luckfox.log` for
+`3-3.4`, `2026-11-18-1725-6g-luckfox.log` for `3-6`). The runner records
+the file identity and cursor just before submission. An acknowledged exec
+followed by disappearance or mailbox state 0x21 is not proof: the new serial
+slice must contain the RVBAR handover followed by `main>`. A late serial
+flush can be checked offline with `scripts/fel-handover.py` via `python3 -I`,
+passing the same port/log and `--since` the recorded JSON cursor; do not
+resubmit Entry 2. Never confirm an unacknowledged or identity-refused command.
+
+`make test` includes the compiled selector suite; it requires bubblewrap.
+To run that suite alone without hardware:
 
     python3 -I scripts/test-xfel-binary.py out/tools/xfel
 

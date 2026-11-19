@@ -206,14 +206,14 @@ elif tool == "aarch64-linux-gnu-gcc":
     sys.exit("the fixture must not run the cross compiler")
 elif tool == "xfel":
     if args == ["--help"]:
-        print("xfel [--port BUS-PORT[.PORT...]] COMMAND ...")
+        print("xfel [--port PATH --devnum N] COMMAND ...")
         if "FAKE_XFEL_SWAP" in env:
             Path(env["FAKE_XFEL_SWAP"]).write_text("#!/bin/sh\nexit 97\n")
         if "FAKE_BOOT_SWAP" in env:
             Path(env["FAKE_BOOT_SWAP"]).write_bytes(b"replacement after validation\n")
     else:
-        assert args[:2] == ["--port", env["FEL_PORT"]]
-        args = args[2:]
+        assert args[:4] == ["--port", env["FEL_PORT"], "--devnum", "12"]
+        args = args[4:]
         with open(env["FAKE_USB_LOG"], "a") as log:
             log.write(json.dumps([tool, *args]) + "\n")
         cmd, *params = args
@@ -233,6 +233,13 @@ elif tool == "xfel":
             Path(out).write_bytes(data[:int(size)])
         elif cmd == "exec" and params == ["0x90044"]:
             (mem / "entry2").touch()
+            if "FAKE_NO_HANDOVER" not in env:
+                with open(env["FEL_SERIAL_LOG"], "a") as log:
+                    log.write("[bt0] RVBAR 00000000:40000000, fixture\nmain>\n")
+            if "FAKE_UNACK" in env:
+                sys.exit(31)
+            if "FAKE_CHANGE_DEVNUM" in env:
+                (Path(env["FEL_SYSFS_ROOT"]) / env["FEL_PORT"] / "devnum").write_text("19")
             if "FAKE_UNPLUG_AFTER_ENTRY2" in env:
                 shutil.rmtree(Path(env["FEL_SYSFS_ROOT"]) / env["FEL_PORT"])
 else:
@@ -377,6 +384,10 @@ class GateTests(unittest.TestCase):
             path.write_text(f"#!{sys.executable}\n{FAKE_TOOLS}")
             path.chmod(0o755)
         self.env["EXPECT_XFEL_SHA256"] = sha(self.tools / "xfel")
+        serial = self.root / "src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
+        serial.parent.mkdir(parents=True)
+        serial.write_text("[bt0] RVBAR 00000000:40000000, stale\nmain>\n")
+        self.env["FEL_SERIAL_LOG"] = str(serial)
 
         self.workspace.mkdir()
         shutil.copy2(SOURCE / "Makefile", self.workspace)
@@ -387,9 +398,11 @@ class GateTests(unittest.TestCase):
             "fel-manifest.py",
             "fel-check.py",
             "fel-boot.sh",
+            "fel-handover.py",
             "xfel-port",
             "build-xfel.sh",
             "xfel-port-select.patch",
+            "xfel-source.json",
             "build-edk2.sh",
         ):
             shutil.copy2(SOURCE / "scripts" / name, scripts)
@@ -507,6 +520,8 @@ class GateTests(unittest.TestCase):
         git(repo, "commit", "-qm", "Fixture sources")
 
     def make(self, *args, **env):
+        if "fel-boot" in args:
+            env["HOME"] = str(self.root)
         return subprocess.run(
             ["make", "--no-print-directory", *args],
             cwd=self.workspace,
@@ -528,6 +543,7 @@ class GateTests(unittest.TestCase):
         return self.run_boot("make", *args, auth=auth, **env)
 
     def run_boot(self, entry, *args, auth=None, **env):
+        env["HOME"] = str(self.root)
         if auth:
             env["FEL_MEASUREMENT_AUTH"] = str(auth)
         self.usb_log.write_text("")
@@ -1136,11 +1152,21 @@ class GateTests(unittest.TestCase):
             with self.subTest(expectation=expectation):
                 self.refusal(self.boots(EXPECT_XFEL_SHA256=expectation))
 
-    def test_mailbox_port_refusal_is_not_handover_evidence(self):
+    def test_handover_requires_ack_identity_and_fresh_board_serial(self):
         bundle = self.build()
-        proc = self.run_boot("script", bundle, FAKE_UNPLUG_AFTER_ENTRY2="1")
-        self.assertEqual(proc.returncode, 125, self.process_result(proc))
-        self.assertNotIn("bt0 is past the checks", proc.stdout)
+        port = Path(self.env["FEL_SYSFS_ROOT"]) / self.env["FEL_PORT"]
+        for knobs, rc in [
+            (dict(FAKE_UNACK="1"), 31),
+            (dict(FAKE_CHANGE_DEVNUM="1"), 125),
+            (dict(FAKE_NO_HANDOVER="1"), 1),
+            (dict(FEL_SERIAL_LOG=self.env["FEL_SERIAL_LOG"].replace("4g-", "6g-")), 1),
+            (dict(FAKE_UNPLUG_AFTER_ENTRY2="1"), 0),
+        ]:
+            with self.subTest(knobs=knobs):
+                (port / "devnum").write_text("12")
+                proc = self.run_boot("script", bundle, **knobs)
+                self.assertEqual(proc.returncode, rc, self.process_result(proc))
+                self.assertEqual("confirmed by fresh serial" in proc.stdout, rc == 0)
 
     def test_xfel_runs_only_staged_copy(self):
         bundle = self.build()
@@ -1157,6 +1183,20 @@ class GateTests(unittest.TestCase):
         commit = "445e8aefe6914c85817cc9bd1d201629364b0ec6"
         patched = self.tools / "fel.c"
         patched.write_text("// patched fixture source\n")
+        for name in ["main.c", "linux-fel-port.h"]:
+            shutil.copy2(patched, self.tools / name)
+        pins_path = self.workspace / "scripts/xfel-source.json"
+        pins = read_json(pins_path)
+        for name in (
+            "patched_main_c_sha256",
+            "patched_fel_c_sha256",
+            "patched_selector_h_sha256",
+        ):
+            pins[name] = sha(patched)
+        write_json(pins_path, pins)
+        git(self.workspace, "commit", "-qam", "pin fixture xfel sources")
+        # Use a record for the fixture workspace's new HEAD.
+        bundle = self.build()
         subprocess.run(
             [
                 sys.executable,
@@ -1174,9 +1214,26 @@ class GateTests(unittest.TestCase):
                 "binary_sha256": sha(default),
                 "source_commit": commit,
                 "patched_fel_c_sha256": sha(patched),
+                "patched_main_c_sha256": sha(patched),
+                "patched_selector_h_sha256": sha(patched),
+                "selector_patch_sha256": sha(
+                    self.workspace / "scripts/xfel-port-select.patch"
+                ),
+                "compiler": subprocess.check_output(
+                    ["gcc", "--version"], text=True
+                ).splitlines()[0],
+                "libusb_version": subprocess.check_output(
+                    ["pkg-config", "--modversion", "libusb-1.0"], text=True
+                ).strip(),
             },
         )
         self.assert_bundle_writes(self.make("fel-boot"), bundle)
+        receipt_path = default.with_suffix(".record.json")
+        receipt = read_json(receipt_path)
+        write_json(receipt_path, dict(receipt, patched_main_c_sha256="wrong"))
+        self.usb_log.write_text("")
+        self.refusal(self.make("fel-boot"), "source/selector seal mismatch")
+        write_json(receipt_path, receipt)
         with default.open("a") as f:
             f.write("\n# other binary\n")
         self.usb_log.write_text("")

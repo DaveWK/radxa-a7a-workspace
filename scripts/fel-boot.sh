@@ -25,7 +25,8 @@
 #
 # Environment:
 #   FEL_PORT   required physical sysfs port, never a transient USB address.
-#   FEL_STATE_FILE   optional per-run peer snapshot, passed to every invocation.
+#   FEL_STATE_FILE   optional existing session; otherwise use a private session.
+#   FEL_SERIAL_LOG   registered board log, required to confirm handover.
 #   XFEL   optional xfel override; requires EXPECT_XFEL_SHA256. The default
 #          uses out/tools/xfel and its build receipt. Upstream waits 10 s for a FEL
 #          call to return; entry 1 takes ~7 s, so use a build with a 60 s USB
@@ -71,9 +72,6 @@ step() { printf '\n==> %s\n' "$*"; }
 # Keep stdin closed so xfel/sudo never reads the plan file.
 : "${FEL_PORT:?fel-boot requires FEL_PORT (for example 3-3.4)}"
 selector=("$SCRIPTS/xfel-port" --port "$FEL_PORT")
-if [[ -n ${FEL_STATE_FILE:-} ]]; then
-    selector+=(--state "$FEL_STATE_FILE")
-fi
 x() { "${selector[@]}" -- "$@" </dev/null; }
 
 [ $# -eq 1 ] || die "usage: $0 <image dir with bt0-fel.bin, firmware.bin, firmware.seek, build-manifest.json>"
@@ -88,6 +86,7 @@ xfel_source=$(command -v -- "$XFEL") || die "xfel not found (XFEL=$XFEL)"
 # before any USB access. Nothing reads the original bundle after this.
 STAGE=$(mktemp -d "$(dirname "$IMAGE")/.fel-stage.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
+selector+=(--state "${FEL_STATE_FILE:-$STAGE/session.json}")
 python3 -I "$SCRIPTS/fel-tools.py" stage-xfel "${xfel_flags[@]}" "$xfel_source" "$STAGE/xfel"
 export XFEL=$STAGE/xfel
 EXPECT_XFEL_SHA256=$(sha256sum <"$XFEL" | cut -d' ' -f1)
@@ -118,13 +117,12 @@ put() {
 }
 
 # mailbox [seconds]: prints "magic state dram_mb dram_mhz rom_sctlr
-# rom_cpsr rom_vbar", or "none" if FEL does not answer within the time.
+# rom_cpsr rom_vbar". On failure propagate the original exit status.
 mailbox() {
     if timeout "${1:-30}" "${selector[@]}" -- read "$MAILBOX" 28 "$WORK/mailbox" </dev/null >/dev/null; then
         od -An -v -tx4 -w28 "$WORK/mailbox" | tr -s ' ' | sed 's/^ //'
     else
-        [[ $? != 125 ]] || return 125
-        echo none
+        return "$?"
     fi
 }
 
@@ -151,7 +149,6 @@ x exec "$ENTRY1" || die "xfel exec $ENTRY1 failed (see the serial console)"
 # Each read waits while entry 1 runs; poll until it reports DRAM up.
 while :; do
     mb=$(mailbox 60)
-    [ "$mb" != none ] || die "FEL stopped answering during entry 1 (see the serial console)"
     read -r magic state dram_mb dram_mhz sctlr cpsr vbar <<<"$mb"
     [ "$state" = 00000011 ] && break
     [ "$state" = 00000000 ] || [ "$state" = 00000010 ] ||
@@ -170,32 +167,45 @@ while read -r _ addr _ file name; do
 done <"$WORK/plan"
 
 step "Entry 2 ($ENTRY2): check the images, warm reset into oreboot main"
+cursor=""
+if [[ -n ${FEL_SERIAL_LOG:-} ]]; then
+    cursor=$(python3 -I "$SCRIPTS/fel-handover.py" "$FEL_PORT" "$FEL_SERIAL_LOG") || die "invalid handover serial source"
+    printf 'Entry 2 serial cursor: %s\n' "$cursor" >&2
+fi
 rc=0
 timeout 15 "${selector[@]}" -- exec "$ENTRY2" </dev/null || rc=$?
-[[ $rc != 125 ]] || die "port selection refused before entry 2"
-state=none
-if [ "$rc" -eq 0 ]; then
-    # exec answered; whether entry 2 has started yet is the mailbox's to say.
-    for _ in $(seq 20); do
-        mb=$(mailbox 5)
-        [ "$mb" != none ] || {
-            state=none
-            break
-        }
-        read -r _ state _ <<<"$mb"
-        [ "$state" = 00000011 ] || break
-        sleep 0.5
-    done
+if ((rc != 0)); then
+    printf 'Entry 2 not acknowledged (exit %d); handover unconfirmed\n' "$rc" >&2
+    exit "$rc"
 fi
+for _ in $(seq 20); do
+    rc=0
+    mb=$(mailbox 5) || rc=$?
+    case $rc in
+    0)
+        read -r magic state _ <<<"$mb"
+        [[ $magic == 46413741 ]] || die "invalid mailbox magic"
+        ;;
+    66)
+        state=absent
+        break
+        ;;
+    *)
+        printf 'Entry 2 acknowledged; mailbox failed (exit %d); handover unconfirmed\n' "$rc" >&2
+        exit "$rc"
+        ;;
+    esac
+    [[ $state == 00000011 ]] || break
+    sleep 0.5
+done
 case $state in
 000000e0) die "bt0 refused the hand-over (state 0xe0: entry 1 has not run in this FEL session); still in FEL" ;;
 000000e1) die "bt0 refused the hand-over (state 0xe1: layout table or boot layout invalid); still in FEL" ;;
 000000e2) die "bt0 refused the hand-over (state 0xe2: an image does not match its CRC); still in FEL" ;;
 00000011) die "entry 2 did not start within 10 s (mailbox still 0x11); see the serial console" ;;
-none) printf '  FEL no longer answers: bt0 is past the checks (xfel exit %d)\n' "$rc" ;;
-*) printf '  mailbox state 0x%s (0x21: handing over)\n' "$state" ;;
+absent | 00000021) printf '  Entry 2 acknowledged, mailbox: %s\n' "$state" ;;
+*) die "unexpected mailbox state 0x$state; handover unconfirmed" ;;
 esac
-printf '\nWatch the serial console: "[bt0] RVBAR ...", then "main>" and oreboot main,\n'
-printf 'EDK2, then GRUB/Linux from the USB disk in the blue port. If instead bt0\n'
-printf 'prints "no warm reset 1 s after the request", the watchdog resets the\n'
-printf 'board back into FEL about 16 s later.\n'
+[[ -n $cursor ]] || die "handover unconfirmed pending fresh board-specific serial evidence"
+python3 -I "$SCRIPTS/fel-handover.py" "$FEL_PORT" "$FEL_SERIAL_LOG" --since "$cursor"
+printf 'Handover to oreboot main confirmed by fresh serial on FEL port %s\n' "$FEL_PORT"

@@ -24,14 +24,18 @@ fi
     echo "build-xfel: $SRC is not xfel $XFEL_TAG ($XFEL_COMMIT)" >&2
     exit 1
 }
-git -C "$SRC" restore --source="$XFEL_COMMIT" -- main.c fel.c
+# Never build in the cache: xfel's Makefile includes untracked *.c files.
+BUILD=$(mktemp -d "$TOP/out/tools/.xfel-build.XXXXXXXX")
+trap 'rm -rf -- "$BUILD"' EXIT
+git clone -q --no-local --no-checkout "$SRC" "$BUILD"
+SRC=$BUILD
+git -C "$SRC" checkout -q --detach "$XFEL_COMMIT"
 git -C "$SRC" apply --unidiff-zero "$TOP/scripts/xfel-port-select.patch"
 grep -c '&bytes, 10000);' "$SRC/fel.c" | grep -qx 2 || {
     echo "build-xfel: fel.c does not have the two 10 s bulk transfers this script patches" >&2
     exit 1
 }
 sed -i 's/&bytes, 10000);/\&bytes, 60000);/' "$SRC/fel.c"
-make -C "$SRC" -s clean >/dev/null 2>&1 || true
-make -C "$SRC" -s
+make -C "$SRC" -s "CFLAGS=-g -Wall -O3 -ffile-prefix-map=$SRC=/xfel"
 python3 -I "$TOP/scripts/fel-tools.py" record-xfel "$SRC" "$XFEL_COMMIT"
 echo "build-xfel: $TOP/out/tools/xfel (xfel $XFEL_TAG, port selector, 60 s USB timeout)"

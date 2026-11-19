@@ -110,6 +110,7 @@ instructions are in [docs/usb-fel-boot.md](docs/usb-fel-boot.md):
 
     dd if=out/image/a7a-fedora45.img of=/dev/sdX bs=4M conv=fsync   # USB disk, blue port
     make xfel                       # once
+    export FEL_SERIAL_LOG="$HOME/src/radxa-a7a/serial-logs/2026-11-18-1725-4g-luckfox.log"
     FEL_PORT=3-3.4 make fel-boot    # 4 GB board; the 6 GB board uses 3-6
 
 `make fel-boot` boots the blob-free image (`out/fel/blobfree-1200/`). A

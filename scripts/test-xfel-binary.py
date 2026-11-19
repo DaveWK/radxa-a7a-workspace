@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Check actual patched xfel discovery against a replacement USB library."""
+"""Run the built selector with mock libusb and *only* synthetic sysfs/usbfs."""
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 
 
 def main(binary):
-    scratch = Path(__file__).resolve().parent.parent / "out"
-    scratch.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=scratch) as tmp:
-        lib = Path(tmp) / "libusb-1.0.so.0"
-        cflags = subprocess.check_output(
-            ["pkg-config", "--cflags", "libusb-1.0"], text=True
-        ).split()
+    scripts = Path(__file__).resolve().parent
+    (scripts.parent / "out").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scripts.parent / "out") as tmp:
+        root = Path(tmp)
+        lib = root / "libusb-1.0.so.0"
         subprocess.run(
             [
                 "cc",
@@ -25,57 +24,121 @@ def main(binary):
                 "-Wall",
                 "-Wextra",
                 "-Werror",
-                *cflags,
-                Path(__file__).parent / "tests/xfel-usb-shim.c",
+                *subprocess.check_output(
+                    ["pkg-config", "--cflags", "libusb-1.0"], text=True
+                ).split(),
+                scripts / "tests/xfel-usb-shim.c",
                 "-o",
                 lib,
             ],
             check=True,
         )
-        env = os.environ | dict(LD_LIBRARY_PATH=tmp)
-        links = subprocess.check_output(["ldd", binary], text=True, env=env)
-        if f"libusb-1.0.so.0 => {lib} (" not in links:
-            sys.exit("refusing: binary is not linked to the mock")
-        result = subprocess.check_output([binary, "--help"], env=env)
-        assert b"--port BUS-PORT" in result
-        print("PASS help")
-        for fixture, port, expected in (
-            ("empty", None, []),
-            ("two", None, []),
-            ("one", None, ["14"]),
-            ("two", "3-3.4", ["14"]),
-            ("two", "3-6", ["12"]),
-            ("two", "3-3", []),
-            ("two", "4-6", []),
-            ("wrong", "3-6", []),
-            ("duplicate", "3-3.4", []),
-            ("unreadable", "3-3.4", []),
-        ):
-            cmd = [binary, *(["--port", port] if port else []), "version"]
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, env=env | dict(USB_CASE=fixture)
+        shutil.copy2(binary, root / "xfel")
+        nodes = root / "usb/003"
+        nodes.mkdir(parents=True)
+        devices = root / "devices"
+        devices.mkdir()
+
+        def add(name, number, vid="1f3a", chain=None, fd_pid=0xEFE8):
+            path = devices / name
+            path.mkdir()
+            fields = dict(
+                idVendor=vid,
+                idProduct="efe8",
+                busnum="3",
+                devnum=str(number),
+                devpath=chain or name[2:],
             )
-            assert proc.returncode == 125, (cmd, proc.stderr)
-            opens = [
-                line.removeprefix("mock open ")
-                for line in proc.stderr.splitlines()
-                if line.startswith("mock open ")
-            ]
-            assert opens == expected, (fixture, cmd, opens)
-            print(f"PASS {fixture=} {port=} {opens=}")
-        # Mock open succeeds, then claim fails; no bulk API exists in the shim.
-        proc = subprocess.run(
-            [binary, "--port", "3-6", "version"],
-            capture_output=True,
-            text=True,
-            env=env | dict(USB_CASE="receipt"),
-        )
-        assert proc.returncode == 255
-        assert proc.stderr.splitlines() == [
-            "mock open 12",
-            "xfel: selected bus=3 port=3-6 devnum=12",
+            for key, val in fields.items():
+                (path / key).write_text(val + "\n")
+            desc = bytearray(18)
+            desc[:2] = b"\x12\x01"
+            desc[8:12] = b"\x3a\x1f" + fd_pid.to_bytes(2, "little")
+            (nodes / f"{number:03}").write_bytes(desc)
+
+        # No host /sys or /dev/bus anywhere inside the process mount namespace.
+        jail = [
+            "bwrap",
+            "--unshare-all",
+            "--die-with-parent",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--ro-bind",
+            devices,
+            "/sys/bus/usb/devices",
+            "--bind",
+            nodes.parent,
+            "/dev/bus/usb",
+            "--ro-bind",
+            root,
+            "/fixture",
+            "--setenv",
+            "LD_LIBRARY_PATH",
+            "/fixture",
         ]
-        print("PASS selected-device receipt")
+        links = subprocess.check_output(
+            [*jail, "/lib64/ld-linux-x86-64.so.2", "--list", "/fixture/xfel"], text=True
+        )
+        assert "libusb-1.0.so.0 => /fixture/libusb-1.0.so.0" in links
+        selected = ["--port", "3-6", "--devnum", "12", "version"]
+
+        def run(name, args, rc, opened=None, claim=False):
+            proc = subprocess.run(
+                [*jail, "/fixture/xfel", *args],
+                capture_output=True,
+                text=True,
+                env=os.environ | dict(USB_CASE=name),
+            )
+            assert proc.returncode == rc, (
+                name,
+                proc.returncode,
+                proc.stdout,
+                proc.stderr,
+            )
+            lines = proc.stderr.splitlines()
+            assert [s for s in lines if s.startswith("mock fd ")] == (
+                [] if opened is None else [f"mock fd {opened}"]
+            ), (name, lines)
+            assert ("mock wrap" in lines) == claim and ("mock claim" in lines) == claim
+            if claim:
+                assert (
+                    "ID=0x00190300" in proc.stdout and f"devnum={opened}" in proc.stderr
+                )
+            print(f"PASS {name} exit={rc} fd={opened} claim={claim}")
+
+        run("help", ["--help"], 0)
+        run("empty", ["version"], 125)
+        add("3-3.4", 14)
+        run("sole", ["version"], 0, 14, True)
+        run("misplaced", ["version", "--port", "3-6"], 2)
+        add("3-6", 12)
+        run("ambiguous", ["version"], 125)
+        run("duplicate-option", [*selected, "--port", "3-6"], 2)
+        run("missing-devnum", ["--port", "3-6", "version"], 2)
+        run("selected-6", selected, 0, 12, True)
+        run("selected-4", ["--port", "3-3.4", "--devnum", "14", "version"], 0, 14, True)
+        run("wrong-chain", ["--port", "3-3", "--devnum", "14", "version"], 125)
+        for name in ("fd-port", "fd-bus", "fd-address", "no-conninfo"):
+            run(name, selected, 125, 12)
+        (devices / "3-6/devnum").write_text("19")
+        run("changed-before-open", selected, 125)
+        (devices / "3-6/devnum").write_text("12")
+        (devices / "3-6/idVendor").write_text("ffff")
+        run("wrong-vid", selected, 125)
+        (devices / "3-6/idVendor").write_text("1f3a")
+        add("3-7", 19, "ffff", chain="6")
+        run("inconsistent-other-descriptor", selected, 125)
+        shutil.rmtree(devices / "3-7")
+        (nodes / "012").write_bytes(bytes(18))
+        run("wrong-fd-descriptor", selected, 125, 12)
 
 
 if __name__ == "__main__":

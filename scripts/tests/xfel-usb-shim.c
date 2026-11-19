@@ -1,67 +1,108 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Replacement libusb, not an interposer. No USB implementation is linked. */
+/* Replacement library inside the fixture mount namespace. No USB backend. */
+#include <assert.h>
 #include <libusb.h>
+#include <linux/usbdevice_fs.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
-struct libusb_device { unsigned number; };
-static struct libusb_device first = {14}, second = {12};
-static libusb_device *devices[] = {&first, &second, NULL};
+static int verified_fd = -1;
 static int fixture(const char *name) { return !strcmp(getenv("USB_CASE"), name); }
 
-int libusb_init(libusb_context **ctx) { *ctx = NULL; return 0; }
-void libusb_exit(libusb_context *ctx) { (void)ctx; }
-ssize_t libusb_get_device_list(libusb_context *ctx, libusb_device ***list)
+int ioctl(int fd, unsigned long cmd, ...)
 {
-	(void)ctx;
-	*list = devices;
-	return fixture("empty") ? 0 : fixture("one") ? 1 : 2;
+	char link[64], path[128];
+	unsigned number;
+	assert(cmd == USBDEVFS_CONNINFO_EX(sizeof(struct usbdevfs_conninfo_ex)));
+	snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+	ssize_t n = readlink(link, path, sizeof(path) - 1);
+	assert(n > 0);
+	path[n] = 0;
+	assert(sscanf(path, "/dev/bus/usb/003/%u", &number) == 1);
+	fprintf(stderr, "mock fd %u\n", number);
+	va_list ap;
+	va_start(ap, cmd);
+	struct usbdevfs_conninfo_ex *info = va_arg(ap, struct usbdevfs_conninfo_ex *);
+	va_end(ap);
+	info->size = sizeof(*info);
+	info->busnum = fixture("fd-bus") ? 4 : 3;
+	info->devnum = fixture("fd-address") ? 19 : number;
+	info->num_ports = number == 14 ? 2 : 1;
+	info->ports[0] = number == 14 ? 3 : fixture("fd-port") ? 7 : 6;
+	info->ports[1] = 4;
+	verified_fd = fd;
+	return fixture("no-conninfo") ? -1 : 0;
 }
-void libusb_free_device_list(libusb_device **list, int unref)
+
+int libusb_init_context(libusb_context **ctx, const struct libusb_init_option opt[], int n)
 {
-	(void)list;
-	(void)unref;
-}
-int libusb_get_device_descriptor(libusb_device *d, struct libusb_device_descriptor *desc)
-{
-	if (fixture("unreadable") && d == &second)
-		return LIBUSB_ERROR_IO;
-	desc->idVendor = fixture("wrong") && d == &second ? 0 : 0x1f3a;
-	desc->idProduct = 0xefe8;
+	assert(n == 1 && opt[0].option == LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+	*ctx = (libusb_context *)(intptr_t)1;
 	return 0;
 }
-uint8_t libusb_get_bus_number(libusb_device *d) { (void)d; return 3; }
-uint8_t libusb_get_device_address(libusb_device *d) { return d->number; }
-int libusb_get_port_numbers(libusb_device *d, uint8_t *ports, int length)
+int libusb_wrap_sys_device(libusb_context *ctx, intptr_t fd, libusb_device_handle **h)
 {
-	if (length < 2)
-		return LIBUSB_ERROR_OVERFLOW;
-	if (d == &first || fixture("duplicate")) {
-		ports[0] = 3;
-		ports[1] = 4;
-		return 2;
-	}
-	ports[0] = 6;
-	return 1;
+	assert(ctx && fd == verified_fd && fd >= 0);
+	*h = (libusb_device_handle *)(intptr_t)(fd + 1);
+	fprintf(stderr, "mock wrap\n");
+	return 0;
 }
-int libusb_open(libusb_device *d, libusb_device_handle **handle)
+static void check_handle(libusb_device_handle *h)
 {
-	fprintf(stderr, "mock open %u\n", d->number);
-	if (fixture("receipt")) {
-		*handle = (libusb_device_handle *)d;
-		return 0;
-	}
-	return LIBUSB_ERROR_ACCESS;
+	assert(verified_fd >= 0 && h == (libusb_device_handle *)(intptr_t)(verified_fd + 1));
 }
 int libusb_kernel_driver_active(libusb_device_handle *h, int i)
 {
-	(void)h; (void)i;
+	check_handle(h);
+	assert(i == 0);
 	return 0;
 }
 int libusb_claim_interface(libusb_device_handle *h, int i)
 {
-	(void)h; (void)i;
-	return LIBUSB_ERROR_ACCESS;
+	check_handle(h);
+	assert(i == 0);
+	fprintf(stderr, "mock claim\n");
+	return 0;
 }
-void libusb_close(libusb_device_handle *h) { (void)h; }
+libusb_device *libusb_get_device(libusb_device_handle *h)
+{
+	check_handle(h);
+	return (libusb_device *)h;
+}
+int libusb_get_active_config_descriptor(libusb_device *dev, struct libusb_config_descriptor **out)
+{
+	static const struct libusb_endpoint_descriptor eps[] = {
+		{.bmAttributes = 2, .bEndpointAddress = 0x81},
+		{.bmAttributes = 2, .bEndpointAddress = 2}
+	};
+	static const struct libusb_interface_descriptor settings = {.bNumEndpoints = 2, .endpoint = eps};
+	static const struct libusb_interface iface = {.altsetting = &settings, .num_altsetting = 1};
+	static struct libusb_config_descriptor config = {.bNumInterfaces = 1, .interface = &iface};
+	assert(dev);
+	*out = &config;
+	return 0;
+}
+void libusb_free_config_descriptor(struct libusb_config_descriptor *c) { (void)c; }
+void libusb_close(libusb_device_handle *h) { check_handle(h); }
+void libusb_exit(libusb_context *c) { (void)c; }
+int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned char *buf,
+			 int len, int *actual, unsigned timeout)
+{
+	check_handle(h);
+	assert(timeout == 60000);
+	if(ep == 0x81) {
+		memset(buf, 0, len);
+		if(len == 13) memcpy(buf, "AWUS", 4);
+		else if(len == 32) {
+			memcpy(buf, "AWUSBFEX", 8);
+			buf[9] = 3; buf[10] = 0x19;
+		} else assert(len == 8);
+	} else assert(ep == 2);
+	*actual = len;
+	return 0;
+}

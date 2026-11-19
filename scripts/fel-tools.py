@@ -36,13 +36,25 @@ def copy_tool(source, dest):
     return h.hexdigest()
 
 
+def verify_xfel_sources(record):
+    pins = json.loads(Path(__file__).with_name("xfel-source.json").read_bytes())
+    if any(record[k] != v for k, v in pins.items()) or pins[
+        "selector_patch_sha256"
+    ] != digest(Path(__file__).with_name("xfel-port-select.patch")):
+        raise ValueError(
+            "xfel source/selector seal mismatch; rebuild from verified inputs"
+        )
+
+
 def stage_xfel(args):
     if args.override:
         want = os.environ.get("EXPECT_XFEL_SHA256")
         if not want:
             raise ValueError("overridden XFEL requires EXPECT_XFEL_SHA256")
     else:
-        want = json.loads(XFEL_RECORD.read_bytes())["binary_sha256"]
+        record = json.loads(XFEL_RECORD.read_bytes())
+        verify_xfel_sources(record)
+        want = record["binary_sha256"]
     actual = copy_tool(args.source, args.dest)
     if actual != want:
         raise ValueError(f"xfel sha256 mismatch: {actual}")
@@ -140,6 +152,16 @@ def main():
     if args.cmd == "stage-xfel":
         stage_xfel(args)
     elif args.cmd == "record-xfel":
+        sources = dict(
+            source_commit=args.commit,
+            patched_fel_c_sha256=digest(args.source / "fel.c"),
+            patched_main_c_sha256=digest(args.source / "main.c"),
+            patched_selector_h_sha256=digest(args.source / "linux-fel-port.h"),
+            selector_patch_sha256=digest(
+                Path(__file__).with_name("xfel-port-select.patch")
+            ),
+        )
+        verify_xfel_sources(sources)
         with tempfile.TemporaryDirectory(dir=XFEL.parent) as temp:
             fresh = Path(temp) / "xfel"
             binary_digest = copy_tool(args.source / "xfel", fresh)
@@ -148,8 +170,13 @@ def main():
         write_receipt(
             XFEL_RECORD,
             dict(
-                source_commit=args.commit,
-                patched_fel_c_sha256=digest(args.source / "fel.c"),
+                **sources,
+                compiler=subprocess.check_output(
+                    ["gcc", "--version"], text=True
+                ).splitlines()[0],
+                libusb_version=subprocess.check_output(
+                    ["pkg-config", "--modversion", "libusb-1.0"], text=True
+                ).strip(),
                 binary_sha256=binary_digest,
             ),
         )
