@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Host verification for the Radxa Cubie A7A oreboot bt0/main matrix.
 
 This is the maintained board-integration matrix for this workspace. It builds
@@ -44,6 +45,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -545,6 +547,7 @@ class Harness:
         ):
             if not path.is_file():
                 errors.append(f"{label} not found: {path}")
+        errors.extend(self.check_tooling())
         return errors
 
     def _check_source(self, errors: list[str]) -> None:
@@ -654,6 +657,46 @@ class Harness:
                 errors.append(f"baseline SHA256SUMS names a missing file: {name}")
             elif sha256_file(path) != want:
                 errors.append(f"baseline file does not match SHA256SUMS: {name}")
+        return errors
+
+    def check_tooling(self) -> list[str]:
+        """Fail clearly when the pinned toolchain or a target is missing."""
+        errors: list[str] = []
+        for tool in ("cargo", "rustc", "llvm-readelf", "llvm-objcopy"):
+            if shutil.which(tool) is None:
+                errors.append(f"required tool not found: {tool}")
+        toolchain = self.args.source / "rust-toolchain.toml"
+        if not toolchain.is_file():
+            return errors
+        try:
+            data = tomllib.loads(toolchain.read_text(encoding="utf-8"))
+        except (tomllib.TOMLDecodeError, OSError) as exc:
+            return errors + [f"could not read rust-toolchain.toml: {exc}"]
+        spec = data.get("toolchain", {})
+        channel = spec.get("channel")
+        if not channel:
+            return errors + ["rust-toolchain.toml has no channel"]
+        probe = self.runner.run(
+            ["rustup", "run", channel, "rustc", "-vV"], self.args.source, self.env
+        )
+        if probe.returncode != 0:
+            errors.append(f"pinned toolchain {channel} is not installed")
+            return errors
+        targets = spec.get("targets") or []
+        if not targets:
+            return errors
+        installed = self.runner.run(
+            ["rustup", "target", "list", "--installed", "--toolchain", channel],
+            self.args.source,
+            self.env,
+        )
+        if installed.returncode != 0:
+            errors.append(f"could not list the targets of toolchain {channel}")
+            return errors
+        have = set(installed.output.split())
+        for target in targets:
+            if target not in have:
+                errors.append(f"target {target} is not installed for {channel}")
         return errors
 
     # -- matrix ------------------------------------------------------------
@@ -1009,14 +1052,33 @@ class Harness:
     def _count_warnings(self, log: Path) -> int:
         if not log.is_file():
             return 0
-        lines = [
-            line
-            for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
-            if line.startswith("warning")
-        ]
-        for line in lines:
-            self.warnings[line] = self.warnings.get(line, 0) + 1
-        return len(lines)
+        entries: list[tuple[str, str | None]] = []
+        message: str | None = None
+        location: str | None = None
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = WARNING_RE.match(line)
+            if match:
+                if message is not None:
+                    entries.append((message, location))
+                text = match.group(1).strip()
+                if WARNING_SUMMARY_RE.match(text) or re.match(
+                    r"^generated\s+\d+\s+warnings?$", text
+                ):
+                    message = None
+                    location = None
+                    continue
+                message = text
+                location = None
+                continue
+            found = WARNING_LOCATION_RE.match(line)
+            if found and message is not None:
+                location = f"{found.group(1)}:{found.group(2)}:{found.group(3)}"
+        if message is not None:
+            entries.append((message, location))
+        for text, where in entries:
+            key = text if where is None else f"{text} --> {where}"
+            self.warnings[key] = self.warnings.get(key, 0) + 1
+        return len(entries)
 
     # -- negative contract -------------------------------------------------
 
@@ -1346,6 +1408,12 @@ def _digest_arg(value: str) -> tuple[str, str]:
     return name, sha.lower()
 
 
+def _sha256_arg(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        raise argparse.ArgumentTypeError(f"expected a 64-digit SHA256: {value!r}")
+    return value.lower()
+
+
 def parse_args(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
         description="A7A bt0/main host verification matrix, suites, gate and digests."
@@ -1358,10 +1426,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     parser.add_argument("--base", required=True, help="gate base revision")
     parser.add_argument(
-        "--head", default="HEAD", help="gate head revision (default HEAD)"
+        "--baseline", required=True, help="retained matrix baseline directory"
     )
     parser.add_argument(
-        "--baseline", required=True, help="retained matrix baseline directory"
+        "--baseline-sums-sha256",
+        required=True,
+        type=_sha256_arg,
+        help="SHA256 of the retained baseline SHA256SUMS manifest",
     )
     parser.add_argument("--dram-lib", required=True, help="libdram-a733.a build input")
     parser.add_argument(
@@ -1370,7 +1441,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument(
         "--gate", required=True, help="external publication gate script"
     )
-    parser.add_argument("--out", required=True, help="job output directory")
+    parser.add_argument("--out", required=True, help="fresh job output directory")
     parser.add_argument(
         "--expect-digest",
         action="append",

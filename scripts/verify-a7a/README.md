@@ -74,9 +74,13 @@ Exit status is `0` only when every stage passes; `1` for a verification failure;
 `target/`, `tests/` and `gate.log`. Cargo targets and `TMPDIR` stay under this
 directory; the source checkout is never written to.
 
+The job output is private: it contains vendor-library variants and PHY
+extraction, so it is never published or committed. Keep it under the job
+directory (or another private scratch area), not in Git.
+
 ## Regression tests
 
-    python3 -I scripts/verify-a7a/tests/test_verify.py
+    python3 -I -B scripts/verify-a7a/tests/test_verify.py
 
 The suite is quick and needs no cargo: it drives the fail-closed orchestration
 with controlled stage results and real path checks (matrix failure, failing,

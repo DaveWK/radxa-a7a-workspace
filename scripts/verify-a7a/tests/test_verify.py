@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Quick regression suite for the A7A verification harness.
 
 The tests exercise the fail-closed orchestration with controlled stage results
 and real path checks; they do not run cargo or the external gate. Run with:
 
-    python3 -I scripts/verify-a7a/tests/test_verify.py
+    python3 -I -B scripts/verify-a7a/tests/test_verify.py
 """
 
 from __future__ import annotations
@@ -15,15 +16,16 @@ import importlib.util
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import verify  # noqa: E402
+VERIFY_PATH = Path(__file__).resolve().parents[1] / "verify.py"
+_spec = importlib.util.spec_from_file_location("verify_a7a_under_test", VERIFY_PATH)
+assert _spec is not None and _spec.loader is not None
+verify = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(verify)
 
 ZERO = "0" * 64
 IDENT = ("DaveWK", "13626476+DaveWK@users.noreply.github.com")
@@ -333,6 +335,60 @@ class HarnessRegressionTest(unittest.TestCase):
             ],
         )
         self.assertNotEqual(FakeHarness(self.args(), digests=bad).run(), 0)
+
+    def test_baseline_sums_hash_mismatch_returns_nonzero(self):
+        self.assertNotEqual(
+            FakeHarness(self.args(baseline_sums_sha256="0" * 64)).run(), 0
+        )
+
+    def test_stale_output_directory_returns_nonzero_and_writes_nothing(self):
+        self.out.mkdir()
+        (self.out / "stale.bin").write_bytes(b"stale")
+        self.assertNotEqual(FakeHarness(self.args()).run(), 0)
+        self.assertFalse((self.out / "matrix").exists())
+
+    def test_output_inside_source_returns_nonzero_and_writes_nothing(self):
+        out = self.source / "out"
+        self.assertNotEqual(FakeHarness(self.args(out=out)).run(), 0)
+        self.assertFalse(out.exists())
+
+    def test_output_equal_baseline_returns_nonzero_and_writes_nothing(self):
+        self.assertNotEqual(FakeHarness(self.args(out=self.baseline)).run(), 0)
+        self.assertFalse((self.baseline / "matrix").exists())
+
+    def test_relative_paths_are_resolved(self):
+        argv = [
+            "--source",
+            "rel-source",
+            "--source-sha",
+            "0" * 40,
+            "--base",
+            "0" * 40,
+            "--baseline",
+            "rel-baseline",
+            "--baseline-sums-sha256",
+            ZERO,
+            "--dram-lib",
+            "rel-lib",
+            "--phyfw-obj",
+            "rel-phy",
+            "--gate",
+            "rel-gate",
+            "--out",
+            "rel-out",
+            "--expect-digest",
+            f"default={ZERO}",
+        ]
+        args = verify.parse_args(argv)
+        for path in (
+            args.source,
+            args.baseline,
+            args.dram_lib,
+            args.phyfw_obj,
+            args.gate,
+            args.out,
+        ):
+            self.assertTrue(path.is_absolute())
 
     def test_real_gate_failure_is_failure(self):
         gate = self.tmp / "failing-gate.py"
@@ -859,6 +915,8 @@ class PureLogicTest(unittest.TestCase):
                     "HEAD",
                     "--baseline",
                     "b",
+                    "--baseline-sums-sha256",
+                    ZERO,
                     "--dram-lib",
                     "d",
                     "--phyfw-obj",
