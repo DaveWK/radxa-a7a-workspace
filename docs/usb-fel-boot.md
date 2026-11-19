@@ -53,31 +53,41 @@ booted as blob-free, and measurement builds being booted without a
 recorded human authorization. It does not defend against a malicious
 local user who can edit the scripts or the local records.
 
-`make fel-image` captures the full, clean workspace and oreboot commit
-identities before compiling and rechecks both after. It rejects inherited
-`A7A_*` and `A733_*` variables in all modes; use the separate lab tooling
-for knob experiments. In a blob-free build the same `DRAM_MHZ` (default
-1200) selects the slot, Cargo's `A7A_PROFILE` and the reported profile.
+`make fel-image` checks the clean workspace, oreboot, board, EDK2 and
+EDK2-platforms source identities before and after compilation. The three
+submodule HEADs must match the workspace gitlinks. This build refuses
+`OREBOOT` and `BOARD` Make overrides and inherited `EDK2_DIR` and
+`EDK2_PLATFORMS_DIR`.
+
+FEL Cargo builds use an offline, job-private home seeded only with read-only
+copies of the registry index and crate archives. The gate refuses inherited
+and Cargo-configured `A7A_*` and `A733_*` knobs in all modes. Use the separate
+lab tooling for knob experiments. In a blob-free build the same `DRAM_MHZ`
+(default 1200) selects the slot, Cargo's `A7A_PROFILE` and the reported profile.
 Measurement builds require `DRAM_MHZ` to be unset and do not pass
 `A7A_PROFILE` to Cargo; the mode fixes the profile at 2400.
 
 Compilation and the packaging snapshot use private directories under the
-slot's `build/` directory. EDK2 embeds the private copy of the DTB. EDK2
-builds serialize access to the shared checkout with `out/.edk2-build.lock`.
+slot's `build/` directory. EDK2 embeds the private copy of the built DTB
+or of the file selected by `FEL_DTB_INPUT`. EDK2 builds serialize access
+to the shared checkout with `out/.edk2-build.lock`.
 Only the verified build publishes a record at
 `out/fel/.records/<bt0_fel_sha256>.json`, separate from the bundle. It
-records the mode, profile, features, sources, effective build knobs and
-the intermediate and packaged digests. Rebuild old bundles: a manifest
-alone is not a build record.
+records the mode, profile, features, source paths and commits, effective
+build knobs, EDK2 target and arguments, DTB source path and digest, and the
+intermediate and packaged digests. Rebuild old bundles: a manifest alone is
+not a build record.
 
 `make fel-boot` runs `scripts/fel-boot.sh out/fel/<mode>-<mhz>` with
-`XFEL=out/tools/xfel` and `EXPECT_PROFILE=<mhz>`. The steps:
+`XFEL=out/tools/xfel`, `EXPECT_MODE=<mode>` and `EXPECT_PROFILE=<mhz>`.
+Direct script invocations default to `blobfree` and `${DRAM_MHZ:-1200}`.
+The steps:
 
 1. **Stage and validate**: copy the bundle into a private directory (mode
    0700). Hash the staged bt0 and use that digest to look up the local build
    record. The record, not the manifest, determines the mode and profile.
-   The current `HEAD`s, requested profile, bundle manifest and staged file
-   digests must agree with the record. Check the layout table, payload CRCs
+    The current `HEAD`s, requested mode and profile, bundle manifest and
+    staged file digests must agree with the record. Check the layout table, payload CRCs
    and FEL window before probing USB. Staging is removed on exit; xfel sees
    only the staged bytes.
 2. **Check** that the FEL device is an A733 (`xfel version`, ID `0x00190300`).

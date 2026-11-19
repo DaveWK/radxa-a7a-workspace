@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Exercise make fel-image/fel-boot with fixture compilers and fake USB."""
+"""Exercise the FEL gates with fixture compilers, real Cargo config and fake USB."""
 
 import argparse
 import fcntl
@@ -48,8 +48,16 @@ def event(event_name):
             pipe.write(event_name + "\n")
 
 if tool == "cargo":
+    if "config" in args:
+        os.execv(env["REAL_CARGO"], [env["REAL_CARGO"], *args])
     target = Path(env["CARGO_TARGET_DIR"])
     knobs = {k: v for k, v in env.items() if k.startswith(("A7A_", "A733_"))}
+    if "REAL_CARGO_BUILD" in env:
+        receipt = target / "fixture-knobs"
+        subprocess.run([env["REAL_CARGO"], "build", "--offline", "--locked",
+                        "--release"], env=dict(env, FIXTURE_KNOB_RECEIPT=str(receipt)),
+                       check=True)
+        knobs = dict(line.split("=", 1) for line in receipt.read_text().splitlines())
     with open(env["FAKE_CARGO_LOG"], "a") as log:
         log.write(json.dumps([target.name, args, knobs]) + "\n")
     if target.name == "main-fel":
@@ -76,6 +84,8 @@ elif tool == "flock":
     os.execv(env["REAL_FLOCK"], [env["REAL_FLOCK"], *args])
 elif tool == "build":
     event("edk2")
+    with open(env["FAKE_EDK2_LOG"], "a") as log:
+        log.write(json.dumps(args) + "\n")
     defines = [arg for arg in args if "=" in arg]
     tag = next(arg.split("=", 1)[1] for arg in defines if arg.startswith("BUILD_TAG="))
     dtb = next(arg.split("=", 1)[1] for arg in defines if arg.startswith("DTB_FILE="))
@@ -134,6 +144,16 @@ MKIMAGE_HOOK = r"""
         Path(os.environ["FAKE_SWAP"]).write_text("swapped before packaging open")
 """
 
+CARGO_BUILD_RS = """
+fn main() {
+    let knobs: String = std::env::vars()
+        .filter(|(name, _)| name.starts_with("A7A_") || name.starts_with("A733_"))
+        .map(|(name, value)| format!("{name}={value}\\n"))
+        .collect();
+    std::fs::write(std::env::var_os("FIXTURE_KNOB_RECEIPT").unwrap(), knobs).unwrap();
+}
+"""
+
 
 def sha(path):
     with path.open("rb") as image:
@@ -163,14 +183,19 @@ class GateTests(unittest.TestCase):
         self.root = Path(tmp.name)
         self.workspace = self.root / "workspace"
         self.oreboot = self.workspace / "firmware" / "oreboot"
+        self.edk2 = self.workspace / "firmware" / "edk2"
+        self.platforms = self.workspace / "firmware" / "edk2-platforms"
         self.tools = self.root / "tools"
         self.tools.mkdir()
         self.mem = self.root / "mem"
         self.mem.mkdir()
         self.cargo_log = self.root / "cargo.log"
+        self.edk2_log = self.root / "edk2.log"
         self.usb_log = self.root / "usb.log"
         self.cargo_log.touch()
+        self.edk2_log.touch()
         self.usb_log.touch()
+        (self.root / "caller-cargo").mkdir()
         self.env = {
             k: v
             for k, v in os.environ.items()
@@ -189,11 +214,15 @@ class GateTests(unittest.TestCase):
         }
         self.env.update(
             PATH=f"{self.tools}:{os.environ['PATH']}",
+            CARGO_HOME=str(self.root / "caller-cargo"),
+            CARGO_NET_OFFLINE="true",
             SUDO="",
             FAKE_CARGO_LOG=str(self.cargo_log),
+            FAKE_EDK2_LOG=str(self.edk2_log),
             FAKE_USB_LOG=str(self.usb_log),
             FAKE_MEM=str(self.mem),
             REAL_CP=shutil.which("cp"),
+            REAL_CARGO=shutil.which("cargo"),
             REAL_FLOCK=shutil.which("flock"),
         )
         for name in (
@@ -233,15 +262,14 @@ class GateTests(unittest.TestCase):
         self.assertIn(marker, text)
         mkimage.write_text(text.replace(marker, MKIMAGE_HOOK + "\n" + marker, 1))
         self.file("scripts/check-nvstore.py", "# Fake firmware has no NV store.\n")
-        self.file(
-            ".gitignore", "/out/\n/vendor/\n__pycache__/\n/firmware/edk2/Build/\n"
-        )
+        self.file(".gitignore", "/out/\n/vendor/\n__pycache__/\n")
         self.file("fedora/fedora/mkdevcard.sh", "")
         self.file(
             "fedora/fedora/dts/Makefile",
             'all:\n\tmkdir -p "$(dir $(OUT))"\n\tprintf "test device tree\\n" >"$(OUT)"\n',
         )
         self.file("firmware/edk2/edksetup.sh", "# build is on the fixture PATH\n")
+        self.file("firmware/edk2/.gitignore", "/Build/\n")
         self.file("firmware/edk2/MdePkg/Library/BaseFdtLib/libfdt/libfdt/fdt.h", "")
         self.file("firmware/edk2/BaseTools/Source/C/bin/GenFv", "").chmod(0o755)
         self.file("firmware/edk2-platforms/Platform/Radxa/CubieA7APkg/CubieA7A.dsc", "")
@@ -249,19 +277,37 @@ class GateTests(unittest.TestCase):
             "firmware/edk2-platforms/OreEdk2Boot/OreEdk2BootPkg/OreEdk2BootPkg.dec", ""
         )
         (self.workspace / BOARD / "main").mkdir(parents=True)
-        self.file(BOARD / "main" / "Cargo.toml", "# main source\n")
-        self.file(BOARD / "bt0" / "Cargo.toml", "# bt0 source\n")
-        self.init_repo(self.oreboot)
-        self.init_repo(self.workspace, exclude="firmware/oreboot")
-        pin = git(self.oreboot, "rev-parse", "HEAD")
-        git(
-            self.workspace,
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            f"160000,{pin},firmware/oreboot",
+        self.file(
+            "firmware/oreboot/rust-toolchain.toml",
+            '[toolchain]\nchannel = "nightly-2026-05-06"\n',
         )
-        git(self.workspace, "commit", "-qm", "Pin fixture oreboot")
+        for crate in ("bt0", "main"):
+            path = BOARD / crate
+            self.file(
+                path / "Cargo.toml",
+                '[package]\nname = "knob-fixture"\nversion = "0.0.0"\nedition = "2021"\n',
+            )
+            self.file(
+                path / "Cargo.lock",
+                'version = 4\n[[package]]\nname = "knob-fixture"\nversion = "0.0.0"\n',
+            )
+            self.file(path / "build.rs", CARGO_BUILD_RS)
+            self.file(path / "src/lib.rs", "")
+        deps = (self.oreboot, self.edk2, self.platforms)
+        for dep in deps:
+            self.init_repo(dep)
+        paths = [str(dep.relative_to(self.workspace)) for dep in deps]
+        self.init_repo(self.workspace, *paths)
+        for dep, path in zip(deps, paths):
+            pin = git(dep, "rev-parse", "HEAD")
+            git(
+                self.workspace,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"160000,{pin},{path}",
+            )
+        git(self.workspace, "commit", "-qm", "Pin fixture submodules")
         self.file("vendor/dramlib/libdram", "fixture vendor input only\n")
         self.file("out/oreboot/libdram-a733.a", "fixture archive only\n")
         self.assertEqual(git(self.workspace, "status", "--porcelain"), "")
@@ -273,11 +319,11 @@ class GateTests(unittest.TestCase):
         return path
 
     @staticmethod
-    def init_repo(repo, exclude=None):
+    def init_repo(repo, *excluded):
         git(repo, "init", "--template=")
         git(repo, "config", "user.name", "Fixture")
         git(repo, "config", "user.email", "fixture@example.invalid")
-        args = [".", f":(exclude){exclude}"] if exclude else ["."]
+        args = [".", *(f":(exclude){path}" for path in excluded)]
         git(repo, "add", "--", *args)
         git(repo, "commit", "-qm", "Fixture sources")
 
@@ -300,12 +346,25 @@ class GateTests(unittest.TestCase):
         return self.workspace / "out" / "fel" / slot
 
     def boots(self, *args, auth=None, **env):
+        return self.run_boot("make", *args, auth=auth, **env)
+
+    def run_boot(self, entry, *args, auth=None, **env):
         if auth:
             env["FEL_MEASUREMENT_AUTH"] = str(auth)
         self.usb_log.write_text("")
         for f in self.mem.iterdir():
             f.unlink()
-        return self.make("fel-boot", *args, f"XFEL={self.tools / 'xfel'}", **env)
+        if entry == "make":
+            return self.make("fel-boot", *args, f"XFEL={self.tools / 'xfel'}", **env)
+        env["XFEL"] = str(self.tools / "xfel")
+        return subprocess.run(
+            [str(self.workspace / "scripts/fel-boot.sh"), *args],
+            cwd=self.workspace,
+            env=dict(self.env, **env),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
 
     def refusal(self, proc, reason=None):
         self.assertNotEqual(proc.returncode, 0, self.process_result(proc))
@@ -459,6 +518,176 @@ class GateTests(unittest.TestCase):
                 self.assertIn(f"refuses inherited build knobs: {knob}", proc.stderr)
                 self.assertEqual(self.cargo_log.read_text(), "")
 
+    def test_ancestor_cargo_config_cannot_force_profile(self):
+        bundle = self.build(REAL_CARGO_BUILD="1")
+        want = sha(bundle / "bt0-fel.bin")
+        cfg = self.root / ".cargo" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text('[env]\nA7A_PROFILE = { value = "2400", force = true }\n')
+        self.cargo_log.write_text("")
+        proc = self.make("fel-image", REAL_CARGO_BUILD="1")
+        if proc.returncode:
+            self.assertIn("refuses Cargo [env] build knobs", proc.stderr)
+            self.assertIn("A7A_PROFILE", proc.stderr)
+            self.assertEqual(self.cargo_log.read_text(), "")
+        else:
+            self.assertEqual(
+                sha(bundle / "bt0-fel.bin"), want, self.process_result(proc)
+            )
+
+    def test_caller_cargo_home_config_cannot_inject_knob(self):
+        bundle = self.build(REAL_CARGO_BUILD="1")
+        want = sha(bundle / "bt0-fel.bin")
+        cfg = Path(self.env["CARGO_HOME"]) / "config.toml"
+        cfg.write_text('[env]\nA7A_WR_STAGE = "0"\n')
+        self.cargo_log.write_text("")
+        proc = self.make("fel-image", REAL_CARGO_BUILD="1")
+        self.assertEqual(proc.returncode, 0, self.process_result(proc))
+        self.assertEqual(sha(bundle / "bt0-fel.bin"), want, self.process_result(proc))
+        self.assertNotIn("A7A_WR_STAGE", self.cargo_log.read_text())
+
+    def test_refuse_overridden_compiler_source_roots(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        roots = {
+            "OREBOOT": self.oreboot,
+            "BOARD": self.workspace / BOARD,
+            "EDK2_DIR": self.edk2,
+            "EDK2_PLATFORMS_DIR": self.platforms,
+        }
+        for key, original in roots.items():
+            with self.subTest(root=key):
+                override = elsewhere / key
+                shutil.copytree(original, override)
+                self.cargo_log.write_text("")
+                self.edk2_log.write_text("")
+                if key in ("OREBOOT", "BOARD"):
+                    proc = self.make("fel-image", f"{key}={override}")
+                else:
+                    proc = self.make("fel-image", **{key: str(override)})
+                self.refusal(proc, f"refuses {key} override")
+                self.assertEqual(self.cargo_log.read_text(), "")
+                self.assertEqual(self.edk2_log.read_text(), "")
+
+    def test_edk2_roots_must_match_gitlinks(self):
+        for root in (self.edk2, self.platforms):
+            with self.subTest(root=root.name):
+                rel = str(root.relative_to(self.workspace))
+                before = git(root, "rev-parse", "HEAD")
+                git(self.workspace, "update-index", "--assume-unchanged", "--", rel)
+                git(root, "commit", "-qm", "unpinned EDK2 checkout", "--allow-empty")
+                try:
+                    self.refusal(
+                        self.make("fel-image"), "does not match the workspace gitlink"
+                    )
+                    self.assertEqual(self.cargo_log.read_text(), "")
+                    self.assertEqual(self.edk2_log.read_text(), "")
+                finally:
+                    git(root, "reset", "--hard", before)
+                    git(
+                        self.workspace,
+                        "update-index",
+                        "--no-assume-unchanged",
+                        "--",
+                        rel,
+                    )
+
+    def test_records_checked_roots_and_effective_edk2_inputs(self):
+        dtb = self.root / "alternative device tree.dtb"
+        dtb.write_bytes(b"external device tree\n")
+        for args, expected in (
+            ((), DTB),
+            ((f"FEL_DTB_INPUT={dtb}",), dtb.read_bytes()),
+        ):
+            with self.subTest(passed_dtb=bool(args)):
+                slot = self.build(
+                    "blobfree-1200",
+                    "EDK2_TARGET=RELEASE",
+                    "EDK2_ARGS=-D USB_ENABLE=FALSE -D 'OTHER=with spaces'",
+                    *args,
+                )
+                bt0 = sha(slot / "bt0-fel.bin")
+                record = read_json(self.record(bt0))
+                manifest = read_json(slot / "build-manifest.json")
+                actual = json.loads(self.edk2_log.read_text().splitlines()[-1])
+                start = actual.index("-D", actual.index("-n")) + 4
+                effective = ["-D", "USB_ENABLE=FALSE", "-D", "OTHER=with spaces"]
+                self.assertEqual(record.get("edk2_args"), effective)
+                self.assertEqual(actual[start:-2], effective)
+                for data in (record, manifest):
+                    self.assertEqual(data["edk2_args"], effective)
+                    self.assertEqual(data["edk2_target"], "RELEASE")
+                    self.assertEqual(data["fel_dtb_input"], str(dtb) if args else None)
+                    if args:
+                        self.assertEqual(data["dtb_path"], str(dtb))
+                    else:
+                        self.assertIn(".compile.", data["dtb_path"])
+                    self.assertEqual(
+                        data["dtb_sha256"], hashlib.sha256(expected).hexdigest()
+                    )
+                self.assertEqual(actual[actual.index("-b") + 1], "RELEASE")
+                self.assertIn(".snapshot.", actual[-1])
+                self.assertEqual(
+                    record["intermediates"]["dtb_sha256"], record["dtb_sha256"]
+                )
+                self.assertIn(expected, (slot / "firmware.bin").read_bytes())
+                for name, path, top in (
+                    ("oreboot", self.oreboot, self.oreboot),
+                    ("board", self.workspace / BOARD, self.oreboot),
+                    ("edk2", self.edk2, self.edk2),
+                    ("edk2_platforms", self.platforms, self.platforms),
+                ):
+                    self.assertEqual(
+                        record["source_roots"][name],
+                        dict(
+                            path=str(path),
+                            toplevel=str(top),
+                            head=git(top, "rev-parse", "HEAD"),
+                            clean=True,
+                        ),
+                    )
+
+    def test_expected_mode_is_required_before_measurement_authorization(self):
+        blobfree = self.build()
+        dramlib = self.build("dramlib-2400", "VENDOR_DRAM=yes")
+        bt0 = sha(dramlib / "bt0-fel.bin")
+        auth = self.root / "auth.json"
+        write_json(auth, {"bt0_fel_sha256": bt0, "authorization": "fixture"})
+        for bundle, profile, mode in (
+            (blobfree, 1200, "dramlib"),
+            (dramlib, 2400, "blobfree"),
+        ):
+            with self.subTest(mode=mode):
+                self.refusal(
+                    self.run_boot(
+                        "script",
+                        str(bundle),
+                        auth=auth,
+                        EXPECT_MODE=mode,
+                        EXPECT_PROFILE=str(profile),
+                    ),
+                    f"does not match requested mode {mode}",
+                )
+        self.refusal(
+            self.run_boot(
+                "script", str(dramlib), EXPECT_MODE="dramlib", EXPECT_PROFILE="2400"
+            ),
+            "FEL_MEASUREMENT_AUTH",
+        )
+        self.assert_bundle_writes(
+            self.run_boot(
+                "script",
+                str(dramlib),
+                auth=auth,
+                EXPECT_MODE="dramlib",
+                EXPECT_PROFILE="2400",
+            ),
+            dramlib,
+        )
+        wrong_slot = blobfree.with_name("blobfree-2400")
+        shutil.copytree(dramlib, wrong_slot)
+        self.refusal(self.boots("DRAM_MHZ=2400", auth=auth), "requested mode blobfree")
+
     def test_disjoint_dry_run_slots_and_fixed_measurement_profiles(self):
         for mode, profile, args in (
             ("blobfree", "1200", []),
@@ -476,7 +705,8 @@ class GateTests(unittest.TestCase):
                 boot = self.make("-n", "fel-boot", *args, f"XFEL={self.tools / 'xfel'}")
                 self.assertEqual(boot.returncode, 0, self.process_result(boot))
                 self.assertIn(
-                    f"EXPECT_PROFILE={profile} scripts/fel-boot.sh {slot}", boot.stdout
+                    f"EXPECT_MODE={mode} EXPECT_PROFILE={profile} scripts/fel-boot.sh {slot}",
+                    boot.stdout,
                 )
                 if mode == "blobfree":
                     self.assertIn(
