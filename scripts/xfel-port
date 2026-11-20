@@ -174,7 +174,7 @@ def main():
             stdout=subprocess.DEVNULL,
             check=True,
         )
-        # The session owns the lease, but the transfer must retain the same
+        # The session owns the port lock, but the transfer must retain the same
         # open file description if both its Python parents disappear.
         lease = os.environ.get("FEL_SESSION_LEASE_FD")
         lease_fds = ()

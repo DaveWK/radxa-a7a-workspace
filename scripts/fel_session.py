@@ -448,7 +448,7 @@ class Selector:
                     break
                 time.sleep(min(0.01, remaining))
         # An uninterruptible kernel task may survive SIGKILL. The transfer
-        # inherits our lease and therefore still fences the port in this case.
+        # inherits our port lock and therefore still fences the port in this case.
         raise SessionError(
             Exit.LIVE_TIMEOUT,
             "selector group did not drain after SIGKILL; any surviving transfer retains the port lease",
